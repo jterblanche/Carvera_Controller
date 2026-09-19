@@ -1,26 +1,32 @@
 """A fake machine: a real TCP socket speaking the Makera framed protocol.
 
 Used to test the controller's connect and identify-handshake behaviour
-end to end (real sockets, real background threads) without hardware, as
-ticket #18's acceptance criteria call for. Complements the existing
-client-side socket doubles (tests/unit/test_wifi_stream.py) with a real
-accept()-ing server, since these tests exercise Controller's own
-socket-based streamIO thread rather than a single stream method.
+end to end (real sockets, real background threads) without hardware.
+Complements the existing client-side socket doubles
+(tests/unit/test_wifi_stream.py) with a real accept()-ing server, since
+these tests exercise Controller's own socket-based streamIO thread rather
+than a single stream method.
 
 Firmware personalities modelled:
-  "new"  - a firmware that understands the identify handshake: acks hello
-           (accepted, or rejected per ``ack_result``) and answers
-           client-list requests.
-  "old"    - today's firmware: silently drops every new message type,
-             exactly as the protocol doc's backward-compatibility rule
-             says, but still answers realtime status queries.
-  "silent" - answers nothing at all, ever (a dead/unresponsive link) —
-             used to prove hello is withheld until a frame is confirmed.
+  "new"      - a firmware that understands the identify handshake: acks
+               hello (accepted, or rejected per ``ack_result``) and answers
+               client-list requests.
+  "old"      - today's firmware: silently drops every new message type
+               (never even reads far enough to notice they're a hello or a
+               client-list request), but still answers realtime status
+               queries exactly as before.
+  "silent"   - answers nothing at all, ever (a dead/unresponsive link) —
+               used to prove hello is withheld until a frame is confirmed.
+  "smoothie" - a machine still running the legacy plaintext line protocol:
+               answers the controller's plaintext "echo" probe so the
+               protocol detector picks Smoothie mode, never speaks framed
+               bytes at all, and so never sees a hello either.
 
-``close_after`` models the measured old-firmware-busy race: the machine
-accepts the TCP connection, then closes it unconditionally after that many
-seconds without answering anything — "accepted and closed by the machine
-at once" (protocol doc §7).
+``close_after`` models a race observed against old firmware with another
+client already attached: the machine accepts the TCP connection, then
+closes it unconditionally after that many seconds without answering
+anything at all — an accept immediately followed by a close, not a normal
+"stayed connected but never answered" case.
 """
 
 from __future__ import annotations
@@ -62,6 +68,7 @@ class FakeMachine:
         self.hellos_received = []  # list[bytes]: raw hello payloads
         self.frames_received = []  # list[tuple[int, bytes]]: (ptype, payload)
         self.client_list_requests = 0
+        self.smoothie_bytes_received = bytearray()  # "smoothie" mode only
 
         self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._accept_thread.start()
@@ -98,6 +105,10 @@ class FakeMachine:
                 pass
             return
 
+        if self.mode == "smoothie":
+            self._serve_smoothie(conn)
+            return
+
         conn.settimeout(0.2)
         buf = bytearray()
         try:
@@ -112,6 +123,34 @@ class FakeMachine:
                     return
                 buf.extend(chunk)
                 self._consume(conn, buf)
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def _serve_smoothie(self, conn):
+        """Legacy plaintext line protocol: never framed, so a hello would
+        never be understood — and per the controller's own rule, must never
+        even be attempted here. Only replies to the protocol detector's
+        "echo" probe, enough to make the controller pick Smoothie mode;
+        every other byte received is just recorded for the test to inspect.
+        """
+        conn.settimeout(0.2)
+        try:
+            while not self._stop.is_set():
+                try:
+                    chunk = conn.recv(4096)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                with self._lock:
+                    self.smoothie_bytes_received.extend(chunk)
+                if b"echo" in chunk:
+                    self._send(conn, b"echo\r\nok\r\n")
         finally:
             try:
                 conn.close()
