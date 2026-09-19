@@ -1,4 +1,5 @@
 #import "bridge.h"
+#import "SceneDelegate.h"
 #import <UIKit/UIKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include "Python.h"
@@ -132,20 +133,7 @@ CMAltimeter *altimeterManager;
 void get_safe_area_insets_px(double *top, double *left, double *bottom, double *right) {
     *top = *left = *bottom = *right = 0;
 
-    UIWindow *window = nil;
-    if (@available(iOS 13.0, *)) {
-        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-            UIWindowScene *ws = (UIWindowScene *)scene;
-            for (UIWindow *w in ws.windows) {
-                if (w.isKeyWindow) { window = w; break; }
-            }
-            if (window) break;
-        }
-    }
-    if (!window) {
-        window = [UIApplication sharedApplication].keyWindow;
-    }
+    UIWindow *window = [SceneDelegate keyWindow];
     if (!window) return;
 
     UIEdgeInsets insets = window.safeAreaInsets;
@@ -176,7 +164,7 @@ void get_safe_area_insets_px(double *top, double *left, double *bottom, double *
     picker.delegate = [DocumentPickerHelper sharedInstance];
 
     // Get the current top view controller
-    UIViewController *rootViewController = [UIApplication sharedApplication].keyWindow.rootViewController;
+    UIViewController *rootViewController = [SceneDelegate keyWindow].rootViewController;
     [rootViewController presentViewController:picker animated:YES completion:nil];
 }
 

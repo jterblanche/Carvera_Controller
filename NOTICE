@@ -7,6 +7,9 @@ This product includes software developed by
 Makera
 (https://github.com/MakeraInc/)
 
+The Makera logo is included as carveracontroller/data/makera.png and used as the
+Machine tab icon in the file browser.
+
 ===============================================================================
 This product includes the following third-party libraries:
 
@@ -44,6 +47,21 @@ This product includes the following third-party libraries:
    - License: MIT License
    - URL: https://github.com/kivy-garden/garden.ddd/tree/master
 
+8. pyusb
+   - Author: Wander Lairson Costa, pyusb contributors
+   - License: BSD License
+   - URL: https://github.com/pyusb/pyusb
+
+9. libusb
+   - Author: libusb contributors
+   - License: LGPL 2.1
+   - URL: https://libusb.info/
+
+10. libusb-package
+   - Author: Arm Ltd, pyOCD contributors
+   - License: Apache 2.0
+   - URL: https://github.com/pyocd/libusb-package
+
 Notices for files provided by third-party libraries are included below. These
 notices are provided for informational purposes only. The licenses and details
 of these libraries apply to their respective source code.
@@ -54,6 +72,9 @@ of these libraries apply to their respective source code.
 - pyserial is distributed under the terms of the BSD License.
 - libusb/hidapi is distributed under the terms of the GPL 3.0.
 - kivy.ddd is distributed under the terms of the MIT License.
+- pyusb is distributed under the terms of the BSD License.
+- libusb is distributed under the terms of the LGPL 2.1.
+- libusb-package is distributed under the terms of the Apache 2.0 License.
 
 ===============================================================================
 This product includes the following third-party icons:
@@ -65,10 +86,154 @@ This product includes the following third-party icons:
    - Used in: carveracontroller/data/axis-arrow.png
 
 2. camera.png
-   - Author: Austin Andrews
+   - Author: Google
    - License: Apache 2.0 License
    - URL: https://pictogrammers.com/library/mdi/icon/camera/
    - Used in: carveracontroller/data/camera.png
+
+3. grid.png
+   - Author: Google
+   - License: Apache 2.0 License
+   - URL: https://pictogrammers.com/library/mdi/icon/grid/
+   - Used in: carveracontroller/data/GcodeViewer/grid.png
+
+4. monitor-edit.png
+   - Author: Michael Richins
+   - License: Apache 2.0 License
+   - URL: https://pictogrammers.com/library/mdi/icon/monitor-edit/
+   - Used in: carveracontroller/data/GcodeViewer/display-settings.png
+
+5. perspective-less.png
+   - Author: Michael Irigoyen
+   - License: Apache 2.0 License
+   - URL: https://pictogrammers.com/library/mdi/icon/perspective-less/
+   - Used in: carveracontroller/data/GcodeViewer/ortho.png
+
+6. cube.png
+   - Author: Austin Andrews
+   - License: Apache 2.0 License
+   - URL: https://pictogrammers.com/library/mdi/icon/cube/
+   - Used in: carveracontroller/data/GcodeViewer/stock.png
+
+7. card.png
+   - Author: Rynco Li
+   - License: Apache 2.0 License
+   - URL: https://pictogrammers.com/library/mdi/icon/card/
+   - Used in: carveracontroller/data/GcodeViewer/bed.png
+
+8. folder-arrow-up.png
+   - Author: Colton Wiscombe
+   - License: Apache 2.0 License
+   - URL: https://pictogrammers.com/library/mdi/icon/folder-arrow-up/
+   - Used in: carveracontroller/data/folder-arrow-up.png
+
+9. laptop.png
+   - Author: Google
+   - License: Apache 2.0 License
+   - URL: https://pictogrammers.com/library/mdi/icon/laptop/
+   - Used in: carveracontroller/data/laptop.png
+
+10. eye.png
+   - Author: Google
+   - License: Apache 2.0 License
+   - URL: https://pictogrammers.com/library/mdi/icon/eye/
+   - Used in: carveracontroller/data/eye.png
+
+11. upload.png
+   - Author: Google
+   - License: Apache 2.0 License
+   - URL: https://pictogrammers.com/library/mdi/icon/upload/
+   - Used in: carveracontroller/data/upload.png
+
+12. play.png
+   - Author: Google
+   - License: Apache 2.0 License
+   - URL: https://pictogrammers.com/library/mdi/icon/play/
+   - Used in: carveracontroller/data/play.png
+
+13. pencil.png
+   - Author: Google
+   - License: Apache 2.0 License
+   - URL: https://pictogrammers.com/library/mdi/icon/pencil/
+   - Used in: carveracontroller/data/pencil.png
+
+14. delete.png
+   - Author: Google
+   - License: Apache 2.0 License
+   - URL: https://pictogrammers.com/library/mdi/icon/delete/
+   - Used in: carveracontroller/data/delete.png
+
+15. close.png
+   - Author: Google
+   - License: Apache 2.0 License
+   - URL: https://pictogrammers.com/library/mdi/icon/close/
+   - Used in: carveracontroller/data/close.png
+
+16. folder-plus.png
+   - Author: Austin Andrews
+   - License: Apache 2.0 License
+   - URL: https://pictogrammers.com/library/mdi/icon/folder-plus/
+   - Used in: carveracontroller/data/folder-plus.png
+
+17. checkbox-multiple-outline.png
+   - Author: Michael Richins
+   - License: Apache 2.0 License
+   - URL: https://pictogrammers.com/library/mdi/icon/checkbox-multiple-outline/
+   - Used in: carveracontroller/data/checkbox-multiple-outline.png
+
+18. check.png
+   - Author: Google
+   - License: Apache 2.0 License
+   - URL: https://pictogrammers.com/library/mdi/icon/check/
+   - Used in: carveracontroller/data/check.png
+
+19. folder.png
+   - Author: Google
+   - License: Apache 2.0 License
+   - URL: https://pictogrammers.com/library/mdi/icon/folder/
+   - Used in: carveracontroller/data/folder-32.png
+
+20. file-outline.png
+   - Author: Google
+   - License: Apache 2.0 License
+   - URL: https://pictogrammers.com/library/mdi/icon/file-outline/
+   - Used in: carveracontroller/data/file-outline.png
+
+21. file-code-outline.png
+   - Author: Terren
+   - License: Apache 2.0 License
+   - URL: https://pictogrammers.com/library/mdi/icon/file-code-outline/
+   - Used in: carveracontroller/data/file-code-outline.png
+
+22. memory.png
+   - Author: Google
+   - License: Apache 2.0 License
+   - URL: https://pictogrammers.com/library/mdi/icon/memory/
+   - Used in: carveracontroller/data/memory.png
+
+23. download.png
+   - Author: Google
+   - License: Apache 2.0 License
+   - URL: https://pictogrammers.com/library/mdi/icon/download/
+   - Used in: carveracontroller/data/download.png
+
+24. console.png
+   - Author: Austin Andrews
+   - License: Apache 2.0 License
+   - URL: https://pictogrammers.com/library/mdi/icon/console/
+   - Used in: carveracontroller/data/console.png
+
+25. history.png
+   - Author: Google
+   - License: Apache 2.0 License
+   - URL: https://pictogrammers.com/library/mdi/icon/history/
+   - Used in: carveracontroller/data/history.png
+
+26. link-variant.png
+   - Author: Austin Andrews
+   - License: Apache 2.0 License
+   - URL: https://pictogrammers.com/library/mdi/icon/link-variant/
+   - Used in: carveracontroller/data/link-variant.png
 
 ===============================================================================
 Please see the respective license files for detailed information.

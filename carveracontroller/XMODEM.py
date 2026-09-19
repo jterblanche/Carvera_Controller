@@ -457,6 +457,8 @@ class XMODEM:
         # until after decompress. Cleared at the start of each download and after checking.
         self.deferred_download_md5 = None
         self.download_md5_failed = False
+        # Text from a FILE_CAN payload when the machine included one.
+        self.last_file_error = None
 
     def clear_mode_set(self):
         self.mode_set = False
@@ -480,6 +482,15 @@ class XMODEM:
     def abort_framed(self):
         """Abort a Makera framed file transfer."""
         self._send_file_trans_command(PTYPE_FILE_CAN, b"")
+
+    def _file_packet_payload(self) -> bytes:
+        """Return the payload of the last assembled file-transfer frame."""
+        if len(self.packetData) <= 5:
+            return b""
+        return bytes(self.packetData[3:-2])
+
+    def _file_packet_text(self) -> str:
+        return self._file_packet_payload().decode("utf-8", errors="replace").strip("\x00").strip()
 
     def _send_file_trans_command(self, cmd: int, data: bytes) -> None:
         self.putc(build_frame(cmd, data))
@@ -753,6 +764,7 @@ class XMODEM:
         """Send a file using the Makera framed transfer protocol."""
         packet_size = self._framed_packet_size()
         data = md5.encode()
+        self.last_file_error = None
         self._send_file_trans_command(PTYPE_FILE_MD5, data)
         lastcmd = PTYPE_FILE_MD5
         lastseq = 0
@@ -771,8 +783,15 @@ class XMODEM:
                 if cmd_type < PTYPE_FILE_MD5:
                     continue
                 if cmd_type == PTYPE_FILE_CAN:
-                    self.log.info("Transmission canceled by Machine.")
+                    # Abort on both C1/CA1 and Z1. Success is FILE_END. C1/CA1 may
+                    # payload `ok`; Z1 may payload the open-error string.
+                    reason = self._file_packet_text()
+                    self.last_file_error = reason or None
                     self.FileRcvState = FileTransState.WAIT_MD5
+                    if reason:
+                        self.log.info("Transmission canceled by Machine: %s", reason)
+                    else:
+                        self.log.info("Transmission canceled by Machine.")
                     return None
                 if cmd_type == PTYPE_FILE_RETRY:
                     self._send_file_trans_command(lastcmd, data)

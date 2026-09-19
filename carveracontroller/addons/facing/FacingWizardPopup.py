@@ -37,6 +37,7 @@ from .facing_gcode import (
     PATTERN_RASTER_X,
     PATTERN_RASTER_Y,
     PATTERN_SPIRAL,
+    PATTERN_SPIRAL_ROUND,
     FacingParams,
     compute_facing_envelope,
     facing_toolpath_xy_polyline,
@@ -59,11 +60,9 @@ from .probe_grid_gcode import (
     probe_grid_z_datum_shift_after_probe_gcode,
 )
 from .stock_geometry import (
-    CORNER_BL,
-    CORNER_BR,
-    CORNER_TL,
-    CORNER_TR,
+    STOCK_ORIGIN_CORNER_BL,
     rect_with_xy_margin,
+    stock_origin_pairs,
     stock_rect_from_origin_corner,
 )
 
@@ -124,15 +123,6 @@ def _milling_direction_pairs():
     ]
 
 
-def _stock_corner_pairs():
-    return [
-        (tr._("Bottom-left (+X width, +Y length)"), CORNER_BL),
-        (tr._("Bottom-right (-X width, +Y length)"), CORNER_BR),
-        (tr._("Top-left (+X width, -Y length)"), CORNER_TL),
-        (tr._("Top-right (-X width, -Y length)"), CORNER_TR),
-    ]
-
-
 class FacingSavePresetContent(BoxLayout):
     pass
 
@@ -143,7 +133,7 @@ class FacingWizardPopup(ModalView):
     def __init__(self, **kwargs):
         self._m6_collet_pairs_list = None
         self._probe_tool_pairs_list = None
-        self._stock_corner_pairs_list = None
+        self._stock_origin_pairs_list = None
         self._milling_direction_pairs_list = None
         super().__init__(**kwargs)
         self.bind(on_open=self._on_open_wizard, on_dismiss=self._on_dismiss_wizard)
@@ -469,8 +459,8 @@ class FacingWizardPopup(ModalView):
             self._m6_collet_pairs_list = _m6_collet_pairs()
         if self._probe_tool_pairs_list is None:
             self._probe_tool_pairs_list = _probe_tool_pairs()
-        if self._stock_corner_pairs_list is None:
-            self._stock_corner_pairs_list = _stock_corner_pairs()
+        if self._stock_origin_pairs_list is None:
+            self._stock_origin_pairs_list = stock_origin_pairs()
         if self._milling_direction_pairs_list is None:
             self._milling_direction_pairs_list = _milling_direction_pairs()
 
@@ -489,11 +479,11 @@ class FacingWizardPopup(ModalView):
             if spp.text not in spp.values:
                 spp.text = self._probe_tool_pairs_list[0][0]
 
-            self._stock_corner_pairs_list = _stock_corner_pairs()
+            self._stock_origin_pairs_list = stock_origin_pairs()
             spcorner = self.ids.spn_stock_corner
-            spcorner.values = [p[0] for p in self._stock_corner_pairs_list]
+            spcorner.values = [p[0] for p in self._stock_origin_pairs_list]
             if spcorner.text not in spcorner.values:
-                spcorner.text = self._stock_corner_pairs_list[0][0]
+                spcorner.text = self._stock_origin_pairs_list[0][0]
 
             self._milling_direction_pairs_list = _milling_direction_pairs()
             spmd = self.ids.spn_milling_dir
@@ -535,10 +525,10 @@ class FacingWizardPopup(ModalView):
     def _stock_origin_corner_from_ui(self) -> str:
         self._ensure_wizard_lists()
         text = self.ids.spn_stock_corner.text
-        for label, val in self._stock_corner_pairs_list:
+        for label, val in self._stock_origin_pairs_list:
             if text == label:
                 return val
-        return CORNER_BL
+        return STOCK_ORIGIN_CORNER_BL
 
     def _milling_direction_from_ui(self) -> str:
         self._ensure_wizard_lists()
@@ -553,6 +543,8 @@ class FacingWizardPopup(ModalView):
             ids = self.ids
         except Exception:
             return PATTERN_RASTER_X
+        if getattr(ids, "raster_round_btn", None) and ids.raster_round_btn.state == "down":
+            return PATTERN_SPIRAL_ROUND
         if getattr(ids, "raster_spiral_btn", None) and ids.raster_spiral_btn.state == "down":
             return PATTERN_SPIRAL
         if ids.raster_x_btn.state == "down":
@@ -568,7 +560,7 @@ class FacingWizardPopup(ModalView):
         except Exception:
             return
         pat = self._pattern_from_ui()
-        if pat == PATTERN_SPIRAL:
+        if pat in (PATTERN_SPIRAL, PATTERN_SPIRAL_ROUND):
             filtered = [(lab, v) for lab, v in self._milling_direction_pairs_list if v != MILLING_BOTH]
             new_values = [p[0] for p in filtered]
             if list(spmd.values) != new_values:
@@ -677,7 +669,12 @@ class FacingWizardPopup(ModalView):
             Clock.schedule_once(lambda _dt: self._bind_preview_inputs(), 0.12)
             return
 
-        if "raster_x_btn" not in ids or "raster_y_btn" not in ids or "raster_spiral_btn" not in ids:
+        if (
+            "raster_x_btn" not in ids
+            or "raster_y_btn" not in ids
+            or "raster_spiral_btn" not in ids
+            or "raster_round_btn" not in ids
+        ):
             logger.debug("facing preview bind: tab widgets missing, retrying")
             Clock.schedule_once(lambda _dt: self._bind_preview_inputs(), 0.12)
             return
@@ -699,6 +696,7 @@ class FacingWizardPopup(ModalView):
             "txt_rough_f",
             "txt_rough_plunge",
             "txt_rough_step",
+            "txt_path_radius",
             "txt_rough_doc",
             "txt_rough_total",
             "txt_finish_f",
@@ -730,6 +728,7 @@ class FacingWizardPopup(ModalView):
             ids.raster_x_btn.bind(state=self._on_facing_input_changed)
             ids.raster_y_btn.bind(state=self._on_facing_input_changed)
             ids.raster_spiral_btn.bind(state=self._on_facing_input_changed)
+            ids.raster_round_btn.bind(state=self._on_facing_input_changed)
         except Exception:
             pass
         for wid_name in ("spn_stock_corner", "spn_milling_dir", "spn_m6_collet", "spn_probe_tool"):
@@ -814,6 +813,7 @@ class FacingWizardPopup(ModalView):
             rough_feed_mm_min=_parse_float_widget(self.ids.txt_rough_f, tr._("Rough feed (mm/min)")),
             rough_plunge_feed_mm_min=_parse_float_widget(self.ids.txt_rough_plunge, tr._("Rough plunge feed (mm/min)")),
             rough_stepover_mm=_parse_float_widget(self.ids.txt_rough_step, tr._("Rough stepover (mm)")),
+            path_radius_mm=_parse_float_widget(self.ids.txt_path_radius, tr._("Path radius (mm)")),
             rough_depth_per_pass_mm=_parse_float_widget(self.ids.txt_rough_doc, tr._("Rough depth / pass (mm)")),
             rough_total_depth_mm=_parse_float_widget(self.ids.txt_rough_total, tr._("Rough total depth (mm)")),
             finish_enabled=self.ids.chk_finish.active,
@@ -923,7 +923,6 @@ class FacingWizardPopup(ModalView):
             root.content.current = "File"
         app.show_gcode_ctl_bar = False
         try:
-            root.cmd_manager.transition.direction = "right"
             root.cmd_manager.current = "gcode_cmd_page"
         except Exception:
             pass

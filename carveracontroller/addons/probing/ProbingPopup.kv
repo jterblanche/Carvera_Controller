@@ -376,6 +376,8 @@
                                 tooltip_image: ''
                                 on_press: root.on_probeTip_probing_pressed("Anchor2")
                                 image: 'addons/probing/data/icons_1024x768/calibration/Calibrate_On_Anchor_2.png'
+                                opacity: 1 if app.has_anchor2 else 0
+                                disabled: not app.has_anchor2
                             ProbeButton:
                                 
                                 tooltip_txt: tr._('Calibrate probe tip using a known boss in the Y direction')
@@ -428,6 +430,8 @@
                                 tooltip_image: ''
                                 on_press: root.on_callibration_probing_pressed("Anchor2")
                                 image: 'addons/probing/data/icons_1024x768/calibration/Calibrate_Anchor_2.png'
+                                opacity: 1 if app.has_anchor2 else 0
+                                disabled: not app.has_anchor2
 
                         BoxLayout:
                             size_hint_x: 0.6

@@ -1,3 +1,41 @@
+[unreleased]
+- Enhancement: Firmware updater now support Makera Z1. Detects if fw is bundled LPC+ESP, LPC-only, or ESP-only and updates using the correct method
+- Enhancement: Improve update popup UI and retrieve version data from the GitHub API
+- Enhancement: Replace the nested Remote/Local file popup with a single file browser
+- Enhancement: Auto enclosure light on connect and off on disconnect or app close. Controller setting is available to enable/disable this feature, default is disabled.
+- Enhancement: Tool-change flags have tooltip showing time until the change
+- Enhancement: Remaining time text alternates with time until the next tool change and playback completion
+- Enhancement: Selected files show estimated run time on the playback bar before the job starts
+- Enhancement: Intellisense-like popups explaining commands in lines selected in the gcode viewer and MDI terminal
+- Enhancement: Support for connect to the Makera Z1 over USB
+- Enhancement: Add Auto Blow, Auto Bed Clean, and Ionizer toggles to the Config and Run screen on Z1
+- Enhancement: Add Z1 bed background
+- Enhancement: Machine bed background images in the config-n-run preview screen now filtered to show images that match the machine model connected
+- Enhancement: Add stock settings and simulation to the G-Code viewer
+- Enhancement: Alarm popup now notes an engaged e-stop when the halt reason is not the e-stop code
+- Enhancement: Use machine limits when available to calculate time estimates
+- Enhancement: Add bed settings and visualization to the G-Code viewer
+- Enhancement: Add keyboard shortcuts settings
+- Change: Update screen is now accessible when not connected to a machine
+- Change: Facing wizard now supports center WCS origin
+- Change: Hide Auto Vacuum on the Config and Run screen when the machine is not a C1
+- Change: Config and Run preview now uses now uses the configured worksize_x/y for the bed size
+- Change: Auto Leveling auto-enables Auto Z Probe, but keeps the previous Z-probe location and allows the location config to be changed. Auto Z Probe can be turned off while leveling, but a warning is shown.
+- Change: Replace the MDI/FILE buttons by a tabbed panel
+- Change: Replace the G-code first/previous/next/last buttons with a compact page bar that shows the current page and line range, and hides when the file fits on one page
+- Change: The WCS button now shows rotation in the subtext, alternating with the WCS name when a description is set.
+- Change: Add support for iOS 27
+- Fixed: Harden the gcode parser against "zero length" movement, and prevent division by zero in play slider
+- Fixed: Time estimates ignoring speed for some 4th-axis moves
+- Fixed: Allow to select the bottom element of the MDI, Gcode and probing confirmation lists
+- Fixed: Machine config backup no longer applies settings or opens files in the G-code viewer
+- Fixed: Fixed rotary previews so toolpaths, pointers, and stock rotate around the WCS origin without unwanted orbiting.
+- Fixed: Keep thin tool icon fills visible by drawing the outline outside the silhouette.
+- Fixed: Upload-and-select on the Z1 would not select the file after uploading. The select callback ran on the wrong thread because Z1 does not use .lz compression.
+- Fixed: Keyboard jogging in the CMM Workbench now uses the workbench step size, synchronized with the main screen
+- Fixed: Y+/Y- jogging buttons on the CMM Workbench respect the configured Y axis inversion setting
+- Fixed: Connecting to a different machine now clears the previous job's file view, tool-change flags, and 3D simulation
+
 [2.2.0-RC3]
 - Enhancement: The step size is now synchronized between the main screen and the Probing screen
 - Fixed: Y+/Y- jogging buttons on the Probing screen respect the configured Y axis inversion setting
@@ -6,6 +44,7 @@
 - Enhancement: Adds "Allow Jogging When Spindle or Laser Is On" option (disabled by default). "Allow Jogging When Machine Running" will now be enabled by default. Existing configs that already allowed jogging while the machine is running also enable the new spindle/laser option.
 - Enhancement: Windows and Android artifacts are now signed
 - Enhancement: Abort CMM workbench operations when an invalid machine state is detected
+- Enhancement: Windows and Android artifacts are now signed
 - Fixed: Prevent a probing modal crash if E is not provided when using the angle operation
 - Fixed: Default Values on Probing screens caused probing to fail unexpectedly 
 - Fixed: Remaining job time no longer resumes counting after aborting playback and disconnecting
@@ -17,7 +56,8 @@
 - Fixed: Machine time sync now includes daylight saving, SD card timestamps now match the PC clock when daylight savings is in effect
 - Changed: added help button to probing screen confirmation/error popup for clarity
 - Changed: Moved Z1 Camera to a collapsible area in the Gcode Viewer. Collapsible splitter is only shown if a supported camera is found.
-- Change: Moved tools visibility controls to the color scheme panel
+- Changed: Moved tools visibility controls to the color scheme panel
+- Changed: Moved tools visibility controls to the color scheme panel
 
 [2.2.0-RC1]
 - Enhancement: Read tool definitions from post-processor outputs and use them in the G-code viewer

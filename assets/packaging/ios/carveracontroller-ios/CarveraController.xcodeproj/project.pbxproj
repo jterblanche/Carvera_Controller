@@ -20,6 +20,8 @@
 		31D64A1F9418CA4719DF905E /* libssl.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4A4B440CA87E67B49D875F29 /* libssl.xcframework */; };
 		3317407194A5AA0AD871FE9B /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EBA441B7898864FA55FA614D /* CoreGraphics.framework */; };
 		3CD04BDD9A248442EC2A360E /* libpyobjus.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 69034840BB27C9E3CDF095C5 /* libpyobjus.xcframework */; };
+		4BA9401E95D3FA522F4E9937 /* libnpymath.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 522B42809F414F852C795FD1 /* libnpymath.xcframework */; };
+		57BE4D24A86523C7B637473B /* libfreetype.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = A89846A1B3150D9DC56E7FF7 /* libfreetype.xcframework */; };
 		59738AB51A8BB5D8001B2C0C /* lib in Resources */ = {isa = PBXBuildFile; fileRef = 59738AB41A8BB5D8001B2C0C /* lib */; };
 		59738ABB1A8E19AA001B2C0C /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 59738ABA1A8E19AA001B2C0C /* Images.xcassets */; };
 		59994E3B148E85C800863906 /* carveracontrollerpkg in Resources */ = {isa = PBXBuildFile; fileRef = 59994E3A148E85C800863906 /* carveracontrollerpkg */; };
@@ -29,18 +31,23 @@
 		6C644356ABBDF9FF43C40333 /* libz.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = BB7E40659FD98753F2835610 /* libz.tbd */; };
 		7A0D45EA98F7B2EF12AD9C02 /* libSDL2_ttf.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 339B48A886CA761D0A19C3D5 /* libSDL2_ttf.xcframework */; };
 		7A674BEEA1BB0033336CC4E5 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = DAA347728ECFEC295FDF6F22 /* QuartzCore.framework */; };
+		7E4A9C12B3D84F1A9C0E2B03 /* SceneDelegate.m in Sources */ = {isa = PBXBuildFile; fileRef = 7E4A9C12B3D84F1A9C0E2B02 /* SceneDelegate.m */; };
 		8587495197F4C0E15F52D0A4 /* Accelerate.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 650D4733935B336C699C93ED /* Accelerate.framework */; };
 		86414F6BA0CBE609139D0282 /* libpng16.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 03E841FA9892EEDE7E244A1D /* libpng16.xcframework */; };
 		8FEE46FBA9CE9BB13F001D41 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F36C451183F607E02CD8B638 /* Metal.framework */; };
 		94BE41E8B2394F6B340B4550 /* OpenGLES.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4DEA4A81A8F3A569B130BCAA /* OpenGLES.framework */; };
+		9C264597B0F629F91B7C4F41 /* libjpeg.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 531848A78C1F6769FE8BD1DB /* libjpeg.xcframework */; };
 		9DFB4942AD366508F6A592F9 /* libkivy.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 64F7416AB075A0994023F21B /* libkivy.xcframework */; };
 		A22D4C9B9C2728FC45EFECEE /* CoreHaptics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4F7140229CC1D236491CB9CA /* CoreHaptics.framework */; };
+		AA674C63BE1C5AF3DFE317A9 /* libnpyrandom.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 243B405B8DAA11B3D06038FB /* libnpyrandom.xcframework */; };
 		AC5106F52959EE4E00655416 /* Launch Screen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = AC5106F42959EE4E00655416 /* Launch Screen.storyboard */; };
 		AFF84E7D9623124FB7A8D3F3 /* Photos.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5A7641749B9D44C54E1BBDFE /* Photos.framework */; };
 		B8E84737AAA446910914F993 /* MessageUI.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 25C8414497F8E6296A597ED7 /* MessageUI.framework */; };
 		B9D740B78FF3454EF62BF12A /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 31C44A95BA4F2D31DE1C045C /* WebKit.framework */; };
 		BB9D4757A3F349FF27DC7D78 /* libcrypto.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 230943B0AFDC9C60CAF6C442 /* libcrypto.xcframework */; };
 		C8E849BE8622EE80721C94AA /* AudioToolbox.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9C1D4231A812C140D00ABCF9 /* AudioToolbox.framework */; };
+		CA3C4C9194B733177306166B /* libnumpy.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7E6047BDBD7DE772824E6531 /* libnumpy.xcframework */; };
+		CC444C89A9B3F830C0EEE55A /* libpillow.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 35BC4C7A84262301F13DE8F2 /* libpillow.xcframework */; };
 		CD3846F2A5CFDCB7B6D66221 /* libffi.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 59864361B31751B48655D9D2 /* libffi.xcframework */; };
 		D0FB4AA0A8226C4BF0C63F6E /* libpython3.11.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 17C445C2A54DAA82C0BBF162 /* libpython3.11.xcframework */; };
 		D86A4F58915DC9EE73706617 /* AVFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9F384D92844FA79268A315BD /* AVFoundation.framework */; };
@@ -60,6 +67,7 @@
 		1D6058910D05DD3D006BFB54 /* carveracontroller.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = carveracontroller.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		230943B0AFDC9C60CAF6C442 /* libcrypto.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = libcrypto.xcframework; path = ../../../../dist/xcframework/libcrypto.xcframework; sourceTree = SOURCE_ROOT; };
 		240447DF913C90BB541347FC /* libbz2.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; path = libbz2.tbd; sourceTree = DEVELOPER_DIR; };
+		243B405B8DAA11B3D06038FB /* libnpyrandom.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = libnpyrandom.xcframework; path = ../../../../dist/xcframework/libnpyrandom.xcframework; sourceTree = SOURCE_ROOT; };
 		25C8414497F8E6296A597ED7 /* MessageUI.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; path = MessageUI.framework; sourceTree = DEVELOPER_DIR; };
 		29B97316FDCFA39411CA2CEA /* main.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = main.m; sourceTree = "<group>"; };
 		2CB5F34517D5233A006187AB /* bridge.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = bridge.h; sourceTree = SOURCE_ROOT; };
@@ -68,10 +76,13 @@
 		30F3597C2D7C7B3800D5A803 /* UniformTypeIdentifiers.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UniformTypeIdentifiers.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS18.2.sdk/System/Library/Frameworks/UniformTypeIdentifiers.framework; sourceTree = DEVELOPER_DIR; };
 		31C44A95BA4F2D31DE1C045C /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; path = WebKit.framework; sourceTree = DEVELOPER_DIR; };
 		339B48A886CA761D0A19C3D5 /* libSDL2_ttf.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = libSDL2_ttf.xcframework; path = ../../../../dist/xcframework/libSDL2_ttf.xcframework; sourceTree = SOURCE_ROOT; };
+		35BC4C7A84262301F13DE8F2 /* libpillow.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = libpillow.xcframework; path = ../../../../dist/xcframework/libpillow.xcframework; sourceTree = SOURCE_ROOT; };
 		3D0646D283B8832F573E425A /* GameController.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; path = GameController.framework; sourceTree = DEVELOPER_DIR; };
 		4A4B440CA87E67B49D875F29 /* libssl.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = libssl.xcframework; path = ../../../../dist/xcframework/libssl.xcframework; sourceTree = SOURCE_ROOT; };
 		4DEA4A81A8F3A569B130BCAA /* OpenGLES.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; path = OpenGLES.framework; sourceTree = DEVELOPER_DIR; };
 		4F7140229CC1D236491CB9CA /* CoreHaptics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; path = CoreHaptics.framework; sourceTree = DEVELOPER_DIR; };
+		522B42809F414F852C795FD1 /* libnpymath.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = libnpymath.xcframework; path = ../../../../dist/xcframework/libnpymath.xcframework; sourceTree = SOURCE_ROOT; };
+		531848A78C1F6769FE8BD1DB /* libjpeg.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = libjpeg.xcframework; path = ../../../../dist/xcframework/libjpeg.xcframework; sourceTree = SOURCE_ROOT; };
 		537F42158DFB71F9E32277D8 /* libSDL2_mixer.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = libSDL2_mixer.xcframework; path = ../../../../dist/xcframework/libSDL2_mixer.xcframework; sourceTree = SOURCE_ROOT; };
 		59738AB41A8BB5D8001B2C0C /* lib */ = {isa = PBXFileReference; lastKnownFileType = folder; name = lib; path = ../../../../dist/root/python3/lib; sourceTree = "<group>"; };
 		59738ABA1A8E19AA001B2C0C /* Images.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Images.xcassets; sourceTree = "<group>"; };
@@ -84,12 +95,16 @@
 		69034840BB27C9E3CDF095C5 /* libpyobjus.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = libpyobjus.xcframework; path = ../../../../dist/xcframework/libpyobjus.xcframework; sourceTree = SOURCE_ROOT; };
 		6C0A4962AE1BE0703D8D42A7 /* CoreVideo.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; path = CoreVideo.framework; sourceTree = DEVELOPER_DIR; };
 		7AF849BC8B4B05BEC365B924 /* CoreMotion.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; path = CoreMotion.framework; sourceTree = DEVELOPER_DIR; };
+		7E4A9C12B3D84F1A9C0E2B01 /* SceneDelegate.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = SceneDelegate.h; sourceTree = SOURCE_ROOT; };
+		7E4A9C12B3D84F1A9C0E2B02 /* SceneDelegate.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = SceneDelegate.m; sourceTree = SOURCE_ROOT; };
+		7E6047BDBD7DE772824E6531 /* libnumpy.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = libnumpy.xcframework; path = ../../../../dist/xcframework/libnumpy.xcframework; sourceTree = SOURCE_ROOT; };
 		8D1107310486CEB800E47090 /* carveracontroller-Info.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; path = "carveracontroller-Info.plist"; plistStructureDefinitionIdentifier = "com.apple.xcode.plist.structure-definition.iphone.info-plist"; sourceTree = "<group>"; };
 		9AF44AE9BEFA4C339069C854 /* libios.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = libios.xcframework; path = ../../../../dist/xcframework/libios.xcframework; sourceTree = SOURCE_ROOT; };
 		9C1D4231A812C140D00ABCF9 /* AudioToolbox.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; path = AudioToolbox.framework; sourceTree = DEVELOPER_DIR; };
 		9F384D92844FA79268A315BD /* AVFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; path = AVFoundation.framework; sourceTree = DEVELOPER_DIR; };
 		A45949769FBB857AFD4CC2FE /* libsqlite3.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; path = libsqlite3.tbd; sourceTree = DEVELOPER_DIR; };
 		A5124B098F07AB0CE70E7C0F /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; path = UIKit.framework; sourceTree = DEVELOPER_DIR; };
+		A89846A1B3150D9DC56E7FF7 /* libfreetype.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = libfreetype.xcframework; path = ../../../../dist/xcframework/libfreetype.xcframework; sourceTree = SOURCE_ROOT; };
 		AC5106F42959EE4E00655416 /* Launch Screen.storyboard */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = file.storyboard; name = "Launch Screen.storyboard"; path = "Storyboards/Launch Screen.storyboard"; sourceTree = "<group>"; };
 		AD544F96AD5EB18FE34CB6F2 /* MobileCoreServices.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; path = MobileCoreServices.framework; sourceTree = DEVELOPER_DIR; };
 		B16343CABE5245DC84B592C3 /* libquicklz.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = libquicklz.xcframework; path = ../../../../dist/xcframework/libquicklz.xcframework; sourceTree = SOURCE_ROOT; };
@@ -144,6 +159,12 @@
 				86414F6BA0CBE609139D0282 /* libpng16.xcframework in Frameworks */,
 				7A0D45EA98F7B2EF12AD9C02 /* libSDL2_ttf.xcframework in Frameworks */,
 				E93C475E8E8D386492849908 /* libios.xcframework in Frameworks */,
+				CC444C89A9B3F830C0EEE55A /* libpillow.xcframework in Frameworks */,
+				AA674C63BE1C5AF3DFE317A9 /* libnpyrandom.xcframework in Frameworks */,
+				9C264597B0F629F91B7C4F41 /* libjpeg.xcframework in Frameworks */,
+				CA3C4C9194B733177306166B /* libnumpy.xcframework in Frameworks */,
+				4BA9401E95D3FA522F4E9937 /* libnpymath.xcframework in Frameworks */,
+				57BE4D24A86523C7B637473B /* libfreetype.xcframework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -155,6 +176,8 @@
 			children = (
 				2CB5F34517D5233A006187AB /* bridge.h */,
 				2CB5F34617D5233A006187AB /* bridge.m */,
+				7E4A9C12B3D84F1A9C0E2B01 /* SceneDelegate.h */,
+				7E4A9C12B3D84F1A9C0E2B02 /* SceneDelegate.m */,
 			);
 			name = Classes;
 			sourceTree = "<group>";
@@ -240,6 +263,12 @@
 				339B48A886CA761D0A19C3D5 /* libSDL2_ttf.xcframework */,
 				9AF44AE9BEFA4C339069C854 /* libios.xcframework */,
 				B16343CABE5245DC84B592C3 /* libquicklz.xcframework */,
+				35BC4C7A84262301F13DE8F2 /* libpillow.xcframework */,
+				243B405B8DAA11B3D06038FB /* libnpyrandom.xcframework */,
+				531848A78C1F6769FE8BD1DB /* libjpeg.xcframework */,
+				7E6047BDBD7DE772824E6531 /* libnumpy.xcframework */,
+				522B42809F414F852C795FD1 /* libnpymath.xcframework */,
+				A89846A1B3150D9DC56E7FF7 /* libfreetype.xcframework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -390,6 +419,7 @@
 			files = (
 				1D60589B0D05DD56006BFB54 /* main.m in Sources */,
 				2CB5F34717D5233A006187AB /* bridge.m in Sources */,
+				7E4A9C12B3D84F1A9C0E2B03 /* SceneDelegate.m in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -405,7 +435,7 @@
 				COPY_PHASE_STRIP = NO;
 				CURRENT_PROJECT_VERSION = 1;
 				DEAD_CODE_STRIPPING = NO;
-				DEVELOPMENT_TEAM = QMMYJPQXNE;
+				DEVELOPMENT_TEAM = RD2B7W3NLG;
 				EXCLUDED_ARCHS = "";
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(SRCROOT)/../../../../dist/frameworks",
@@ -456,7 +486,7 @@
 				COPY_PHASE_STRIP = NO;
 				CURRENT_PROJECT_VERSION = 1;
 				DEAD_CODE_STRIPPING = NO;
-				DEVELOPMENT_TEAM = QMMYJPQXNE;
+				DEVELOPMENT_TEAM = RD2B7W3NLG;
 				EXCLUDED_ARCHS = "";
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(SRCROOT)/../../../../dist/frameworks",

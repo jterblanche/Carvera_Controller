@@ -7,12 +7,12 @@ from typing import Any
 from carveracontroller.CNC import PROBE_3D_TOOL_NUMBER
 
 from .facing_gcode import MILLING_CLIMB, PATTERN_RASTER_X
-from .stock_geometry import CORNER_BL
+from .stock_geometry import STOCK_ORIGIN_CORNER_BL
 
 DEFAULT_PROBE_TOOL_T = PROBE_3D_TOOL_NUMBER
 DEFAULT_M6_COLLET = None
 
-DEFAULT_STOCK_ORIGIN_CORNER = CORNER_BL
+DEFAULT_STOCK_ORIGIN_CORNER = STOCK_ORIGIN_CORNER_BL
 DEFAULT_PATTERN = PATTERN_RASTER_X
 DEFAULT_MILLING_DIRECTION = MILLING_CLIMB
 
@@ -34,6 +34,7 @@ DEFAULT_TXT: dict[str, str] = {
     "txt_rough_f": "1200",
     "txt_rough_plunge": "400",
     "txt_rough_step": "2",
+    "txt_path_radius": "0",
     "txt_rough_doc": "1",
     "txt_rough_total": "2",
     "txt_finish_f": "600",
