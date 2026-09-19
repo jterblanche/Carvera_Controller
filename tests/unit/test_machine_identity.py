@@ -79,6 +79,34 @@ def test_load_or_create_identity_recovers_from_corrupt_persisted_id():
     assert store.get("controller_id") == str(identity.id)
 
 
+def test_load_or_create_identity_regenerates_a_negative_persisted_id():
+    # A hand-edited or corrupted config value that parses as an int but
+    # can't fit the hello frame's 8-byte unsigned id field.
+    store = FakeStore(controller_id="-1", controller_name="Shop Laptop")
+
+    identity = load_or_create_identity(store)
+
+    assert 0 <= identity.id < 2**64
+    assert store.get("controller_id") == str(identity.id)
+
+
+def test_load_or_create_identity_regenerates_an_oversized_persisted_id():
+    store = FakeStore(controller_id=str(2**64), controller_name="Shop Laptop")
+
+    identity = load_or_create_identity(store)
+
+    assert 0 <= identity.id < 2**64
+    assert store.get("controller_id") == str(identity.id)
+
+
+def test_load_or_create_identity_keeps_the_boundary_values():
+    store_low = FakeStore(controller_id="0", controller_name="A")
+    store_high = FakeStore(controller_id=str(2**64 - 1), controller_name="B")
+
+    assert load_or_create_identity(store_low).id == 0
+    assert load_or_create_identity(store_high).id == 2**64 - 1
+
+
 def test_controller_identity_trims_name_on_construction():
     identity = ControllerIdentity(id=1, name="x" * 50)
     assert len(identity.name.encode("utf-8")) <= MAX_NAME_BYTES
@@ -92,6 +120,15 @@ def test_set_name_persists_trimmed_name_and_keeps_id():
     assert identity.id == 7
     assert identity.name == "New Name"
     assert store.get("controller_name") == "New Name"
+
+
+def test_set_name_regenerates_an_out_of_range_persisted_id():
+    store = FakeStore(controller_id="-5", controller_name="Old Name")
+
+    identity = set_name(store, "New Name")
+
+    assert 0 <= identity.id < 2**64
+    assert store.get("controller_id") == str(identity.id)
 
 
 def test_set_name_trims_an_overlong_name():

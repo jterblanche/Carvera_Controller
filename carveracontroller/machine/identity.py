@@ -1,9 +1,9 @@
 """Controller identity: a stable random id and a display name.
 
 Sent in the hello handshake so the machine and other controllers can
-recognise this one (docs/protocol/connection-follows-me.md §6.1). Kivy-free:
-persistence is done through the ``IdentityStore`` protocol, implemented by a
-thin adapter over whatever settings storage the application uses.
+recognise this one. Kivy-free: persistence is done through the
+``IdentityStore`` protocol, implemented by a thin adapter over whatever
+settings storage the application uses.
 """
 
 from __future__ import annotations
@@ -70,17 +70,33 @@ class IdentityStore(Protocol):
     def set(self, key: str, value: str) -> None: ...
 
 
-def load_or_create_identity(store: IdentityStore) -> ControllerIdentity:
-    """Load the persisted identity, creating and persisting a fresh one if absent."""
+def _load_or_generate_id(store: IdentityStore) -> int:
+    """Read the persisted id, generating and persisting a fresh one if it is
+    missing or not a valid 64-bit unsigned value.
+
+    The hello frame's id field is a fixed-width 8-byte unsigned integer
+    (protocols/makera.py's ``encode_hello``); a hand-edited or corrupted
+    config value that parses as an int but falls outside ``0 <= id < 2**64``
+    would otherwise raise every time a hello is built, rather than once
+    here.
+    """
     raw_id = store.get(_KEY_ID)
     controller_id: int | None
     try:
         controller_id = int(raw_id) if raw_id else None
     except ValueError:
         controller_id = None
+    if controller_id is not None and not (0 <= controller_id < 2**64):
+        controller_id = None
     if controller_id is None:
         controller_id = generate_id()
         store.set(_KEY_ID, str(controller_id))
+    return controller_id
+
+
+def load_or_create_identity(store: IdentityStore) -> ControllerIdentity:
+    """Load the persisted identity, creating and persisting a fresh one if absent."""
+    controller_id = _load_or_generate_id(store)
 
     raw_name = store.get(_KEY_NAME)
     name = raw_name if raw_name else default_name()
@@ -95,13 +111,6 @@ def set_name(store: IdentityStore, name: str) -> ControllerIdentity:
     trimmed = trim_name(name) or default_name()
     store.set(_KEY_NAME, trimmed)
 
-    raw_id = store.get(_KEY_ID)
-    try:
-        controller_id = int(raw_id) if raw_id else None
-    except ValueError:
-        controller_id = None
-    if controller_id is None:
-        controller_id = generate_id()
-        store.set(_KEY_ID, str(controller_id))
+    controller_id = _load_or_generate_id(store)
 
     return ControllerIdentity(id=controller_id, name=trimmed)
