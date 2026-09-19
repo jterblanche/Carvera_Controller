@@ -2499,7 +2499,19 @@ class Controller:
                         allow_wire_switch = self.sendNUM == 0 and self.loadNUM == 0
                         for message in self.comms.feed(data, allow_wire_switch=allow_wire_switch):
                             self._handle_protocol_message(message)
-                    elif data == b"" and self.comms.uses_framed_transfer and not self.comms.frame_confirmed:
+                    elif (
+                        data == b""
+                        and self.connection_type == CONN_WIFI
+                        and self.comms.uses_framed_transfer
+                        and not self.comms.frame_confirmed
+                    ):
+                        # WiFi only: a TCP recv() of b"" after select() said
+                        # readable is the standard peer-closed signal. USB
+                        # serial's recv() can return b"" on an ordinary read
+                        # timeout with nothing wrong, so this check would
+                        # misfire there — it isn't the old-firmware-busy race
+                        # this exists for (protocol doc §7), which is
+                        # inherently a WiFi TCP accept/close pattern.
                         self._handle_closed_before_identify()
                     dynamic_delay = 0
                 else:
