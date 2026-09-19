@@ -1,4 +1,4 @@
-from carveracontroller.machine.hello import ACK_TIMEOUT_S, HelloNegotiator, Resolution
+from carveracontroller.machine.hello import ACK_TIMEOUT_S, HELLO_WINDOW_S, HelloNegotiator, Resolution
 from carveracontroller.machine.identity import ControllerIdentity
 from carveracontroller.protocols.handshake import (
     HELLO_ACCEPTED,
@@ -117,6 +117,47 @@ def test_re_hello_stops_once_identified():
     assert negotiator.on_status_reply(now=100.0) is None
 
 
+def test_duplicate_accepted_ack_does_not_report_newly_identified():
+    """A repeated hello ack on an already-identified link changes nothing —
+    a caller that triggers a one-off action on "newly identified" (like
+    requesting the client list) must not repeat it on every re-ack."""
+    negotiator = HelloNegotiator(identity=IDENTITY, link=LINK_WIFI)
+    negotiator.on_valid_frame(now=0.0)
+
+    first = negotiator.on_hello_ack(HelloAck(HELLO_PROTOCOL_VERSION, HELLO_ACCEPTED, 0))
+    second = negotiator.on_hello_ack(HelloAck(HELLO_PROTOCOL_VERSION, HELLO_ACCEPTED, 0))
+
+    assert first is True
+    assert second is False
+    assert negotiator.identified is True
+
+
+def test_re_hello_continues_past_the_ack_timeout_within_the_hello_window():
+    """Re-hello must keep going after the controller's own 1.0s fallback —
+    that timer is the controller's own decision to stop *waiting*, not the
+    machine's. The machine may still be listening for a hello until its own
+    window passes."""
+    negotiator = HelloNegotiator(identity=IDENTITY, link=LINK_WIFI)
+    negotiator.on_valid_frame(now=0.0)
+    negotiator.poll(now=ACK_TIMEOUT_S)  # functional fallback already happened
+    assert negotiator.resolution is Resolution.FALLBACK
+
+    frame = negotiator.on_status_reply(now=2 * ACK_TIMEOUT_S)
+
+    assert frame is not None
+    assert frame[4] == 0x60
+
+
+def test_re_hello_stops_once_the_hello_window_has_passed():
+    negotiator = HelloNegotiator(identity=IDENTITY, link=LINK_WIFI)
+    negotiator.on_valid_frame(now=0.0)
+
+    # Still within the window: fires.
+    assert negotiator.on_status_reply(now=HELLO_WINDOW_S - 0.01) is not None
+    # Past the window: the machine has given up on this link; stop.
+    assert negotiator.on_status_reply(now=HELLO_WINDOW_S + 1.0) is None
+
+
 def test_repeated_status_replies_do_not_delay_fallback():
     """A status reply arriving right at the ack-timeout boundary triggers a
     re-hello (on_status_reply) — that resend must not push back poll()'s
@@ -134,7 +175,7 @@ def test_repeated_status_replies_do_not_delay_fallback():
 
 def test_late_ack_after_fallback_still_identifies():
     """A lost-then-retried ack can identify the controller even after the
-    1.0s window already forced a functional fallback (protocol doc §4.2)."""
+    1.0s window already forced a functional fallback."""
     negotiator = HelloNegotiator(identity=IDENTITY, link=LINK_WIFI)
     negotiator.on_valid_frame(now=0.0)
     negotiator.poll(now=ACK_TIMEOUT_S)
