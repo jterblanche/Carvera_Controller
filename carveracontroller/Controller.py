@@ -22,14 +22,18 @@ from . import Utils
 from .CNC import CMDPAT, CNC, LASER_TOOL_NUMBER, PARENPAT, SEMIPAT, ZPROBE_TOOL_NUMBER
 from .machine.hello import HelloNegotiator, Resolution
 from .machine.identity import ControllerIdentity, default_name, generate_id
-from .protocols import LINK_USB, LINK_WIFI, MessageKind, ProtocolSession
-from .protocols.handshake import (
+from .protocols import (
     HELLO_REJECTED_CAP,
+    LINK_USB,
+    LINK_WIFI,
     ClientEntry,
+    MessageKind,
+    ProtocolSession,
     decode_client_list,
     decode_hello_ack,
+    encode_automatic_command,
+    encode_client_list_request,
 )
-from .protocols.makera import encode_automatic_command, encode_client_list_request
 from .USBBulkStream import USBBulkStream, is_usb_bulk_address
 from .USBStream import USBStream
 from .WIFIStream import WIFIStream
@@ -126,10 +130,24 @@ class Controller:
         # Connect-time identify handshake for the current connection, or
         # None when not connected. See machine/hello.py.
         self._hello: HelloNegotiator | None = None
-        # Sends held back while the handshake is unresolved: (kind, payload,
-        # display) where kind is 0 (console command) or 1 (file transfer
-        # start), matching the automatic-command wrapper's `kind` field.
-        self._pending_sends = []
+        # Guards _pending_sends below: executeCommand/executeFileCommand/the
+        # automatic-query methods can be called from the UI thread while
+        # streamIO (a separate thread) resolves the handshake and flushes
+        # this queue. Without a lock shared by the "check resolved, then
+        # append" and "swap the queue out, then send" steps, a send that
+        # passes the resolved check on one thread can still be appended
+        # after the other thread has already swapped the queue out to
+        # flush it — stranding that send until the next connection.
+        self._pending_sends_lock = threading.Lock()
+        # Sends held back while the handshake is unresolved: (channel, kind,
+        # payload, display). channel is "ordinary" (executeCommand/
+        # executeFileCommand: always flushed unwrapped, exactly as it would
+        # have gone out today) or "auto" (an allow-listed connect-time
+        # query: flushed wrapped in the automatic-command envelope if the
+        # handshake identified us, unwrapped otherwise). kind is 0 (console
+        # command) or 1 (file transfer start), matching the automatic-
+        # command wrapper's `kind` field.
+        self._reset_pending_sends()
         # The other controllers currently connected, from the last client-list reply.
         self.connected_clients: tuple[ClientEntry, ...] = ()
 
@@ -288,33 +306,89 @@ class Controller:
             except Exception:
                 self.log.put((Controller.MSG_ERROR, str(sys.exc_info()[1])))
 
+    def _reset_pending_sends(self):
+        with self._pending_sends_lock:
+            self._pending_sends = []
+
     def _gate_send(self, kind, payload, display):
         """Hold back an ordinary-channel send while the identify handshake
-        is unresolved (protocol doc §5.2: nothing but hello and realtime
-        bytes goes out before an accepted ack). Returns True if the send was
-        queued rather than sent now; ``_flush_pending_sends`` sends it once
-        the handshake resolves, wrapped in the automatic-command envelope if
-        identified, or exactly as it would have gone out today otherwise.
+        is unresolved: a new controller must not send the machine anything
+        but realtime bytes and the hello itself until it has an accepted
+        ack. Returns True if the send was queued rather than sent now;
+        ``_flush_pending_sends`` sends every queued ordinary-channel item
+        once the handshake resolves, always unwrapped, exactly as it would
+        have gone out today — these are real user/UI-triggered sends
+        (including ones this codebase doesn't specifically track as
+        "automatic"), and wrapping something not on the machine's allow-
+        list would just get it refused. Genuine automatic queries use
+        ``_send_automatic_command`` instead, never this method.
         """
         negotiator = self._hello
-        if negotiator is None or negotiator.resolved:
+        if negotiator is None:
             return False
-        self._pending_sends.append((kind, payload, display))
+        with self._pending_sends_lock:
+            if negotiator.resolved:
+                return False
+            self._pending_sends.append(("ordinary", kind, payload, display))
+            return True
+
+    def _send_automatic_command(self, kind, payload, display=None):
+        """Send one of the small set of allow-listed connect-time queries
+        (current time, firmware version, machine model, filesystem type, the
+        automatic config-file fetch, and the USB baud-rate switch).
+
+        Whether this goes out wrapped in the automatic-command envelope is
+        decided by whether the controller is currently identified, not by
+        whether this particular call happened to race the ack: once
+        identified, every call from here on wraps, for the rest of the
+        connection, not just the ones pending when the ack arrived.
+        Otherwise (not identified, e.g. the old-firmware fallback) it goes
+        out exactly as it always has, on the ordinary channel. Like any
+        other send, it is held back first if the handshake is still
+        unresolved.
+
+        Returns True if the frame was actually sent just now, False if it
+        was queued for later — a caller with follow-up steps that only make
+        sense once the machine has actually seen this send (starting an
+        XMODEM transfer that depends on a download command already having
+        reached the machine, or reopening a serial port at a new baud rate
+        right after asking the firmware to switch to it) must check this
+        and not proceed on a queued send.
+        """
+        if not self.stream:
+            return False
+        if isinstance(payload, str):
+            payload = payload.encode()
+        negotiator = self._hello
+        with self._pending_sends_lock:
+            if negotiator is not None and not negotiator.resolved:
+                self._pending_sends.append(("auto", kind, payload, display))
+                return False
+        if negotiator is not None and negotiator.identified:
+            frame = encode_automatic_command(kind, payload)
+        elif kind == 0:
+            frame = self.comms.encode_command(payload)
+        else:
+            frame = self.comms.encode_file_command(payload)
+        self._send_raw(frame)
+        if display is not None and self.execCallback:
+            self.execCallback(display)
         return True
 
     def _flush_pending_sends(self):
         negotiator = self._hello
-        pending, self._pending_sends = self._pending_sends, []
+        with self._pending_sends_lock:
+            pending, self._pending_sends = self._pending_sends, []
         if not pending or negotiator is None or self.stream is None:
             return
         if negotiator.resolution is Resolution.REJECTED:
-            # A rejected client never becomes a peer and the link is about
-            # to be closed by the machine (protocol doc §6.2) — drop rather
-            # than send into a connection that's already being torn down.
+            # A rejected client never becomes a peer, and the machine is
+            # about to close this link — drop rather than send into a
+            # connection that's already being torn down.
             return
-        wrap = negotiator.resolution is Resolution.IDENTIFIED
-        for kind, payload, display in pending:
-            if wrap:
+        wrap_auto = negotiator.resolution is Resolution.IDENTIFIED
+        for channel, kind, payload, display in pending:
+            if channel == "auto" and wrap_auto:
                 frame = encode_automatic_command(kind, payload)
             elif kind == 0:
                 frame = self.comms.encode_command(payload)
@@ -364,7 +438,15 @@ class Controller:
             self.log.put((Controller.MSG_ERROR, str(sys.exc_info()[1])))
 
     def executeFileCommand(self, line):
-        """Send an upload/download initiation command through the active protocol."""
+        """Send an upload/download initiation command through the active protocol.
+
+        Returns True if it was actually sent now, False if it was held back
+        (the identify handshake is still unresolved) or nothing was sent at
+        all (no stream, or an error). A caller that immediately starts
+        reading/writing the transfer itself (e.g. ``doDownload``) must check
+        this — proceeding on a queued send would start the XMODEM transfer
+        before the machine has been told to expect one.
+        """
         if self.stream and line:
             try:
                 if isinstance(line, str) and not line.endswith("\n"):
@@ -376,12 +458,14 @@ class Controller:
                     if display.endswith(".lz\n"):
                         display = display[:-4] + "\n"
                 if self._gate_send(1, payload, display):
-                    return
+                    return False
                 self.stream.send(self.comms.encode_file_command(payload))
                 if display is not None:
                     self.execCallback(display)
+                return True
             except Exception:
                 self.log.put((Controller.MSG_ERROR, str(sys.exc_info()[1])))
+        return False
 
     # ----------------------------------------------------------------------
     def autoCommand(
@@ -452,19 +536,21 @@ class Controller:
         self.executeCommand("M471")
 
     def syncTime(self, *args):
+        # A write (sets the machine's clock), not a read — always the
+        # ordinary channel, never automatic.
         self.executeCommand("time " + str(Utils.local_unix_time()))
 
     def queryTime(self, *args):
-        self.executeCommand("time")
+        self._send_automatic_command(0, "time", "time\n" if self.execCallback else None)
 
     def queryVersion(self, *args):
-        self.executeCommand("version")
+        self._send_automatic_command(0, "version", "version\n" if self.execCallback else None)
 
     def queryModel(self, *args):
-        self.executeCommand("model")
+        self._send_automatic_command(0, "model", "model\n" if self.execCallback else None)
 
     def queryFtype(self, *args):
-        self.executeCommand("ftype")
+        self._send_automatic_command(0, "ftype", "ftype\n" if self.execCallback else None)
 
     # # ----------------------------------------------------------------------
     # def zProbeCommand(self, c=0, d=0, buffer=False):
@@ -817,11 +903,26 @@ class Controller:
             upload_command = "upload %s\n" % "/".join(filename.split("\\")).replace(" ", "\x01")
         self.executeFileCommand(self.escape(upload_command))
 
-    def downloadCommand(self, filename):
+    def downloadCommand(self, filename, automatic=False):
+        """Send a download-start command.
+
+        ``automatic=True`` is for the one connect-time caller (the
+        unprompted config-file fetch) — routes through the automatic-query
+        path so it wraps once identified, rather than racing whether the
+        ack happened to already arrive. A manual download (the file
+        browser) always leaves this False: the same "download <path>" text
+        is used for both, so only the caller can say which one this is: it
+        cannot be told apart by the string. Returns True if actually sent
+        now, False if held back — see ``executeFileCommand``.
+        """
         download_command = "download %s\n" % filename.replace(" ", "\x01")
         if "\\" in filename:
             download_command = "download %s\n" % "/".join(filename.split("\\")).replace(" ", "\x01")
-        self.executeFileCommand(self.escape(download_command))
+        escaped = self.escape(download_command)
+        if automatic:
+            display = escaped if self.execCallback else None
+            return self._send_automatic_command(1, escaped, display)
+        return self.executeFileCommand(escaped)
 
     def suspendCommand(self):
         self.executeCommand("suspend\n")
@@ -1659,7 +1760,7 @@ class Controller:
             self.stream = None
         self.comms.reset()
         self._hello = None
-        self._pending_sends = []
+        self._reset_pending_sends()
         self.connected_clients = ()
         self.clearRun()
 
@@ -1736,12 +1837,14 @@ class Controller:
             except Exception:
                 self.log.put((self.MSG_ERROR, "Controller clear thread error!"))
             self.comms.detect_and_select(transport)
-            # Hello only ever applies on a framed (Makera) link, never
-            # Smoothie (protocol doc §3); a non-applicable negotiator
-            # resolves to the legacy fallback immediately.
+            # Hello only ever applies on a framed (Makera) link, never a
+            # legacy plaintext (Smoothie) one — sending framed bytes into a
+            # plaintext parser risks a random byte being misread as a
+            # control character. A non-applicable negotiator resolves to
+            # the legacy fallback immediately.
             link = LINK_USB if conn_type == CONN_USB else LINK_WIFI
             self._hello = HelloNegotiator(identity=self.identity, link=link, applicable=self.comms.uses_framed_transfer)
-            self._pending_sends = []
+            self._reset_pending_sends()
             self.connected_clients = ()
             self.stream = transport
             self.thread = threading.Thread(target=self.streamIO)
@@ -1777,7 +1880,7 @@ class Controller:
         self.stream = None
         self.comms.reset()
         self._hello = None
-        self._pending_sends = []
+        self._reset_pending_sends()
         self.connected_clients = ()
         CNC.vars["state"] = NOT_CONNECTED
         CNC.vars["color"] = STATECOLOR[CNC.vars["state"]]
@@ -1807,7 +1910,7 @@ class Controller:
         self.stream = None
         self.comms.reset()
         self._hello = None
-        self._pending_sends = []
+        self._reset_pending_sends()
         self.connected_clients = ()
         # Set a flag to indicate this was a manual disconnection
         self._manual_disconnect = True
@@ -2219,7 +2322,17 @@ class Controller:
         # Stop streamIO and wait until it is parked so it cannot steal the "ok".
         self.pauseStream(0.0)
         try:
-            self.executeCommand(f"baud {baud}\n")
+            payload = f"baud {baud}\n"
+            display = payload if self.execCallback else None
+            if not self._send_automatic_command(0, payload, display):
+                # Held back (handshake still unresolved) rather than sent —
+                # streamIO is paused right now, so nothing will flush this
+                # until it resumes below, and reopening the host port
+                # without the firmware having seen the command would just
+                # break the link. Bail out; the next scheduled attempt (or
+                # connection) tries again.
+                self.log.put((self.MSG_ERROR, "Failed to change serial speed: not yet connected to the machine"))
+                return
             # Firmware prints framed/text "ok" at the old baud, then switches.
             # Give TX time to finish, then reopen the host port at the new rate.
             time.sleep(0.15)
@@ -2246,8 +2359,10 @@ class Controller:
         """Best-effort restore of 115200 after a failed high-baud switch."""
         try:
             # Machine may already be at attempted_baud — ask it to drop back.
-            self.executeCommand("baud 115200\n")
-            time.sleep(0.15)
+            payload = "baud 115200\n"
+            display = payload if self.execCallback else None
+            if self._send_automatic_command(0, payload, display):
+                time.sleep(0.15)
         except Exception:
             pass
         try:
@@ -2358,7 +2473,7 @@ class Controller:
             return
 
         # LINE. Still-unidentified controllers re-send hello on a live reply
-        # in case the previous hello's ack was lost (protocol doc §4.2).
+        # in case the previous hello's ack was lost.
         if self._hello is not None and not self._hello.identified:
             frame = self._hello.on_status_reply(time.time())
             if frame is not None and self.stream is not None:
@@ -2401,34 +2516,59 @@ class Controller:
         if newly_identified:
             if self.stream is not None:
                 self._send_raw(encode_client_list_request())
-        elif negotiator.resolution is Resolution.REJECTED:
+            return
+        if not was_resolved and negotiator.resolution is Resolution.REJECTED:
+            # The machine closes this link shortly after a rejected ack
+            # (cap reached, or an old controller already present) — it was
+            # never going to treat this as a peer. Close it ourselves now,
+            # without starting a reconnect loop against a machine that just
+            # refused us, so the user sees the rejection message rather
+            # than it being overwritten a moment later by a heartbeat-
+            # timeout "connection lost" popup and repeated failed retries.
             reason = "cap" if ack.result == HELLO_REJECTED_CAP else "old_controller"
+            self._close_inline()
             self._notify_hello_rejected(reason)
 
     def _on_client_list(self, payload):
         self.connected_clients = decode_client_list(payload)
         self._notify_client_list_updated(self.connected_clients)
 
-    def _handle_closed_before_identify(self):
-        """The peer closed the link before a single valid frame was ever
-        confirmed — the signature of old firmware that already has another
-        client attached (protocol doc §7: "accepted and closed by the
-        machine at once", measured ~60ms). Show today's "machine busy"
-        message instead of the heartbeat-timeout "connection lost" flow, and
-        don't start an auto-reconnect loop against a machine that just
-        refused us."""
+    def _close_inline(self):
+        """Close the current link from within the streamIO thread itself.
+
+        Deliberately not ``close()``: that calls ``_join_stream_io()``,
+        which would try to join the very thread calling this method. Skips
+        ``stopRun``/the thread join for the same reason (nothing is running
+        that needs stopping — this only ever runs before the connection
+        became a normal, working one), and never starts a reconnect loop,
+        since both callers below are cases where retrying the exact same
+        thing would just repeat the same outcome.
+        """
         self._runLines = 0
         self._hello = None
-        self._pending_sends = []
+        self._reset_pending_sends()
         self.connected_clients = ()
-        try:
-            self.stream.close()
-        except Exception:
-            pass
-        self.stream = None
+        if self.stream is not None:
+            try:
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None
         self.comms.reset()
         CNC.vars["state"] = NOT_CONNECTED
         CNC.vars["color"] = STATECOLOR[CNC.vars["state"]]
+
+    def _handle_closed_before_identify(self):
+        """The peer closed the link before a single valid frame was ever
+        confirmed. On today's firmware this is the signature of a machine
+        that already has another controller attached: it accepts the TCP
+        connection and closes it again almost immediately (measured about
+        60ms), never having sent a single byte back. Show the same
+        "machine busy" message the pre-connect busy check already uses,
+        instead of the heartbeat-timeout "connection lost" flow, and don't
+        start an auto-reconnect loop against a machine that just refused
+        us."""
+        self._close_inline()
         self._notify_machine_busy_before_identify()
 
     def _notify_hello_rejected(self, reason):
@@ -2509,9 +2649,9 @@ class Controller:
                         # readable is the standard peer-closed signal. USB
                         # serial's recv() can return b"" on an ordinary read
                         # timeout with nothing wrong, so this check would
-                        # misfire there — it isn't the old-firmware-busy race
-                        # this exists for (protocol doc §7), which is
-                        # inherently a WiFi TCP accept/close pattern.
+                        # misfire there — the old-firmware-busy race this
+                        # exists for is inherently a WiFi TCP accept/close
+                        # pattern, not something that can happen over USB.
                         self._handle_closed_before_identify()
                     dynamic_delay = 0
                 else:
@@ -2520,7 +2660,10 @@ class Controller:
                     else:
                         dynamic_delay = 0
 
-                self._advance_hello(t)
+                # A fresh timestamp, not the loop's `t`: recv()/_handle_protocol_message
+                # above can take a little time, and the ack-wait deadline is timed
+                # against the real clock, not against when this iteration started.
+                self._advance_hello(time.time())
 
             except Exception:
                 self.comms.reset_parser()
