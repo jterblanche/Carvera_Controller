@@ -1,9 +1,7 @@
-"""Decoders for the identify-handshake and client-list wire messages.
-
-Wire layouts are the ones in docs/protocol/connection-follows-me.md (the
-workspace repo, not part of this fork): hello ack (`0x61`) and client-list
-reply (`0x64`). This module only decodes; encoding lives in
-``protocols/makera.py`` alongside the rest of the Makera frame builders.
+"""Decoders for the identify-handshake and client-list wire messages: hello
+ack (`0x61`) and client-list reply (`0x64`). This module only decodes;
+encoding lives in ``protocols/makera.py`` alongside the rest of the Makera
+frame builders.
 """
 
 from __future__ import annotations

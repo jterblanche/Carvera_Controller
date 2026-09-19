@@ -63,7 +63,10 @@ def encode_automatic_command(kind: int, data: bytes) -> bytes:
     file-transfer start (as FILE_START/0xB0 would carry). ``data`` is
     normalised the same way ``encode_command``/``encode_file_command`` would
     normalise it for the channel it stands in for, so the wrapped payload is
-    "exactly the text that channel would otherwise carry" (protocol doc §5.1).
+    exactly the text that channel would otherwise carry — the machine only
+    executes a wrapped command (never moving control to the sender) when its
+    first word is on a fixed allow-list of read-only/self-contained
+    commands; anything else wrapped this way is refused, not executed.
     """
     if kind == 0:
         payload = bytes(data).rstrip(b"\r\n")
@@ -189,7 +192,7 @@ class MakeraProtocol(CommunicationProtocol):
         if parsed is None:
             return []
         # Any complete, CRC-valid frame — regardless of type — proves the
-        # link is actually framed (docs/protocol/connection-follows-me.md §3).
+        # link is genuinely speaking the framed protocol.
         self.frame_confirmed = True
 
         if parsed.ptype in _FILE_TRANSFER_TYPES:
@@ -198,7 +201,7 @@ class MakeraProtocol(CommunicationProtocol):
         # New multi-client types must be intercepted here, before the
         # unknown-type-becomes-console-LINE fallback below, or a new
         # controller talking to another new controller/firmware would show
-        # raw protocol frames as garbled console text (protocol doc §7).
+        # raw protocol frames as garbled console text.
         if parsed.ptype == PTYPE_HELLO_ACK:
             return [ParsedMessage(MessageKind.HELLO_ACK, payload=parsed.payload)]
         if parsed.ptype == PTYPE_CLIENT_LIST_REPLY:

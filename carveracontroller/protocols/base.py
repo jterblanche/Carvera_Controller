@@ -17,9 +17,11 @@ class CommunicationProtocol(ABC):
         self.ready: bool = False
         # True once at least one complete, CRC-valid frame has been received
         # from the machine. Only ever set by a framed protocol (Makera);
-        # stays False for Smoothie, which has no frames. Proves the link is
-        # actually framed, as opposed to the protocol detector's own guess —
-        # see docs/protocol/connection-follows-me.md §3.
+        # stays False for Smoothie, which has no frames. This is what proves
+        # a link is genuinely speaking the framed protocol, as opposed to
+        # the protocol detector's own guess (which only checks for the
+        # *absence* of a plaintext echo reply, not confirmation that a
+        # framed reply was ever received).
         self.frame_confirmed: bool = False
 
     @abstractmethod
