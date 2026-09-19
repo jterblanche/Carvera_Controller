@@ -137,3 +137,26 @@ def test_a_repeated_beacon_within_one_scan_updates_the_entry_in_place():
 
     assert len(detector.machine_list) == 1
     assert detector.machine_list[0]["old_controller_present"] is True
+
+
+def test_two_machines_sharing_a_name_get_separate_entries_not_one_flip_flopping_one():
+    """The in-place update is keyed by (name, ip) together, not name alone
+    — two different machines that happen to broadcast the same name must
+    not be folded into a single entry that alternates between their IPs."""
+    detector = MachineDetector()
+    detector.sock = _FakeUdpSocket(
+        [
+            b"Carvera,10.0.0.5,2222,0,0",
+            b"Carvera,10.0.0.9,2222,1,1",
+            b"Carvera,10.0.0.5,2222,0,0",
+        ]
+    )
+    detector.t = detector.tr = time.time()
+
+    detector.check_for_responses()
+    detector.check_for_responses()
+    detector.check_for_responses()
+
+    assert len(detector.machine_list) == 2
+    ips = {entry["ip"] for entry in detector.machine_list}
+    assert ips == {"10.0.0.5", "10.0.0.9"}

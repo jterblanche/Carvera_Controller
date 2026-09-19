@@ -21,6 +21,7 @@ SOCKET_TIMEOUT = 0.3  # s
 class MachineDetector:
     def __init__(self):
         self.machine_list = []
+        # (name, ip) pairs already recorded this scan — see check_for_responses.
         self.machine_name_list = []
         self.sock = None
         self.t = None
@@ -70,20 +71,23 @@ class MachineDetector:
                         "busy": fields[3] == "1",
                         "old_controller_present": old_controller_present,
                     }
-                    if fields[0] in self.machine_name_list:
+                    # Keyed by (name, ip) together, not name alone: two
+                    # different machines that happen to share a name must
+                    # not be folded into one flip-flopping entry.
+                    key = (fields[0], fields[1])
+                    if key in self.machine_name_list:
                         # Seen this machine already this scan — update its
                         # entry in place rather than ignoring the repeat, so
                         # a flag that changes mid-scan (e.g. an old
                         # controller connecting) is reflected, not stuck at
                         # whatever the first beacon said.
                         for i, existing in enumerate(self.machine_list):
-                            if existing["machine"] == fields[0]:
+                            if (existing["machine"], existing["ip"]) == key:
                                 self.machine_list[i] = entry
                                 break
                     else:
-                        self.machine_name_list.append(fields[0])
+                        self.machine_name_list.append(key)
                         self.machine_list.append(entry)
-                    print(entry)
                 self.t = time.time()
                 return None
             self.sock.close()
