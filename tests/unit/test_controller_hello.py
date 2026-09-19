@@ -226,6 +226,7 @@ def test_ack_rejected_closes_the_link_shows_message_and_drops_held_sends():
         ):
             mock_app_cls.get_running_app.return_value = fake_app
             controller.open(CONN_WIFI, m.address())
+            streamio_thread = controller.thread
             controller.executeCommand("version")  # held back; must never be sent
 
             assert m.wait_until(lambda: len(m.hellos_received) >= 1, timeout=2.0)
@@ -233,6 +234,13 @@ def test_ack_rejected_closes_the_link_shows_message_and_drops_held_sends():
 
             assert m.frames_of_type(PTYPE_CTRL_MULTI) == []
             assert m.frames_of_type(PTYPE_AUTO_COMMAND) == []
+
+            # _close_inline must stop streamIO itself (stopRun()), not rely
+            # on some other test's close() happening to clear the shared
+            # stop Event first — join it directly, on its own, here.
+            streamio_thread.join(timeout=2.0)
+            assert not streamio_thread.is_alive()
+            assert controller._manual_disconnect is True
 
             scheduled = [call.args[0] for call in mock_clock.schedule_once.call_args_list]
             for fn in scheduled:
@@ -259,10 +267,18 @@ def test_accepted_then_closed_before_identify_shows_busy_not_lost():
         ):
             mock_app_cls.get_running_app.return_value = fake_app
             controller.open(CONN_WIFI, m.address())
+            streamio_thread = controller.thread
 
             deadline_ok = m.wait_until(lambda: controller.stream is None, timeout=2.0)
             assert deadline_ok, "controller must give up the link once the machine closes it"
             assert controller.comms.frame_confirmed is False
+
+            # _close_inline must stop streamIO itself (stopRun()), not rely
+            # on some other test's close() happening to clear the shared
+            # stop Event first — join it directly, on its own, here.
+            streamio_thread.join(timeout=2.0)
+            assert not streamio_thread.is_alive()
+            assert controller._manual_disconnect is True
 
             assert mock_clock.schedule_once.called
             scheduled = [call.args[0] for call in mock_clock.schedule_once.call_args_list]

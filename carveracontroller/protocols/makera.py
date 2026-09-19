@@ -32,8 +32,9 @@ from .framing import (
 )
 from .messages import MessageKind, ParsedMessage
 
-# Identify-handshake protocol version carried in hello / hello ack (docs
-# protocol §6.1, §10).
+# Identify-handshake protocol version, carried in the hello frame and
+# echoed back in the hello ack, so either side can tell a future breaking
+# change in this handshake apart from today's version.
 HELLO_PROTOCOL_VERSION = 1
 
 

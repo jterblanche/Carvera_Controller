@@ -2060,7 +2060,19 @@ class Controller:
     def viewParameters(self):
         self.sendGCode("$#")
 
-    def viewWCS(self):
+    def viewWCS(self, automatic=False):
+        """Query the current WCS offsets.
+
+        ``automatic=True`` is for the one connect-time caller
+        (``main.py``'s ``monitorSerial``, fired unprompted off a version
+        reply for firmware that can't rotate WCS) — routes through the
+        automatic-query path so it wraps once identified, the same as the
+        other connect-time queries. The WCS settings popup's own call
+        (opening it is a real user action) always leaves this False.
+        """
+        if automatic:
+            self._send_automatic_command(0, "get wcs", "get wcs\n" if self.execCallback else None)
+            return
         self.sendGCode("get wcs")
 
     def viewState(self):
@@ -2475,9 +2487,11 @@ class Controller:
             return
 
         # LINE. Still-unidentified controllers re-send hello on a live reply
-        # in case the previous hello's ack was lost.
+        # in case the previous hello's ack was lost. monotonic(), not
+        # time(): see the matching comment on the _advance_hello call in
+        # streamIO — the same wall-clock-jump risk applies here.
         if self._hello is not None and not self._hello.identified:
-            frame = self._hello.on_status_reply(time.time())
+            frame = self._hello.on_status_reply(time.monotonic())
             if frame is not None and self.stream is not None:
                 self._send_raw(frame)
 
@@ -2539,13 +2553,28 @@ class Controller:
         """Close the current link from within the streamIO thread itself.
 
         Deliberately not ``close()``: that calls ``_join_stream_io()``,
-        which would try to join the very thread calling this method. Skips
-        ``stopRun``/the thread join for the same reason (nothing is running
-        that needs stopping — this only ever runs before the connection
-        became a normal, working one), and never starts a reconnect loop,
-        since both callers below are cases where retrying the exact same
-        thing would just repeat the same outcome.
+        which would try to join the very thread calling this method
+        (deadlock). Calling ``stopRun()`` is still correct and necessary
+        here, though: it only sets the ``Event`` streamIO's own loop checks
+        each iteration, so it's safe to call from inside the very thread
+        it's telling to stop — the loop simply exits on its next check.
+        Skipping it would leave a non-daemon thread spinning at its polling
+        rate until the next ``open()`` or app exit.
+
+        Sets ``_manual_disconnect = True`` (cleared again by ``open()``, the
+        same as ``close_manual()`` does): both UI sites that would otherwise
+        open a reconnect popup on seeing the state drop to NOT_CONNECTED
+        (``main.py``'s heartbeat check and its ``updateStatus`` state-change
+        handler) already read that flag as "this was not an unexpected
+        drop, don't offer to reconnect". Without it, the busy/rejected
+        message this exists to show would be followed a moment later by a
+        reconnect popup and repeated attempts against a machine that just
+        refused the connection — exactly what this method exists to avoid.
+        Never starts a reconnect loop for the same reason: both callers
+        below are cases where retrying the exact same thing would just
+        repeat the same outcome.
         """
+        self.stopRun()
         self._runLines = 0
         self._hello = None
         self._reset_pending_sends()
@@ -2557,6 +2586,7 @@ class Controller:
                 pass
             self.stream = None
         self.comms.reset()
+        self._manual_disconnect = True
         CNC.vars["state"] = NOT_CONNECTED
         CNC.vars["color"] = STATECOLOR[CNC.vars["state"]]
 
@@ -2663,9 +2693,12 @@ class Controller:
                         dynamic_delay = 0
 
                 # A fresh timestamp, not the loop's `t`: recv()/_handle_protocol_message
-                # above can take a little time, and the ack-wait deadline is timed
-                # against the real clock, not against when this iteration started.
-                self._advance_hello(time.time())
+                # above can take a little time. monotonic(), not time(): the
+                # handshake's deadlines must not be affected by a wall-clock
+                # jump (NTP sync, the user changing the system clock), which
+                # could otherwise stall the fallback (clock jumps back) or
+                # end re-hello early (clock jumps forward).
+                self._advance_hello(time.monotonic())
 
             except Exception:
                 self.comms.reset_parser()

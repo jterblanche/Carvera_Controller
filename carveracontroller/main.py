@@ -4356,7 +4356,7 @@ class Makera(RelativeLayout):
                         app.is_community_firmware = bool(self.fw_version) and "c" in self.fw_version.lower()
                         self.controller.is_community_firmware = app.is_community_firmware
                         if not app.is_community_firmware or not CNC.can_rotate_wcs:
-                            self.controller.viewWCS()
+                            self.controller.viewWCS(automatic=True)
                         app.fw_version_digitized = Utils.digitize_v(self.fw_version)
                         logger.debug(f"Firmware Version detected as {self.fw_version}")
                         Clock.schedule_once(partial(self.onFirmwareDetected, self.fw_version), 0)
