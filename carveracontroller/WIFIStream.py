@@ -60,8 +60,18 @@ class MachineDetector:
                     pass
                 if len(fields) > 3 and fields[0] not in self.machine_name_list:
                     self.machine_name_list.append(fields[0])
+                    # A 5th field (old_controller_present) is new; absent on
+                    # a beacon from firmware that predates it, in which case
+                    # "no old controller known present" is the safe default.
+                    old_controller_present = len(fields) > 4 and fields[4] == "1"
                     self.machine_list.append(
-                        {"machine": fields[0], "ip": fields[1], "port": int(fields[2]), "busy": fields[3] == "1"}
+                        {
+                            "machine": fields[0],
+                            "ip": fields[1],
+                            "port": int(fields[2]),
+                            "busy": fields[3] == "1",
+                            "old_controller_present": old_controller_present,
+                        }
                     )
                     print(self.machine_list[-1])
                 self.t = time.time()
@@ -70,6 +80,15 @@ class MachineDetector:
             return self.machine_list
         except:
             print(sys.exc_info()[1])
+
+    def is_old_controller_present(self, ip):
+        """Whether the last-discovered beacon for ``ip`` reported an old
+        controller already connected. False if that machine hasn't been
+        (re)discovered, matching the "unknown means don't block" default."""
+        for machine in self.machine_list:
+            if machine.get("ip") == ip:
+                return bool(machine.get("old_controller_present", False))
+        return False
 
 
 # ==============================================================================

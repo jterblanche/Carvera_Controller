@@ -3,7 +3,7 @@
 import struct
 
 from carveracontroller.protocols.framing import PTYPE_FILE_DATA, build_frame
-from carveracontroller.WIFIStream import WIFIStream
+from carveracontroller.WIFIStream import MachineDetector, WIFIStream
 from carveracontroller.XMODEM import XMODEM
 
 
@@ -64,3 +64,51 @@ def test_putc_sends_the_complete_makera_file_data_frame_and_returns_its_length()
     frame = _makera_file_data_frame()
     assert len(frame) == 8205, "fixture must model a complete Makera FILE_DATA frame"
     _assert_putc_writes_complete_frame(frame)
+
+
+class _FakeUdpSocket:
+    """recvfrom() double for MachineDetector.check_for_responses()."""
+
+    def __init__(self, packets):
+        self._packets = list(packets)
+
+    def recvfrom(self, bufsize):
+        if not self._packets:
+            raise OSError("no more packets")
+        return self._packets.pop(0), ("0.0.0.0", 0)
+
+    def close(self):
+        pass
+
+
+def _detector_with_packet(payload: bytes) -> MachineDetector:
+    detector = MachineDetector()
+    detector.sock = _FakeUdpSocket([payload])
+    detector.t = detector.tr = 0.0
+    return detector
+
+
+def test_beacon_fifth_field_parsed_as_old_controller_present():
+    detector = _detector_with_packet(b"Carvera,10.0.0.5,2222,1,1")
+
+    detector.check_for_responses()
+
+    assert detector.machine_list == [
+        {"machine": "Carvera", "ip": "10.0.0.5", "port": 2222, "busy": True, "old_controller_present": True}
+    ]
+
+
+def test_beacon_without_fifth_field_defaults_old_controller_present_false():
+    detector = _detector_with_packet(b"Carvera,10.0.0.5,2222,1")
+
+    detector.check_for_responses()
+
+    assert detector.machine_list[0]["old_controller_present"] is False
+
+
+def test_is_old_controller_present_looks_up_by_ip():
+    detector = _detector_with_packet(b"Carvera,10.0.0.5,2222,1,1")
+    detector.check_for_responses()
+
+    assert detector.is_old_controller_present("10.0.0.5") is True
+    assert detector.is_old_controller_present("10.0.0.9") is False
