@@ -20,7 +20,16 @@ from functools import partial
 
 from . import Utils
 from .CNC import CMDPAT, CNC, LASER_TOOL_NUMBER, PARENPAT, SEMIPAT, ZPROBE_TOOL_NUMBER
-from .protocols import MessageKind, ProtocolSession
+from .machine.hello import HelloNegotiator, Resolution
+from .machine.identity import ControllerIdentity, default_name, generate_id
+from .protocols import LINK_USB, LINK_WIFI, MessageKind, ProtocolSession
+from .protocols.handshake import (
+    HELLO_REJECTED_CAP,
+    ClientEntry,
+    decode_client_list,
+    decode_hello_ack,
+)
+from .protocols.makera import encode_automatic_command, encode_client_list_request
 from .USBBulkStream import USBBulkStream, is_usb_bulk_address
 from .USBStream import USBStream
 from .WIFIStream import WIFIStream
@@ -103,10 +112,26 @@ class Controller:
     modem = None
     connection_type = CONN_WIFI
 
-    def __init__(self, cnc, callback, log_sent_receive=False):
+    def __init__(self, cnc, callback, log_sent_receive=False, identity=None):
         self.usb_stream = USBStream(log_sent_receive)
         self.usb_bulk_stream = USBBulkStream(log_sent_receive)
         self.wifi_stream = WIFIStream(log_sent_receive)
+
+        # A stable random id and display name, sent in the hello handshake
+        # so the machine and other controllers can recognise this one.
+        # Callers normally supply an identity loaded from persisted
+        # settings; this fallback keeps Controller() usable standalone
+        # (e.g. in tests) without wiring that up.
+        self.identity: ControllerIdentity = identity or ControllerIdentity(id=generate_id(), name=default_name())
+        # Connect-time identify handshake for the current connection, or
+        # None when not connected. See machine/hello.py.
+        self._hello: HelloNegotiator | None = None
+        # Sends held back while the handshake is unresolved: (kind, payload,
+        # display) where kind is 0 (console command) or 1 (file transfer
+        # start), matching the automatic-command wrapper's `kind` field.
+        self._pending_sends = []
+        # The other controllers currently connected, from the last client-list reply.
+        self.connected_clients: tuple[ClientEntry, ...] = ()
 
         # Reconnection properties
         self.reconnect_enabled = True
@@ -249,17 +274,61 @@ class Controller:
                     self._notify_usb_reset_blocked()
                     return
                 payload = line.encode() if isinstance(line, str) else line
-                self.stream.send(self.comms.encode_command(payload))
+                display = None
                 if self.execCallback:
                     display = line if isinstance(line, str) else line.decode(errors="ignore")
                     # Strip ".lz" suffix for display
                     if display.endswith(".lz\n"):
-                        new_line = display[:-4] + "\n"
-                    else:
-                        new_line = display
-                    self.execCallback(new_line)
+                        display = display[:-4] + "\n"
+                if self._gate_send(0, payload, display):
+                    return
+                self.stream.send(self.comms.encode_command(payload))
+                if display is not None:
+                    self.execCallback(display)
             except Exception:
                 self.log.put((Controller.MSG_ERROR, str(sys.exc_info()[1])))
+
+    def _gate_send(self, kind, payload, display):
+        """Hold back an ordinary-channel send while the identify handshake
+        is unresolved (protocol doc §5.2: nothing but hello and realtime
+        bytes goes out before an accepted ack). Returns True if the send was
+        queued rather than sent now; ``_flush_pending_sends`` sends it once
+        the handshake resolves, wrapped in the automatic-command envelope if
+        identified, or exactly as it would have gone out today otherwise.
+        """
+        negotiator = self._hello
+        if negotiator is None or negotiator.resolved:
+            return False
+        self._pending_sends.append((kind, payload, display))
+        return True
+
+    def _flush_pending_sends(self):
+        negotiator = self._hello
+        pending, self._pending_sends = self._pending_sends, []
+        if not pending or negotiator is None or self.stream is None:
+            return
+        if negotiator.resolution is Resolution.REJECTED:
+            # A rejected client never becomes a peer and the link is about
+            # to be closed by the machine (protocol doc §6.2) — drop rather
+            # than send into a connection that's already being torn down.
+            return
+        wrap = negotiator.resolution is Resolution.IDENTIFIED
+        for kind, payload, display in pending:
+            if wrap:
+                frame = encode_automatic_command(kind, payload)
+            elif kind == 0:
+                frame = self.comms.encode_command(payload)
+            else:
+                frame = self.comms.encode_file_command(payload)
+            self._send_raw(frame)
+            if display is not None and self.execCallback:
+                self.execCallback(display)
+
+    def _send_raw(self, frame):
+        try:
+            self.stream.send(frame)
+        except Exception:
+            self.log.put((Controller.MSG_ERROR, str(sys.exc_info()[1])))
 
     def _notify_usb_reset_blocked(self):
         if App is None or Clock is None:
@@ -301,14 +370,16 @@ class Controller:
                 if isinstance(line, str) and not line.endswith("\n"):
                     line += "\n"
                 payload = line.encode() if isinstance(line, str) else line
-                self.stream.send(self.comms.encode_file_command(payload))
+                display = None
                 if self.execCallback:
                     display = line if isinstance(line, str) else line.decode(errors="ignore")
                     if display.endswith(".lz\n"):
-                        new_line = display[:-4] + "\n"
-                    else:
-                        new_line = display
-                    self.execCallback(new_line)
+                        display = display[:-4] + "\n"
+                if self._gate_send(1, payload, display):
+                    return
+                self.stream.send(self.comms.encode_file_command(payload))
+                if display is not None:
+                    self.execCallback(display)
             except Exception:
                 self.log.put((Controller.MSG_ERROR, str(sys.exc_info()[1])))
 
@@ -1587,6 +1658,9 @@ class Controller:
                 pass
             self.stream = None
         self.comms.reset()
+        self._hello = None
+        self._pending_sends = []
+        self.connected_clients = ()
         self.clearRun()
 
     def _join_stream_io(self):
@@ -1662,6 +1736,13 @@ class Controller:
             except Exception:
                 self.log.put((self.MSG_ERROR, "Controller clear thread error!"))
             self.comms.detect_and_select(transport)
+            # Hello only ever applies on a framed (Makera) link, never
+            # Smoothie (protocol doc §3); a non-applicable negotiator
+            # resolves to the legacy fallback immediately.
+            link = LINK_USB if conn_type == CONN_USB else LINK_WIFI
+            self._hello = HelloNegotiator(identity=self.identity, link=link, applicable=self.comms.uses_framed_transfer)
+            self._pending_sends = []
+            self.connected_clients = ()
             self.stream = transport
             self.thread = threading.Thread(target=self.streamIO)
             self.thread.start()
@@ -1679,7 +1760,7 @@ class Controller:
     # ----------------------------------------------------------------------
     # Close connection port
     # ----------------------------------------------------------------------
-    def close(self):
+    def close(self, allow_reconnect=True):
         if self.stream is None:
             return
         try:
@@ -1695,11 +1776,14 @@ class Controller:
             self.log.put((self.MSG_ERROR, "Controller close stream error!"))
         self.stream = None
         self.comms.reset()
+        self._hello = None
+        self._pending_sends = []
+        self.connected_clients = ()
         CNC.vars["state"] = NOT_CONNECTED
         CNC.vars["color"] = STATECOLOR[CNC.vars["state"]]
 
         # Start reconnection if enabled (WiFi or USB; callback resolves the method).
-        if self.reconnect_enabled and self.reconnect_callback:
+        if allow_reconnect and self.reconnect_enabled and self.reconnect_callback:
             self.start_reconnection()
 
     def close_manual(self):
@@ -1722,6 +1806,9 @@ class Controller:
             self.log.put((self.MSG_ERROR, "Controller close stream error!"))
         self.stream = None
         self.comms.reset()
+        self._hello = None
+        self._pending_sends = []
+        self.connected_clients = ()
         # Set a flag to indicate this was a manual disconnection
         self._manual_disconnect = True
         CNC.vars["state"] = NOT_CONNECTED
@@ -2246,6 +2333,12 @@ class Controller:
 
     def _handle_protocol_message(self, message):
         """Dispatch a ParsedMessage from the active communication protocol."""
+        if message.kind == MessageKind.HELLO_ACK:
+            self._on_hello_ack(message.payload)
+            return
+        if message.kind == MessageKind.CLIENT_LIST:
+            self._on_client_list(message.payload)
+            return
         if message.kind == MessageKind.LOAD_EOF:
             self.loadEOF = True
             return
@@ -2264,7 +2357,13 @@ class Controller:
                     self.load_buffer_size += len(line2) + 1
             return
 
-        # LINE
+        # LINE. Still-unidentified controllers re-send hello on a live reply
+        # in case the previous hello's ack was lost (protocol doc §4.2).
+        if self._hello is not None and not self._hello.identified:
+            frame = self._hello.on_status_reply(time.time())
+            if frame is not None and self.stream is not None:
+                self._send_raw(frame)
+
         if self.loadNUM == 0 or "|MPos" in text:
             self.parseLine(text)
             return
@@ -2274,6 +2373,93 @@ class Controller:
                 if line2:
                     self.load_buffer.put(line2)
                     self.load_buffer_size += len(line2) + 1
+
+    def _advance_hello(self, now):
+        """Called every streamIO tick: sends hello once a frame is confirmed,
+        and resolves the ack-wait timeout (machine/hello.py's ``poll``)."""
+        negotiator = self._hello
+        if negotiator is None or self.stream is None or negotiator.resolved:
+            return
+        if self.comms.frame_confirmed:
+            frame = negotiator.on_valid_frame(now)
+            if frame is not None:
+                self._send_raw(frame)
+        if negotiator.poll(now):
+            self._flush_pending_sends()
+
+    def _on_hello_ack(self, payload):
+        negotiator = self._hello
+        if negotiator is None:
+            return
+        ack = decode_hello_ack(payload)
+        if ack is None:
+            return
+        was_resolved = negotiator.resolved
+        newly_identified = negotiator.on_hello_ack(ack)
+        if not was_resolved and negotiator.resolved:
+            self._flush_pending_sends()
+        if newly_identified:
+            if self.stream is not None:
+                self._send_raw(encode_client_list_request())
+        elif negotiator.resolution is Resolution.REJECTED:
+            reason = "cap" if ack.result == HELLO_REJECTED_CAP else "old_controller"
+            self._notify_hello_rejected(reason)
+
+    def _on_client_list(self, payload):
+        self.connected_clients = decode_client_list(payload)
+        self._notify_client_list_updated(self.connected_clients)
+
+    def _handle_closed_before_identify(self):
+        """The peer closed the link before a single valid frame was ever
+        confirmed — the signature of old firmware that already has another
+        client attached (protocol doc §7: "accepted and closed by the
+        machine at once", measured ~60ms). Show today's "machine busy"
+        message instead of the heartbeat-timeout "connection lost" flow, and
+        don't start an auto-reconnect loop against a machine that just
+        refused us."""
+        self._runLines = 0
+        self._hello = None
+        self._pending_sends = []
+        self.connected_clients = ()
+        try:
+            self.stream.close()
+        except Exception:
+            pass
+        self.stream = None
+        self.comms.reset()
+        CNC.vars["state"] = NOT_CONNECTED
+        CNC.vars["color"] = STATECOLOR[CNC.vars["state"]]
+        self._notify_machine_busy_before_identify()
+
+    def _notify_hello_rejected(self, reason):
+        if App is None or Clock is None:
+            return
+        app = App.get_running_app()
+        if app is None or getattr(app, "root", None) is None:
+            return
+        root = app.root
+        if hasattr(root, "show_hello_rejected_popup"):
+            Clock.schedule_once(lambda dt, r=reason: root.show_hello_rejected_popup(r), 0)
+
+    def _notify_machine_busy_before_identify(self):
+        if App is None or Clock is None:
+            return
+        app = App.get_running_app()
+        if app is None or getattr(app, "root", None) is None:
+            return
+        root = app.root
+        if hasattr(root, "show_machine_busy_before_identify_popup"):
+            Clock.schedule_once(lambda dt: root.show_machine_busy_before_identify_popup(), 0)
+
+    def _notify_client_list_updated(self, entries):
+        if App is None or Clock is None:
+            return
+        app = App.get_running_app()
+        if app is None or getattr(app, "root", None) is None:
+            return
+        root = app.root
+        if hasattr(root, "update_connected_controllers"):
+            Clock.schedule_once(lambda dt, e=entries: root.update_connected_controllers(e), 0)
 
     # ----------------------------------------------------------------------
     # thread performing I/O on serial line
@@ -2313,12 +2499,16 @@ class Controller:
                         allow_wire_switch = self.sendNUM == 0 and self.loadNUM == 0
                         for message in self.comms.feed(data, allow_wire_switch=allow_wire_switch):
                             self._handle_protocol_message(message)
+                    elif data == b"" and self.comms.uses_framed_transfer and not self.comms.frame_confirmed:
+                        self._handle_closed_before_identify()
                     dynamic_delay = 0
                 else:
                     if self.sendNUM == 0 and self.loadNUM == 0:
                         dynamic_delay = 0.1 if dynamic_delay >= 0.09 else dynamic_delay + 0.01
                     else:
                         dynamic_delay = 0
+
+                self._advance_hello(t)
 
             except Exception:
                 self.comms.reset_parser()
