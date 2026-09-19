@@ -1,6 +1,7 @@
 """Tests for WIFIStream socket write semantics."""
 
 import struct
+import time
 
 from carveracontroller.protocols.framing import PTYPE_FILE_DATA, build_frame
 from carveracontroller.WIFIStream import MachineDetector, WIFIStream
@@ -112,3 +113,27 @@ def test_is_old_controller_present_looks_up_by_ip():
 
     assert detector.is_old_controller_present("10.0.0.5") is True
     assert detector.is_old_controller_present("10.0.0.9") is False
+
+
+def test_a_repeated_beacon_within_one_scan_updates_the_entry_in_place():
+    """A machine's old_controller_present flag can change mid-scan (e.g. an
+    old controller connects while the discovery dropdown is still open) —
+    a second beacon from the same machine name must refresh its entry, not
+    be silently ignored because that name was already seen."""
+    detector = MachineDetector()
+    detector.sock = _FakeUdpSocket(
+        [
+            b"Carvera,10.0.0.5,2222,1,0",
+            b"Carvera,10.0.0.5,2222,1,1",
+        ]
+    )
+    # Real timestamps, not 0.0: check_for_responses() sets self.t to the
+    # real clock on every call, so a second call needs self.tr to still be
+    # within its 3s window relative to that, not stuck at a fixed 0.0.
+    detector.t = detector.tr = time.time()
+
+    detector.check_for_responses()
+    detector.check_for_responses()
+
+    assert len(detector.machine_list) == 1
+    assert detector.machine_list[0]["old_controller_present"] is True
