@@ -44,7 +44,16 @@ class HelloNegotiator:
     identity: ControllerIdentity
     link: int
     applicable: bool = True
-    _hello_sent_at: float | None = field(default=None, init=False, repr=False)
+    # When the *first* hello was sent. The ack-wait deadline is anchored
+    # here and never moves — see _last_hello_sent_at below for why that
+    # matters.
+    _first_hello_sent_at: float | None = field(default=None, init=False, repr=False)
+    # When the most recent hello (first or re-hello) was sent. Deliberately
+    # a separate field from _first_hello_sent_at: if re-hello (on_status_reply)
+    # refreshed the same timestamp poll() times out against, a steady stream
+    # of status replies would keep re-triggering it and the 1.0s fallback
+    # would never actually fire against old firmware.
+    _last_hello_sent_at: float | None = field(default=None, init=False, repr=False)
     _resolution: Resolution | None = field(default=None, init=False)
     _identified: bool = field(default=False, init=False)
 
@@ -70,9 +79,9 @@ class HelloNegotiator:
         Returns the hello frame to send the first time this applies; None on
         every later call (idempotent), or when hello does not apply here.
         """
-        if not self.applicable or self._hello_sent_at is not None:
+        if not self.applicable or self._first_hello_sent_at is not None:
             return None
-        return self._send_hello(now)
+        return self._send_hello(now, first=True)
 
     def on_status_reply(self, now: float) -> bytes | None:
         """Call whenever a status reply arrives (proof the link is live).
@@ -82,18 +91,20 @@ class HelloNegotiator:
         Does not affect ``resolution``: a late ack after FALLBACK can still
         identify the controller for anything that checks ``identified``.
         """
-        if not self.applicable or self._identified or self._hello_sent_at is None:
+        if not self.applicable or self._identified or self._last_hello_sent_at is None:
             return None
-        if now - self._hello_sent_at < ACK_TIMEOUT_S:
+        if now - self._last_hello_sent_at < ACK_TIMEOUT_S:
             return None
-        return self._send_hello(now)
+        return self._send_hello(now, first=False)
 
     def poll(self, now: float) -> bool:
         """Call periodically. Returns True exactly once: the moment the ack
-        window elapses with no ack, resolving to FALLBACK."""
-        if self._resolution is not None or self._hello_sent_at is None:
+        window elapses with no ack, resolving to FALLBACK. Measured from the
+        first hello sent, so a re-hello triggered by a live status reply
+        cannot keep pushing this deadline back."""
+        if self._resolution is not None or self._first_hello_sent_at is None:
             return False
-        if now - self._hello_sent_at >= ACK_TIMEOUT_S:
+        if now - self._first_hello_sent_at >= ACK_TIMEOUT_S:
             self._resolution = Resolution.FALLBACK
             return True
         return False
@@ -116,6 +127,8 @@ class HelloNegotiator:
             self._resolution = Resolution.REJECTED
         return False
 
-    def _send_hello(self, now: float) -> bytes:
-        self._hello_sent_at = now
+    def _send_hello(self, now: float, first: bool) -> bytes:
+        if first:
+            self._first_hello_sent_at = now
+        self._last_hello_sent_at = now
         return encode_hello(self.identity.id, self.identity.name.encode("utf-8"), self.link)

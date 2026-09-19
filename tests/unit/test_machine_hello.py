@@ -117,6 +117,21 @@ def test_re_hello_stops_once_identified():
     assert negotiator.on_status_reply(now=100.0) is None
 
 
+def test_repeated_status_replies_do_not_delay_fallback():
+    """A status reply arriving right at the ack-timeout boundary triggers a
+    re-hello (on_status_reply) — that resend must not push back poll()'s
+    fallback deadline, or a steady stream of status replies from old
+    firmware would defer the 1.0s fallback indefinitely."""
+    negotiator = HelloNegotiator(identity=IDENTITY, link=LINK_WIFI)
+    negotiator.on_valid_frame(now=0.0)
+
+    resent = negotiator.on_status_reply(now=ACK_TIMEOUT_S)
+    assert resent is not None  # sanity: the re-hello did fire
+
+    assert negotiator.poll(now=ACK_TIMEOUT_S) is True
+    assert negotiator.resolution is Resolution.FALLBACK
+
+
 def test_late_ack_after_fallback_still_identifies():
     """A lost-then-retried ack can identify the controller even after the
     1.0s window already forced a functional fallback (protocol doc §4.2)."""
