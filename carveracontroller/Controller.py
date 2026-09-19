@@ -898,10 +898,12 @@ class Controller:
         self.executeCommand("config-default\n")
 
     def uploadCommand(self, filename):
+        """Send an upload-start command. Returns True if actually sent now,
+        False if held back — see ``executeFileCommand``."""
         upload_command = "upload %s\n" % filename.replace(" ", "\x01")
         if "\\" in filename:
             upload_command = "upload %s\n" % "/".join(filename.split("\\")).replace(" ", "\x01")
-        self.executeFileCommand(self.escape(upload_command))
+        return self.executeFileCommand(self.escape(upload_command))
 
     def downloadCommand(self, filename, automatic=False):
         """Send a download-start command.

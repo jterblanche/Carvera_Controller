@@ -6483,7 +6483,15 @@ class Makera(RelativeLayout):
         try:
             # md5 = Utils.md5(self.uploading_file)
             md5 = Utils.md5(displayname)
-            self.controller.uploadCommand(os.path.normpath(remotename))
+            sent = self.controller.uploadCommand(os.path.normpath(remotename))
+            if not sent:
+                # Held back: the identify handshake is still unresolved (a
+                # sub-1-second window right after connecting) and streamIO
+                # is already paused above, so nothing would flush the
+                # queued command until it resumes — waiting here would
+                # just stall until XMODEM's own timeout. Fail this attempt
+                # cleanly instead; retrying shortly after succeeds normally.
+                raise RuntimeError(f"Upload command held back for {remotename}: not yet connected to the machine")
             upload_result = self.controller.stream.upload(self.uploading_file, md5, self.uploadCallback)
             modem = getattr(self.controller.stream, "modem", None)
             last_file_error = getattr(modem, "last_file_error", None) if modem else None
