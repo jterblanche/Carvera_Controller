@@ -27,11 +27,3 @@ def rows_for_display(entries: tuple[ClientEntry, ...], own_id: int) -> tuple[Cli
     return tuple(
         ClientRow(name=entry.name, has_control=entry.has_control, is_self=entry.id == own_id) for entry in ordered
     )
-
-
-def controlling_entry(entries: tuple[ClientEntry, ...]) -> ClientEntry | None:
-    """The entry that currently holds control, if any."""
-    for entry in entries:
-        if entry.has_control:
-            return entry
-    return None

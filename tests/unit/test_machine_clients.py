@@ -1,4 +1,4 @@
-from carveracontroller.machine.clients import ClientRow, controlling_entry, rows_for_display
+from carveracontroller.machine.clients import ClientRow, rows_for_display
 from carveracontroller.protocols.handshake import ClientEntry
 
 SELF_ID = 1
@@ -30,14 +30,3 @@ def test_rows_for_display_marks_self():
 
 def test_rows_for_display_empty():
     assert rows_for_display((), own_id=SELF_ID) == ()
-
-
-def test_controlling_entry_returns_the_holder():
-    entry = controlling_entry(_entries())
-    assert entry is not None
-    assert entry.id == SELF_ID
-
-
-def test_controlling_entry_none_when_control_is_free():
-    entries = (ClientEntry(id=1, name="A", link=0, has_control=False),)
-    assert controlling_entry(entries) is None
