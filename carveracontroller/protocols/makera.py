@@ -9,6 +9,9 @@ from .framing import (
     FRAME_END,
     FRAME_HEADER,
     MAX_FRAME_DATA_LENGTH,
+    PTYPE_AUTO_COMMAND,
+    PTYPE_CLIENT_LIST_REPLY,
+    PTYPE_CLIENT_LIST_REQ,
     PTYPE_CTRL_MULTI,
     PTYPE_CTRL_SINGLE,
     PTYPE_FILE_CAN,
@@ -18,6 +21,8 @@ from .framing import (
     PTYPE_FILE_RETRY,
     PTYPE_FILE_START,
     PTYPE_FILE_VIEW,
+    PTYPE_HELLO,
+    PTYPE_HELLO_ACK,
     PTYPE_LOAD_ERROR,
     PTYPE_LOAD_FINISH,
     PTYPE_LOAD_INFO,
@@ -26,6 +31,48 @@ from .framing import (
     validate_packet_data,
 )
 from .messages import MessageKind, ParsedMessage
+
+# Identify-handshake protocol version carried in hello / hello ack (docs
+# protocol §6.1, §10).
+HELLO_PROTOCOL_VERSION = 1
+
+
+def encode_hello(controller_id: int, name: bytes, link: int) -> bytes:
+    """Build a hello (0x60) frame: protocol_version(1) + id(8) + name_len(1) + name + link(1)."""
+    if len(name) > 31:
+        raise ValueError("hello name must be <= 31 bytes")
+    payload = (
+        bytes([HELLO_PROTOCOL_VERSION])
+        + controller_id.to_bytes(8, "big")
+        + bytes([len(name)])
+        + name
+        + bytes([link & 0xFF])
+    )
+    return build_frame(PTYPE_HELLO, payload)
+
+
+def encode_client_list_request() -> bytes:
+    """Build a client-list request (0x63) frame. Empty payload."""
+    return build_frame(PTYPE_CLIENT_LIST_REQ, b"")
+
+
+def encode_automatic_command(kind: int, data: bytes) -> bytes:
+    """Build an automatic-command (0x6B) frame wrapping a connect-time query.
+
+    ``kind``: 0 = console command (as CTRL_MULTI/0xA2 would carry), 1 =
+    file-transfer start (as FILE_START/0xB0 would carry). ``data`` is
+    normalised the same way ``encode_command``/``encode_file_command`` would
+    normalise it for the channel it stands in for, so the wrapped payload is
+    "exactly the text that channel would otherwise carry" (protocol doc §5.1).
+    """
+    if kind == 0:
+        payload = bytes(data).rstrip(b"\r\n")
+    else:
+        payload = bytes(data)
+        if not payload.endswith(b"\n"):
+            payload += b"\n"
+    return build_frame(PTYPE_AUTO_COMMAND, bytes([kind & 0xFF]) + payload)
+
 
 # File-transfer frames are owned by XMODEM while streamIO is paused. If any
 # leak into the control parser, ignore them rather than treating as MDI text.
@@ -141,9 +188,21 @@ class MakeraProtocol(CommunicationProtocol):
         self._packet_data.clear()
         if parsed is None:
             return []
+        # Any complete, CRC-valid frame — regardless of type — proves the
+        # link is actually framed (docs/protocol/connection-follows-me.md §3).
+        self.frame_confirmed = True
 
         if parsed.ptype in _FILE_TRANSFER_TYPES:
             return []
+
+        # New multi-client types must be intercepted here, before the
+        # unknown-type-becomes-console-LINE fallback below, or a new
+        # controller talking to another new controller/firmware would show
+        # raw protocol frames as garbled console text (protocol doc §7).
+        if parsed.ptype == PTYPE_HELLO_ACK:
+            return [ParsedMessage(MessageKind.HELLO_ACK, payload=parsed.payload)]
+        if parsed.ptype == PTYPE_CLIENT_LIST_REPLY:
+            return [ParsedMessage(MessageKind.CLIENT_LIST, payload=parsed.payload)]
 
         if parsed.ptype == PTYPE_LOAD_FINISH:
             return [ParsedMessage(MessageKind.LOAD_EOF)]

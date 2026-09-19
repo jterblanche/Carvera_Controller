@@ -73,6 +73,10 @@ class ProtocolSession:
         return self._protocol.uses_framed_transfer
 
     @property
+    def frame_confirmed(self) -> bool:
+        return self._protocol.frame_confirmed
+
+    @property
     def protocol(self) -> CommunicationProtocol:
         return self._protocol
 
