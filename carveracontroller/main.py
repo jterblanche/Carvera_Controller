@@ -5092,7 +5092,7 @@ class Makera(RelativeLayout):
         remote_path = "/sd/config.txt"
         self.downloading_file = remote_path
         local_path = self._machine_config_cache_path()
-        threading.Thread(target=self.doDownload, args=(remote_path, local_path)).start()
+        threading.Thread(target=self.doDownload, args=(remote_path, local_path), kwargs={"automatic": True}).start()
 
     # -----------------------------------------------------------------------
     def finishLoadConfig(self, success, *args):
@@ -5265,7 +5265,7 @@ class Makera(RelativeLayout):
         cache.ingest_file(source, machine_cache_key(conn, remote_path), size, date_raw)
 
     # -----------------------------------------------------------------------
-    def doDownload(self, remote_path, local_path, show_progress=True, open_after=True):
+    def doDownload(self, remote_path, local_path, show_progress=True, open_after=True, automatic=False):
         app = App.get_running_app()
         was_config_download = self.downloading_config
         # Config backup reuses downloading_config so /sd is not added to recents, but those
@@ -5305,12 +5305,21 @@ class Makera(RelativeLayout):
             # Smoothie/XMODEM legacy: send first, then pause (OEM timing).
             if self.controller.comms.uses_framed_transfer:
                 self.controller.pauseStream(0.0)
-                self.controller.downloadCommand(remote_path)
+                sent = self.controller.downloadCommand(remote_path, automatic=automatic)
                 progress_cb = self.downloadCallback_framed if show_progress else None
             else:
-                self.controller.downloadCommand(remote_path)
+                sent = self.controller.downloadCommand(remote_path, automatic=automatic)
                 self.controller.pauseStream(0.2)
                 progress_cb = partial(self.downloadCallback, remote_path) if show_progress else None
+            if not sent:
+                # Held back: the identify handshake is still unresolved (a
+                # sub-1-second window right after connecting). streamIO is
+                # already paused above, so nothing would flush the queued
+                # command until it resumes — waiting here would just stall
+                # until XMODEM's own timeout. Fail this attempt cleanly
+                # instead; a retry (automatic or manual) shortly after
+                # succeeds normally.
+                raise RuntimeError(f"Download command held back for {remote_path}: not yet connected to the machine")
             download_result = self.controller.stream.download(tmp_filename, md5, progress_cb)
         except Exception:
             logger.error(sys.exc_info()[1])
@@ -7608,8 +7617,9 @@ class Makera(RelativeLayout):
     # -----------------------------------------------------------------------
     def attempt_open_wifi(self, address):
         """Connect from the discovery dropdown, unless the beacon already
-        told us an old controller is attached — joining then would just be
-        refused after the hello window (protocol doc §7)."""
+        told us an old controller is attached — joining then would just get
+        closed by the machine a few seconds later, once it gives up waiting
+        for a hello that will never come from that old controller."""
         ip = address.split(":")[0]
         if self.machine_detector.is_old_controller_present(ip):
             Clock.schedule_once(
