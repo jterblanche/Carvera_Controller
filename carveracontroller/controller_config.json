@@ -330,5 +330,13 @@
         "section": "carvera",
         "key": "show_playbar_tool_change_markers",
         "default": "true"
+    },
+    {
+        "type": "string",
+        "title": "Controller name",
+        "desc": "How this controller identifies itself to the machine and other connected controllers. Defaults to this computer's name.",
+        "section": "carvera",
+        "key": "controller_name",
+        "default": ""
     }
 ]

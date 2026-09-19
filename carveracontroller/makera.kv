@@ -1234,6 +1234,17 @@
         on_release:
             app.root.close()
             root.select('')
+    Label:
+        id: lbl_connected_controllers
+        text: root.connected_controllers_text
+        size_hint_y: None
+        height: self.texture_size[1] + dp(10) if root.connected_controllers_text else 0
+        opacity: 1 if root.connected_controllers_text else 0
+        color: 170/255, 170/255, 170/255, 1
+        font_size: '12sp'
+        text_size: self.width, None
+        halign: 'left'
+        padding: dp(6), dp(4)
 
 <ComPortsDropDown>:
 
