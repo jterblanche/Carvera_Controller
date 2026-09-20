@@ -2929,6 +2929,17 @@ class Makera(RelativeLayout):
     model_query_attempts = 0
     backing_up_config = False
 
+    # Bounded round trip for verifying a firmware upload's bytes on the SD
+    # card with the "md5sum" console command (see Controller.md5Command).
+    # _md5_verify_expected_path is set only while _verify_uploaded_md5 is
+    # waiting on a reply, so _handle_md5sum_reply can tell a reply meant
+    # for it apart from unrelated console output; it is cleared again once
+    # the wait ends, one way or the other. Reset on disconnect below, same
+    # as the version/model bookkeeping above.
+    _md5_verify_event = threading.Event()
+    _md5_verify_expected_path = None
+    _md5_verify_reply = None
+
     filetype_support = "nc"
     filetype = ""
 
@@ -4018,6 +4029,62 @@ class Makera(RelativeLayout):
         # version line races framed config transfer and breaks the link.
 
     # -----------------------------------------------------------------------
+    def _handle_md5sum_reply(self, line):
+        """Match a console line against an in-flight _verify_uploaded_md5 call.
+
+        Only looks at anything once _md5_verify_expected_path is set (i.e.
+        a verification is actually waiting), so an unrelated line that
+        happens to start with 32 hex characters can't be mistaken for a
+        reply. The firmware's two possible replies to "md5sum <path>" are
+        "<digest> <path>\\n" (SimpleShell::md5sum_command) and
+        "File not found: <path>\\n" -- both echo the exact path that was
+        asked for, so the match also checks that before accepting it.
+        """
+        expected_path = self._md5_verify_expected_path
+        if not expected_path:
+            return
+        match = re.match(r"^([0-9a-fA-F]{32}) (.+)$", line)
+        if match and match.group(2) == expected_path:
+            self._md5_verify_reply = {"status": "digest", "digest": match.group(1)}
+            self._md5_verify_event.set()
+            return
+        not_found = re.match(r"^File not found: (.+)$", line)
+        if not_found and not_found.group(1) == expected_path:
+            self._md5_verify_reply = {"status": "not_found"}
+            self._md5_verify_event.set()
+
+    # -----------------------------------------------------------------------
+    def _verify_uploaded_md5(self, remote_path, expected_md5, timeout=10.0):
+        """Ask the machine to md5sum *remote_path* and compare it to
+        *expected_md5* (the local file's digest, already computed before
+        the upload).
+
+        Returns True on a match, False on a confirmed mismatch or a
+        "File not found" reply, or None if the machine did not answer
+        within *timeout* seconds or disconnected while waiting (the
+        disconnect handler wakes this early rather than leaving it to time
+        out). None is deliberately not treated as a failure by callers: it
+        means verification was inconclusive, not that the file on the card
+        is wrong.
+        """
+        self._md5_verify_reply = None
+        self._md5_verify_event.clear()
+        self._md5_verify_expected_path = remote_path
+        try:
+            self.controller.md5Command(remote_path)
+            self._md5_verify_event.wait(timeout)
+            reply = self._md5_verify_reply
+        finally:
+            self._md5_verify_expected_path = None
+        if reply is None:
+            logger.warning("No reply to md5sum %s within %ss", remote_path, timeout)
+            return None
+        if reply.get("status") != "digest":
+            logger.error("md5sum %s: %s", remote_path, reply)
+            return False
+        return reply["digest"].lower() == expected_md5.lower()
+
+    # -----------------------------------------------------------------------
     def switch_status(self, *args):
         self.status_index = self.status_index + 1
         if self.status_index >= 6:
@@ -4461,6 +4528,7 @@ class Makera(RelativeLayout):
                             self.controller.syncTime()
 
                     self._handle_version_reply(line)
+                    self._handle_md5sum_reply(line)
 
                     remote_model = re.search(r"model = (\w+), (\d+), (\d+), (\d+)", line)
                     if remote_model != None:
@@ -6658,7 +6726,40 @@ class Makera(RelativeLayout):
                     shutil.copyfile(self.uploading_file, local_path)
             if firmware:
                 self._log_firmware("SD transfer succeeded")
-                Clock.schedule_once(self.confirm_reset, 0)
+                # A firmware upload gets no md5 sidecar on the card (unlike
+                # a gcode upload -- Player.cpp skips it for firmware.bin),
+                # and a compressed upload's own sidecar wouldn't help here
+                # anyway (it would be the compressed file's digest, not the
+                # firmware's). So the only way to know the bytes on the
+                # card are actually what was sent, before offering to reset
+                # onto them, is to ask the machine to md5sum them itself.
+                remote_firmware_path = os.path.normpath(remotename)
+                verified = self._verify_uploaded_md5(remote_firmware_path, md5)
+                if verified is False:
+                    self._log_firmware(
+                        "MD5 mismatch after upload (expected %s); not offering to reset" % md5,
+                        error=True,
+                    )
+                    Clock.schedule_once(
+                        partial(
+                            self.show_message_popup,
+                            tr._(
+                                "The firmware on the card does not match the file that was"
+                                " sent. Do not reset the machine -- upload it again."
+                            ),
+                            False,
+                        ),
+                        0,
+                    )
+                elif verified is None:
+                    self._log_firmware(
+                        "Could not verify MD5 after upload (no reply); offering reset anyway",
+                        error=True,
+                    )
+                    Clock.schedule_once(self.confirm_reset, 0)
+                else:
+                    self._log_firmware("MD5 verified after upload")
+                    Clock.schedule_once(self.confirm_reset, 0)
             # update recent folder
             if not firmware:
                 self.update_recent_local_dir_list(os.path.dirname(self.original_upload_filepath))
@@ -6973,6 +7074,11 @@ class Makera(RelativeLayout):
                     Clock.schedule_once(lambda *_: self._refresh_firmware_update_state(), 0)
                     app.model = ""
                     self.model_query_attempts = 0
+                    # Wake any in-flight _verify_uploaded_md5 immediately,
+                    # rather than leaving it to time out: the connection it
+                    # was waiting on is already gone.
+                    self._md5_verify_expected_path = None
+                    self._md5_verify_event.set()
                     app.has_anchor2 = True
                     app.fw_version_digitized = 0
                     app.is_community_firmware = False
