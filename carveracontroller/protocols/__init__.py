@@ -2,6 +2,18 @@
 
 from .base import CommunicationProtocol
 from .detector import detect_protocol_name
+from .handshake import (
+    HELLO_ACCEPTED,
+    HELLO_REJECTED_CAP,
+    HELLO_REJECTED_OLD_CONTROLLER,
+    LINK_USB,
+    LINK_WIFI,
+    ClientEntry,
+    HelloAck,
+    decode_client_list,
+    decode_hello_ack,
+)
+from .makera import encode_automatic_command, encode_client_list_request, encode_hello
 from .messages import MessageKind, ParsedMessage
 from .registry import (
     DEFAULT_PROTOCOL,
@@ -14,12 +26,24 @@ from .session import ProtocolSession, protocol_name_from_announcement
 __all__ = [
     "CommunicationProtocol",
     "DEFAULT_PROTOCOL",
+    "HELLO_ACCEPTED",
+    "HELLO_REJECTED_CAP",
+    "HELLO_REJECTED_OLD_CONTROLLER",
+    "LINK_USB",
+    "LINK_WIFI",
+    "ClientEntry",
+    "HelloAck",
     "MessageKind",
     "ParsedMessage",
     "ProtocolSession",
     "available_protocols",
     "create_protocol",
+    "decode_client_list",
+    "decode_hello_ack",
     "detect_protocol_name",
+    "encode_automatic_command",
+    "encode_client_list_request",
+    "encode_hello",
     "protocol_name_from_announcement",
     "register_protocol",
 ]
