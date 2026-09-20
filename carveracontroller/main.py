@@ -4036,9 +4036,12 @@ class Makera(RelativeLayout):
         a verification is actually waiting), so an unrelated line that
         happens to start with 32 hex characters can't be mistaken for a
         reply. The firmware's two possible replies to "md5sum <path>" are
-        "<digest> <path>\\n" (SimpleShell::md5sum_command) and
-        "File not found: <path>\\n" -- both echo the exact path that was
-        asked for, so the match also checks that before accepting it.
+        "<digest> <path>\\n" and "File not found: <path>\\r\\n" (both in
+        SimpleShell::md5sum_command -- the line endings really do differ;
+        monitorSerial has stripped either one by the time a line gets
+        here). Both echo back the path md5sum resolved, which for the
+        absolute path this sends is the same text, so the match also
+        checks that before accepting it.
         """
         expected_path = self._md5_verify_expected_path
         if not expected_path:
@@ -6726,13 +6729,19 @@ class Makera(RelativeLayout):
                     shutil.copyfile(self.uploading_file, local_path)
             if firmware:
                 self._log_firmware("SD transfer succeeded")
-                # A firmware upload gets no md5 sidecar on the card (unlike
-                # a gcode upload -- Player.cpp skips it for firmware.bin),
-                # and a compressed upload's own sidecar wouldn't help here
-                # anyway (it would be the compressed file's digest, not the
-                # firmware's). So the only way to know the bytes on the
-                # card are actually what was sent, before offering to reset
-                # onto them, is to ask the machine to md5sum them itself.
+                # Neither the transfer's own acknowledgements nor the .md5
+                # sidecar the machine writes is independent evidence that
+                # the file arrived intact: both come out of the same upload
+                # that may have gone wrong, and the sidecar is the digest
+                # the sender announced, written to the card verbatim rather
+                # than computed from the bytes that landed there. That
+                # matters more for firmware than for anything else on the
+                # card, because the bootloader applies this file at the
+                # very next reset, whatever caused that reset. So the only
+                # way to know the bytes on the card are actually what was
+                # sent, before offering to reset onto them, is to ask the
+                # machine to md5sum them itself -- the one check that
+                # re-reads the file from the card.
                 remote_firmware_path = os.path.normpath(remotename)
                 verified = self._verify_uploaded_md5(remote_firmware_path, md5)
                 if verified is False:

@@ -1,12 +1,18 @@
 """Pin the exact text Controller.md5Command sends.
 
 The firmware's "md5sum" takes an absolute path and nothing else
-(SimpleShell::md5sum_command hands its whole parameter string straight to
-absolute_from_relative and opens the result as a filename) -- unlike
-ls/cat/rm/mv/mkdir, it does not parse a trailing "-e". Appending one used to
-turn it into part of the filename, so the machine answered "File not found"
-for a file that was actually there. The whole bug was in the string built
-here, so these tests assert on the exact text, not a regex or a substring.
+(SimpleShell::md5sum_command hands the whole remainder of the line straight
+to absolute_from_relative and opens the result as a filename) -- unlike
+ls/cat/rm/mv/mkdir, it never splits a trailing "-e" off with
+shift_parameter. Appending one used to turn it into part of the filename, so
+the machine answered "File not found" for a file that was actually there.
+The whole bug was in the string built here, so these tests assert on the
+exact text, not a regex or a substring.
+
+For the same reason -- no shift_parameter -- md5sum does not decode the 0x01
+stand-in for a space. The space test below therefore pins the escaping the
+command has always done, not a path the machine would resolve; the paths
+this is used with contain no spaces.
 """
 
 from unittest.mock import MagicMock
@@ -28,7 +34,7 @@ def test_md5_command_sends_bare_path_with_no_flags():
     controller.executeCommand.assert_called_once_with("md5sum /sd/firmware.bin\n")
 
 
-def test_md5_command_escapes_spaces_like_the_other_file_commands():
+def test_md5_command_keeps_the_existing_space_escaping():
     controller = _controller_with_mock_execute()
 
     controller.md5Command("/sd/gcodes/my job.nc")

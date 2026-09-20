@@ -875,15 +875,22 @@ class Controller:
     def md5Command(self, filename):
         """Ask the machine to md5sum an absolute path already on the card.
 
-        Unlike ls/cat/rm/mv/mkdir, the firmware's "md5sum" takes a path and
-        nothing else (SimpleShell::md5sum_command passes its whole parameter
-        string straight to absolute_from_relative and opens the result as a
-        filename) -- it does not parse a trailing "-e" the way those other
-        commands do, so appending one here would become part of the
-        filename and the machine would answer "File not found" for a file
-        that is there. ``filename`` is expected to already be absolute
-        (e.g. "/sd/firmware.bin"); md5sum_command resolves it itself, so
-        this method does not prepend "/sd/".
+        Unlike ls/cat/rm/mv/mkdir, the firmware's "md5sum" never splits its
+        parameters: SimpleShell::md5sum_command passes the whole remainder
+        of the line straight to absolute_from_relative and opens the result
+        as a filename. Those other commands take their path with
+        shift_parameter, so a trailing "-e" stays a separate parameter that
+        they act on or ignore; here it would become part of the filename
+        and the machine would answer "File not found" for a file that is
+        there.
+
+        Skipping shift_parameter also means md5sum never decodes the 0x01
+        stand-in for a space (shift_parameter is what decodes it), so a
+        path containing a space would not be found either. The paths sent
+        here have none; the escaping is kept as it is for consistency with
+        the commands above. ``filename`` is expected to already be absolute
+        (e.g. "/sd/firmware.bin"), and absolute_from_relative returns an
+        absolute path unchanged, so this method does not prepend "/sd/".
         """
         md5_command = "md5sum %s\n" % filename.replace(" ", "\x01")
         if "\\" in filename:
