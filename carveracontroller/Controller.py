@@ -123,6 +123,17 @@ def remote_command_path(path):
     inline. Nothing matches their replies against a stored path, so
     nothing depends on them agreeing with a second copy; folding them
     into this function would be a separate change.
+
+    One limit, for whoever calls this next: escape() runs afterwards and
+    rewrites "?", "&", "!" and "~" into 0x02 to 0x05. A path containing
+    any of those four would therefore reach the machine as something this
+    function did not produce, so a reply echoing it would not match. That
+    cannot happen to the only caller today -- the firmware path is a fixed
+    literal, "/sd/firmware.bin" or "/sd/lpc1768.bin" -- and md5sum could
+    not open such a path anyway, for the same reason it cannot open a path
+    with a space: it never calls shift_parameter, which is where the
+    firmware decodes those five bytes back. A caller that needs arbitrary
+    filenames has to deal with both.
     """
     return "/".join(path.split("\\")).replace(" ", "\x01")
 
@@ -924,9 +935,12 @@ class Controller:
 
         The path goes through remote_command_path, which is also what a
         caller waiting for the reply matches against, so the text sent and
-        the text expected back cannot drift apart. escape() only rewrites
-        "?", "&", "!" and "~", none of which these conversions produce, so
-        what remote_command_path returns is what reaches the machine.
+        the text expected back cannot drift apart. escape() then only
+        rewrites "?", "&", "!" and "~", none of which either conversion
+        produces, so for a path free of those four characters -- which the
+        firmware paths this is called with are -- the text that reaches
+        the machine is exactly what remote_command_path returned. See its
+        docstring for what a path containing them would do.
         """
         self.executeCommand(self.escape("md5sum %s\n" % remote_command_path(filename)))
 
