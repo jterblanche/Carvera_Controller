@@ -1,16 +1,20 @@
 """Tests for the version/model query loop fix.
 
-Covers two related bugs, both in check_model_metadata()'s handling of the
-machine's "version"/"model" replies (main.py):
+Covers two related bugs in main.py:
 
-1. The old version-reply regex only matched a release-style
-   "major.minor.patch" number, so a firmware built from a branch (which
-   reports "<branch>-<commit>") was never recognised. fw_version stayed
-   empty forever and check_model_metadata queried "version" again on every
-   10-second tick, indefinitely.
-2. Nothing capped how many times check_model_metadata would query "version"
-   or "model" while waiting for a first reply, so a machine that never
-   replies at all (to either command) was also queried forever.
+1. In _handle_version_reply(), the old version-reply regex only matched a
+   release-style "major.minor.patch" number, so a firmware built from a
+   branch (which reports "<branch>-<commit>") was never recognised.
+   fw_version stayed empty and check_model_metadata() queried "version"
+   again on every call it made, indefinitely.
+2. In check_model_metadata(), nothing capped how many times it would query
+   "version" or "model" while waiting for a first reply, so a machine that
+   never replies at all (to either command) was also queried forever.
+   check_model_metadata() is called from two places that share one attempt
+   counter per value -- the 10-second status timer, and updateStatus() at up
+   to once a second while the machine is Idle and config hasn't loaded yet
+   -- so the tests below drive it directly rather than assume any particular
+   cadence.
 """
 
 from types import SimpleNamespace
@@ -24,9 +28,7 @@ def _host(fw_version=""):
     return SimpleNamespace(
         fw_version=fw_version,
         fw_version_query_attempts=0,
-        fw_version_unknown=False,
         model_query_attempts=0,
-        model_unknown=False,
         controller=SimpleNamespace(
             stream=object(),
             viewWCS=Mock(),
@@ -79,8 +81,13 @@ def test_development_reply_without_the_letter_c_is_not_flagged_community():
     # is_community_firmware is a plain substring test for "c" in the version
     # string; that is pre-existing, unrelated to this fix, and not changed
     # here. It simply now runs for development replies too, since they are
-    # no longer dropped before reaching it. A branch/commit string with no
-    # "c" in it demonstrates the safe direction that gives: not flagged.
+    # no longer dropped before reaching it. This pins that existing
+    # behaviour, not a safe one: a branch/commit string with no "c" in it
+    # is flagged as non-community even when the build genuinely is a
+    # community-firmware development build (see onFirmwareDetected(), which
+    # then shows an undismissable "Stock Firmware Detected" popup, and every
+    # community-only feature gate that checks is_community_firmware alone).
+    # That is a known, separate problem this fix does not solve.
     host = _host()
     app = _fake_app()
     with patch("carveracontroller.main.App.get_running_app", return_value=app):
@@ -113,13 +120,15 @@ def test_version_query_stops_after_max_attempts_when_there_is_no_reply():
     app = _fake_app(model="CA1")  # model already known; isolate the version path
 
     with patch("carveracontroller.main.App.get_running_app", return_value=app):
-        # Simulate the 10-second timer firing many times with the machine
-        # never answering "version" at all.
+        # Simulate check_model_metadata() firing many more times than the
+        # cap, as either of its two callers would over time, with the
+        # machine never answering "version" at all.
         for _ in range(MACHINE_METADATA_QUERY_MAX_ATTEMPTS + 5):
             Makera.check_model_metadata(host)
 
     assert host.controller.queryVersion.call_count == MACHINE_METADATA_QUERY_MAX_ATTEMPTS
-    assert host.fw_version_unknown is True
+    # Parked one past the cap: the give-up state, reached and never revisited.
+    assert host.fw_version_query_attempts == MACHINE_METADATA_QUERY_MAX_ATTEMPTS + 1
     assert host.fw_version == ""
 
 
@@ -132,7 +141,7 @@ def test_model_query_stops_after_max_attempts_when_there_is_no_reply():
             Makera.check_model_metadata(host)
 
     assert host.controller.queryModel.call_count == MACHINE_METADATA_QUERY_MAX_ATTEMPTS
-    assert host.model_unknown is True
+    assert host.model_query_attempts == MACHINE_METADATA_QUERY_MAX_ATTEMPTS + 1
     assert app.model == ""
 
 
@@ -150,9 +159,10 @@ def test_version_query_stops_as_soon_as_a_reply_is_recorded():
         for _ in range(5):
             Makera.check_model_metadata(host)
 
-    # No further queries once a value is known, and no false "unknown".
+    # No further queries once a value is known, and the counter never
+    # advances to the give-up state.
     assert host.controller.queryVersion.call_count == 1
-    assert host.fw_version_unknown is False
+    assert host.fw_version_query_attempts == 1
 
 
 def test_check_model_metadata_does_nothing_while_disconnected():
