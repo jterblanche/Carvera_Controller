@@ -332,6 +332,7 @@ from .Controller import (
     STATECOLOR,
     STATECOLORDEF,
     Controller,
+    remote_command_path,
 )
 from .GcodeViewer import (
     COLOR_SCHEME_BY_SPEED,
@@ -4041,7 +4042,9 @@ class Makera(RelativeLayout):
         monitorSerial has stripped either one by the time a line gets
         here). Both echo back the path md5sum resolved, which for the
         absolute path this sends is the same text, so the match also
-        checks that before accepting it.
+        checks that before accepting it. _md5_verify_expected_path holds
+        the path in the form it went on the wire (remote_command_path),
+        which is the form that comes back.
         """
         expected_path = self._md5_verify_expected_path
         if not expected_path:
@@ -4069,21 +4072,32 @@ class Makera(RelativeLayout):
         out). None is deliberately not treated as a failure by callers: it
         means verification was inconclusive, not that the file on the card
         is wrong.
+
+        *remote_path* is converted once, with remote_command_path, and the
+        same string is both sent and waited for: the machine echoes the
+        path back, so anything that converted it a second time (or not at
+        all) could disagree with what was sent and never match. That is
+        not hypothetical -- on Windows this used to hold a backslash path
+        while sending a forward-slash one, so every verification timed
+        out.
         """
+        wire_path = remote_command_path(remote_path)
         self._md5_verify_reply = None
         self._md5_verify_event.clear()
-        self._md5_verify_expected_path = remote_path
+        # Set before sending: the reply is matched on the monitor thread
+        # and can arrive before md5Command returns.
+        self._md5_verify_expected_path = wire_path
         try:
-            self.controller.md5Command(remote_path)
+            self.controller.md5Command(wire_path)
             self._md5_verify_event.wait(timeout)
             reply = self._md5_verify_reply
         finally:
             self._md5_verify_expected_path = None
         if reply is None:
-            logger.warning("No reply to md5sum %s within %ss", remote_path, timeout)
+            logger.warning("No reply to md5sum %s within %ss", wire_path, timeout)
             return None
         if reply.get("status") != "digest":
-            logger.error("md5sum %s: %s", remote_path, reply)
+            logger.error("md5sum %s: %s", wire_path, reply)
             return False
         return reply["digest"].lower() == expected_md5.lower()
 
@@ -6742,8 +6756,14 @@ class Makera(RelativeLayout):
                 # sent, before offering to reset onto them, is to ask the
                 # machine to md5sum them itself -- the one check that
                 # re-reads the file from the card.
-                remote_firmware_path = os.path.normpath(remotename)
-                verified = self._verify_uploaded_md5(remote_firmware_path, md5)
+                # remotename, not os.path.normpath(remotename): the file
+                # is on the machine's card, not on this computer, so the
+                # local platform's idea of a path separator does not apply
+                # to it. uploadCommand converts separators before sending
+                # too, so the file landed under the forward-slash path the
+                # firmware plan names, on every platform; asking about the
+                # Windows spelling of it would ask about a different path.
+                verified = self._verify_uploaded_md5(remotename, md5)
                 if verified is False:
                     self._log_firmware(
                         "MD5 mismatch after upload (expected %s); not offering to reset" % md5,

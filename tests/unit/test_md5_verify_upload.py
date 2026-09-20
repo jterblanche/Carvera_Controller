@@ -13,6 +13,7 @@ with a SimpleNamespace standing in for self.
 import threading
 from types import SimpleNamespace
 
+from carveracontroller.Controller import Controller
 from carveracontroller.main import Makera
 
 
@@ -126,6 +127,61 @@ def test_disconnect_while_waiting_is_also_inconclusive():
     result = Makera._verify_uploaded_md5(host, "/sd/firmware.bin", "d41d8cd98f00b204e9800998ecf8427e", timeout=1)
 
     assert result is None
+
+
+# -----------------------------------------------------------------------
+# The two sides agree on one path form
+#
+# The machine echoes back the path it resolved, so the string waited for
+# has to be the string sent. On Windows the caller's path arrives spelt
+# with backslashes while the command converts them to forward slashes, so
+# a second, separate conversion (or none) on the waiting side would never
+# match and every verification would time out. These tests use a path
+# spelt the Windows way rather than trying to run as Windows, so they
+# catch that on any platform.
+# -----------------------------------------------------------------------
+
+
+def test_a_windows_spelt_path_matches_the_reply_the_machine_sends():
+    host = _host(reply_line="d41d8cd98f00b204e9800998ecf8427e /sd/firmware.bin")
+
+    result = Makera._verify_uploaded_md5(host, "\\sd\\firmware.bin", "d41d8cd98f00b204e9800998ecf8427e", timeout=1)
+
+    assert result is True
+    assert host.sent_commands == ["/sd/firmware.bin"]
+
+
+def test_a_windows_spelt_path_still_recognises_file_not_found():
+    host = _host(reply_line="File not found: /sd/firmware.bin")
+
+    result = Makera._verify_uploaded_md5(host, "\\sd\\firmware.bin", "d41d8cd98f00b204e9800998ecf8427e", timeout=1)
+
+    assert result is False
+
+
+def test_the_path_waited_for_is_the_text_the_real_command_sends():
+    # Not a stub controller: the real md5Command builds the line, and the
+    # expected path is read at the moment it is sent. Asserting the two
+    # against each other is what a separate "the command converts" test
+    # and a separate "the matcher accepts slashes" test cannot do -- both
+    # of those passed while the two sides disagreed. Reading the expected
+    # path here also shows it is set before the command goes out, which it
+    # must be: the reply is matched on the monitor thread.
+    host = _host()
+    seen = {}
+
+    def record(text):
+        seen["text"] = text
+        seen["expected"] = host._md5_verify_expected_path
+
+    controller = Controller.__new__(Controller)  # skip __init__: no stream needed
+    controller.executeCommand = record
+    host.controller = controller
+
+    Makera._verify_uploaded_md5(host, "\\sd\\firmware.bin", "d41d8cd98f00b204e9800998ecf8427e", timeout=0.05)
+
+    assert seen["expected"] == "/sd/firmware.bin"
+    assert seen["text"] == "md5sum %s\n" % seen["expected"]
 
 
 def test_expected_path_is_cleared_after_the_call_either_way():
