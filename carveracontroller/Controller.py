@@ -97,6 +97,47 @@ CONN_USB = 0
 CONN_WIFI = 1
 
 
+def remote_command_path(path):
+    """Return the exact text *path* becomes inside a file console command.
+
+    Two conversions, both of which the commands below have always done
+    inline: backslashes become forward slashes (the machine's filesystem
+    knows only "/", and a path beginning with "\\" would not even look
+    absolute to the firmware's absolute_from_relative, so it would be
+    resolved against the working directory instead), and a space becomes
+    the 0x01 stand-in the line protocol uses. Running it over a path it
+    has already converted changes nothing.
+
+    This is the one definition of that form, and it exists because
+    md5sum is the only one of these commands whose reply has to be
+    matched back to what was sent: the firmware echoes the path it
+    resolved in both of its replies (SimpleShell::md5sum_command,
+    SimpleShell.cpp:2087). The sending side and the matching side must
+    therefore agree on this text exactly. They used to convert
+    separately, which held on Linux and macOS and failed on Windows,
+    where the caller's path carried backslashes; see
+    Makera._verify_uploaded_md5 in main.py, which uses this function for
+    the path it waits for and passes the same string to md5Command.
+
+    The other commands (ls/cat/rm/mv/mkdir/upload/download) still convert
+    inline. Nothing matches their replies against a stored path, so
+    nothing depends on them agreeing with a second copy; folding them
+    into this function would be a separate change.
+
+    One limit, for whoever calls this next: escape() runs afterwards and
+    rewrites "?", "&", "!" and "~" into 0x02 to 0x05. A path containing
+    any of those four would therefore reach the machine as something this
+    function did not produce, so a reply echoing it would not match. That
+    cannot happen to the only caller today -- the firmware path is a fixed
+    literal, "/sd/firmware.bin" or "/sd/lpc1768.bin" -- and md5sum could
+    not open such a path anyway, for the same reason it cannot open a path
+    with a space: it never calls shift_parameter, which is where the
+    firmware decodes those five bytes back. A caller that needs arbitrary
+    filenames has to deal with both.
+    """
+    return "/".join(path.split("\\")).replace(" ", "\x01")
+
+
 # ==============================================================================
 # Controller class
 # ==============================================================================
@@ -873,10 +914,35 @@ class Controller:
         self.executeCommand(self.escape(mkdir_command))
 
     def md5Command(self, filename):
-        md5_command = "md5sum %s -e\n" % filename.replace(" ", "\x01")
-        if "\\" in filename:
-            md5_command = "md5sum %s -e\n" % "/".join(filename.split("\\")).replace(" ", "\x01")
-        self.executeCommand(self.escape(md5_command))
+        """Ask the machine to md5sum an absolute path already on the card.
+
+        Unlike ls/cat/rm/mv/mkdir, the firmware's "md5sum" never splits its
+        parameters: SimpleShell::md5sum_command passes the whole remainder
+        of the line straight to absolute_from_relative and opens the result
+        as a filename. Those other commands take their path with
+        shift_parameter, so a trailing "-e" stays a separate parameter that
+        they act on or ignore; here it would become part of the filename
+        and the machine would answer "File not found" for a file that is
+        there.
+
+        Skipping shift_parameter also means md5sum never decodes the 0x01
+        stand-in for a space (shift_parameter is what decodes it), so a
+        path containing a space would not be found either. The paths sent
+        here have none; the escaping is kept as it is for consistency with
+        the commands above. ``filename`` is expected to already be absolute
+        (e.g. "/sd/firmware.bin"), and absolute_from_relative returns an
+        absolute path unchanged, so this method does not prepend "/sd/".
+
+        The path goes through remote_command_path, which is also what a
+        caller waiting for the reply matches against, so the text sent and
+        the text expected back cannot drift apart. escape() then only
+        rewrites "?", "&", "!" and "~", none of which either conversion
+        produces, so for a path free of those four characters -- which the
+        firmware paths this is called with are -- the text that reaches
+        the machine is exactly what remote_command_path returned. See its
+        docstring for what a path containing them would do.
+        """
+        self.executeCommand(self.escape("md5sum %s\n" % remote_command_path(filename)))
 
     def loadWiFiCommand(self):
         self.executeCommand("wlan -e\n")
