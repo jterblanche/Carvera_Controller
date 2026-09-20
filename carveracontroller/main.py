@@ -317,6 +317,8 @@ from .GcodeViewer import (
     VISIBILITY_MAX_TOOLS,
     GCodeViewer,
 )
+from .machine.clients import rows_for_display
+from .machine.identity import load_or_create_identity, set_name
 from .ui import widget_helpers
 from .ui.PlayProgressBar import (
     next_tool_change_after_line,
@@ -369,6 +371,23 @@ def load_halt_translations(tr: translation.Lang):
         41: tr._("Spindle Alarm, power off/on needed"),
     }
     return HALT_REASON
+
+
+class _KivyConfigIdentityStore:
+    """Adapts machine.identity's IdentityStore protocol onto Kivy's Config,
+    so the controller's random id and display name persist in the same
+    config.ini every other setting lives in."""
+
+    def get(self, key):
+        if not Config.has_option("carvera", key):
+            return None
+        # An unset "string" settings-panel entry reads back as "", not
+        # missing; treat that the same as absent so a fresh value is created.
+        return Config.get("carvera", key) or None
+
+    def set(self, key, value):
+        Config.set("carvera", key, value)
+        Config.write()
 
 
 def app_base_path():
@@ -2062,8 +2081,24 @@ class FuncDropDown(ToolTipDropDown):
 
 
 class StatusDropDown(ToolTipDropDown):
+    # A simple "who else is connected" list, one line per row, newest data
+    # from the last client-list reply. Empty when there is nothing to show
+    # (not connected, or no reply received yet).
+    connected_controllers_text = StringProperty("")
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+
+    def set_connected_controllers(self, rows):
+        lines = []
+        for row in rows:
+            label = row.name
+            if row.is_self:
+                label += tr._(" (you)")
+            if row.has_control:
+                label += tr._(" — in control")
+            lines.append(label)
+        self.connected_controllers_text = "\n".join(lines)
 
 
 class ComPortsDropDown(ToolTipDropDown):
@@ -2932,8 +2967,12 @@ class Makera(RelativeLayout):
 
         self.cnc = CNC()
         self.wcs_names = self.cnc.getWCSNames()
+        self.identity = load_or_create_identity(_KivyConfigIdentityStore())
         self.controller = Controller(
-            self.cnc, self.execCallback, Config.getboolean("carvera", "log_sent_receive", fallback=False)
+            self.cnc,
+            self.execCallback,
+            Config.getboolean("carvera", "log_sent_receive", fallback=False),
+            identity=self.identity,
         )
         # Set up reconnection callbacks
         self.controller.set_reconnection_callbacks(
@@ -3075,7 +3114,7 @@ class Makera(RelativeLayout):
         self.shortcut_manager.install()
 
         self.usb_event = lambda instance, device_path: self.openUSB(device_path)
-        self.wifi_event = lambda instance, x: self.openWIFI(x)
+        self.wifi_event = lambda instance, x: self.attempt_open_wifi(x)
 
         self.heartbeat_time = 0
         self.machine_metadata_query_time = 0
@@ -3896,6 +3935,7 @@ class Makera(RelativeLayout):
                     self.reconnection_popup.open()
 
             self.controller.close()
+            self.status_drop_down.set_connected_controllers(())
             self.updateStatus()
 
     # -----------------------------------------------------------------------
@@ -4316,7 +4356,7 @@ class Makera(RelativeLayout):
                         app.is_community_firmware = bool(self.fw_version) and "c" in self.fw_version.lower()
                         self.controller.is_community_firmware = app.is_community_firmware
                         if not app.is_community_firmware or not CNC.can_rotate_wcs:
-                            self.controller.viewWCS()
+                            self.controller.viewWCS(automatic=True)
                         app.fw_version_digitized = Utils.digitize_v(self.fw_version)
                         logger.debug(f"Firmware Version detected as {self.fw_version}")
                         Clock.schedule_once(partial(self.onFirmwareDetected, self.fw_version), 0)
@@ -5052,7 +5092,7 @@ class Makera(RelativeLayout):
         remote_path = "/sd/config.txt"
         self.downloading_file = remote_path
         local_path = self._machine_config_cache_path()
-        threading.Thread(target=self.doDownload, args=(remote_path, local_path)).start()
+        threading.Thread(target=self.doDownload, args=(remote_path, local_path), kwargs={"automatic": True}).start()
 
     # -----------------------------------------------------------------------
     def finishLoadConfig(self, success, *args):
@@ -5225,7 +5265,7 @@ class Makera(RelativeLayout):
         cache.ingest_file(source, machine_cache_key(conn, remote_path), size, date_raw)
 
     # -----------------------------------------------------------------------
-    def doDownload(self, remote_path, local_path, show_progress=True, open_after=True):
+    def doDownload(self, remote_path, local_path, show_progress=True, open_after=True, automatic=False):
         app = App.get_running_app()
         was_config_download = self.downloading_config
         # Config backup reuses downloading_config so /sd is not added to recents, but those
@@ -5265,12 +5305,21 @@ class Makera(RelativeLayout):
             # Smoothie/XMODEM legacy: send first, then pause (OEM timing).
             if self.controller.comms.uses_framed_transfer:
                 self.controller.pauseStream(0.0)
-                self.controller.downloadCommand(remote_path)
+                sent = self.controller.downloadCommand(remote_path, automatic=automatic)
                 progress_cb = self.downloadCallback_framed if show_progress else None
             else:
-                self.controller.downloadCommand(remote_path)
+                sent = self.controller.downloadCommand(remote_path, automatic=automatic)
                 self.controller.pauseStream(0.2)
                 progress_cb = partial(self.downloadCallback, remote_path) if show_progress else None
+            if not sent:
+                # Held back: the identify handshake is still unresolved (a
+                # sub-1-second window right after connecting). streamIO is
+                # already paused above, so nothing would flush the queued
+                # command until it resumes — waiting here would just stall
+                # until XMODEM's own timeout. Fail this attempt cleanly
+                # instead; a retry (automatic or manual) shortly after
+                # succeeds normally.
+                raise RuntimeError(f"Download command held back for {remote_path}: not yet connected to the machine")
             download_result = self.controller.stream.download(tmp_filename, md5, progress_cb)
         except Exception:
             logger.error(sys.exc_info()[1])
@@ -5920,6 +5969,26 @@ class Makera(RelativeLayout):
         self.message_popup.btn_ok.disabled = btn_disabled
         self.message_popup.open()
 
+    def show_machine_busy_before_identify_popup(self, *args):
+        # Same wording as the pre-connect busy check (reconnect_last_connection):
+        # this is the same "someone else is already connected" outcome, just
+        # discovered after the TCP connection was accepted rather than before it.
+        self.show_message_popup(tr._("Cannot connect, machine is busy or not available."), False)
+
+    def show_hello_rejected_popup(self, reason, *args):
+        if reason == "cap":
+            message = tr._("This machine already has the maximum number of controllers connected.")
+        else:
+            message = tr._(
+                "An older controller is connected to this machine. Multiple controllers aren't available until it disconnects."
+            )
+        self.show_message_popup(message, False)
+
+    def update_connected_controllers(self, entries):
+        own_id = self.identity.id if getattr(self, "identity", None) is not None else None
+        rows = rows_for_display(entries, own_id) if own_id is not None else ()
+        self.status_drop_down.set_connected_controllers(rows)
+
     def show_usb_reset_blocked_popup(self, *args):
         content = BoxLayout(orientation="vertical", padding=dp(15))
         lbl = Label(
@@ -6414,7 +6483,15 @@ class Makera(RelativeLayout):
         try:
             # md5 = Utils.md5(self.uploading_file)
             md5 = Utils.md5(displayname)
-            self.controller.uploadCommand(os.path.normpath(remotename))
+            sent = self.controller.uploadCommand(os.path.normpath(remotename))
+            if not sent:
+                # Held back: the identify handshake is still unresolved (a
+                # sub-1-second window right after connecting) and streamIO
+                # is already paused above, so nothing would flush the
+                # queued command until it resumes — waiting here would
+                # just stall until XMODEM's own timeout. Fail this attempt
+                # cleanly instead; retrying shortly after succeeds normally.
+                raise RuntimeError(f"Upload command held back for {remotename}: not yet connected to the machine")
             upload_result = self.controller.stream.upload(self.uploading_file, md5, self.uploadCallback)
             modem = getattr(self.controller.stream, "modem", None)
             last_file_error = getattr(modem, "last_file_error", None) if modem else None
@@ -7546,6 +7623,25 @@ class Makera(RelativeLayout):
             ).start()
 
     # -----------------------------------------------------------------------
+    def attempt_open_wifi(self, address):
+        """Connect from the discovery dropdown, unless the beacon already
+        told us an old controller is attached — joining then would just get
+        closed by the machine a few seconds later, once it gives up waiting
+        for a hello that will never come from that old controller."""
+        ip = address.split(":")[0]
+        if self.machine_detector.is_old_controller_present(ip):
+            Clock.schedule_once(
+                partial(
+                    self.show_message_popup,
+                    tr._("An older controller is already connected to this machine."),
+                    False,
+                ),
+                0,
+            )
+            return
+        self.openWIFI(address)
+
+    # -----------------------------------------------------------------------
     def openWIFI(self, address):
         try:
             if self.controller.open(CONN_WIFI, address):
@@ -7572,6 +7668,7 @@ class Makera(RelativeLayout):
             self.controller.close_manual()
         except:
             logger.error(sys.exc_info()[1])
+        self.status_drop_down.set_connected_controllers(())
         self.updateStatus()
 
     # -----------------------------------------------------------------------
@@ -8118,6 +8215,13 @@ class Makera(RelativeLayout):
             App.get_running_app().active_color = self._parse_active_color(
                 self.controller_setting_change_list.get("active_color")
             )
+
+        if "controller_name" in self.controller_setting_change_list:
+            # set_name trims to the handshake's 31-byte limit and re-persists
+            # the (possibly trimmed) value, so Config and the identity object
+            # agree even if the settings panel accepted a longer name.
+            self.identity = set_name(_KivyConfigIdentityStore(), self.controller_setting_change_list["controller_name"])
+            self.controller.identity = self.identity
 
         pendant_changed = any(
             k == "pendant_type" or k.startswith("gamepad_") for k in self.controller_setting_change_list

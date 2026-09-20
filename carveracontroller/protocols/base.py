@@ -15,6 +15,14 @@ class CommunicationProtocol(ABC):
 
     def __init__(self) -> None:
         self.ready: bool = False
+        # True once at least one complete, CRC-valid frame has been received
+        # from the machine. Only ever set by a framed protocol (Makera);
+        # stays False for Smoothie, which has no frames. This is what proves
+        # a link is genuinely speaking the framed protocol, as opposed to
+        # the protocol detector's own guess (which only checks for the
+        # *absence* of a plaintext echo reply, not confirmation that a
+        # framed reply was ever received).
+        self.frame_confirmed: bool = False
 
     @abstractmethod
     def encode_command(self, data: bytes) -> bytes:

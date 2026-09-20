@@ -21,6 +21,7 @@ SOCKET_TIMEOUT = 0.3  # s
 class MachineDetector:
     def __init__(self):
         self.machine_list = []
+        # (name, ip) pairs already recorded this scan — see check_for_responses.
         self.machine_name_list = []
         self.sock = None
         self.t = None
@@ -58,18 +59,50 @@ class MachineDetector:
                     fields = data.decode("utf-8").split(",")
                 except:
                     pass
-                if len(fields) > 3 and fields[0] not in self.machine_name_list:
-                    self.machine_name_list.append(fields[0])
-                    self.machine_list.append(
-                        {"machine": fields[0], "ip": fields[1], "port": int(fields[2]), "busy": fields[3] == "1"}
-                    )
-                    print(self.machine_list[-1])
+                if len(fields) > 3:
+                    # A 5th field (old_controller_present) is new; absent on
+                    # a beacon from firmware that predates it, in which case
+                    # "no old controller known present" is the safe default.
+                    old_controller_present = len(fields) > 4 and fields[4] == "1"
+                    entry = {
+                        "machine": fields[0],
+                        "ip": fields[1],
+                        "port": int(fields[2]),
+                        "busy": fields[3] == "1",
+                        "old_controller_present": old_controller_present,
+                    }
+                    # Keyed by (name, ip) together, not name alone: two
+                    # different machines that happen to share a name must
+                    # not be folded into one flip-flopping entry.
+                    key = (fields[0], fields[1])
+                    if key in self.machine_name_list:
+                        # Seen this machine already this scan — update its
+                        # entry in place rather than ignoring the repeat, so
+                        # a flag that changes mid-scan (e.g. an old
+                        # controller connecting) is reflected, not stuck at
+                        # whatever the first beacon said.
+                        for i, existing in enumerate(self.machine_list):
+                            if (existing["machine"], existing["ip"]) == key:
+                                self.machine_list[i] = entry
+                                break
+                    else:
+                        self.machine_name_list.append(key)
+                        self.machine_list.append(entry)
                 self.t = time.time()
                 return None
             self.sock.close()
             return self.machine_list
         except:
             print(sys.exc_info()[1])
+
+    def is_old_controller_present(self, ip):
+        """Whether the last-discovered beacon for ``ip`` reported an old
+        controller already connected. False if that machine hasn't been
+        (re)discovered, matching the "unknown means don't block" default."""
+        for machine in self.machine_list:
+            if machine.get("ip") == ip:
+                return bool(machine.get("old_controller_present", False))
+        return False
 
 
 # ==============================================================================

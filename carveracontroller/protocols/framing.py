@@ -24,6 +24,17 @@ PTYPE_LOAD_FINISH = 0x84
 PTYPE_LOAD_ERROR = 0x85
 PTYPE_NORMAL_INFO = 0x90
 
+# Multi-client identify handshake: lets a controller introduce itself to the
+# machine (hello/hello ack) and ask who else is connected (client-list
+# request/reply). Only the message types this controller actually uses are
+# defined here; the full set of reserved values for this feature runs from
+# 0x60 to 0x6B.
+PTYPE_HELLO = 0x60
+PTYPE_HELLO_ACK = 0x61
+PTYPE_CLIENT_LIST_REQ = 0x63
+PTYPE_CLIENT_LIST_REPLY = 0x64
+PTYPE_AUTO_COMMAND = 0x6B
+
 MAX_FRAME_DATA_LENGTH = 8200
 
 # CRC-16/CCITT lookup table (Mark G. Mendel)
