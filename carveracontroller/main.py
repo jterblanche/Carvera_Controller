@@ -14,6 +14,31 @@ MACHINE_CONFIG_FILES = {
 
 MAX_CONFIG_DOWNLOAD_ATTEMPTS = 3
 
+# How many times check_model_metadata() will send "version" or "model" while
+# waiting for a first reply, before it gives up and stops asking. Two
+# callers share this same counter: the 10-second status timer
+# (Clock.schedule_interval(self.check_model_metadata, 10), which governs
+# while the machine is not Idle) and updateStatus(), which calls it at up to
+# once a second while the machine is Idle and config has not loaded yet
+# (config download needs both values -- see download_config_file()'s
+# gating). So on a fresh Idle connection all the attempts are typically
+# spent in a few seconds, not the roughly 30 seconds the 10-second cadence
+# alone would suggest. This bounds how long a machine that never replies
+# (dropped line, an older protocol variant that does not support the
+# command) gets queried before the controller stops and moves on, rather
+# than polling forever. It is not the end of the story: reconnecting resets
+# the count, and a reply to "version"/"model" typed directly into the
+# console goes through the same parsing and is recorded the same way,
+# regardless of how many automatic attempts have already been spent.
+# Since these queries route through Controller._send_automatic_command
+# (Controller.queryVersion / queryModel), the very first one or two calls
+# can sit queued for up to ACK_TIMEOUT_S (machine/hello.py, ~1s worst case,
+# ~70ms typically) if the identify handshake hasn't resolved yet; each
+# still counts as one attempt here, and is sent once the handshake
+# resolves, so this does not change how many times a value is asked for,
+# only when the earliest ones actually reach the wire.
+MACHINE_METADATA_QUERY_MAX_ATTEMPTS = 3
+
 
 def is_android():
     return "ANDROID_ARGUMENT" in os.environ or "ANDROID_PRIVATE" in os.environ or "ANDROID_APP_PATH" in os.environ
@@ -2894,6 +2919,14 @@ class Makera(RelativeLayout):
     instantFSoverride = True
     fw_version = ""
     fw_version_checking = False
+    # How many times check_model_metadata() has queried "version"/"model"
+    # since the last connect without getting a usable reply. See
+    # MACHINE_METADATA_QUERY_MAX_ATTEMPTS. Counts one past the limit once
+    # check_model_metadata gives up, purely so it logs that once instead of
+    # every tick; nothing reads these otherwise. Reset on disconnect, and
+    # not the only way to recover: see MACHINE_METADATA_QUERY_MAX_ATTEMPTS.
+    fw_version_query_attempts = 0
+    model_query_attempts = 0
     backing_up_config = False
 
     filetype_support = "nc"
@@ -3939,6 +3972,52 @@ class Makera(RelativeLayout):
             self.updateStatus()
 
     # -----------------------------------------------------------------------
+    def _handle_version_reply(self, line):
+        """Parse a "version = <value>" line from the machine's serial log.
+
+        Any non-empty value is accepted and recorded as fw_version, not just
+        a release-style "major.minor.patch" number. A firmware built from a
+        branch (rather than a tagged release) reports "<branch>-<commit>"
+        (firmware src/generate-version.sh), which never looks like a release
+        number, so the old code here never recorded it. check_model_metadata
+        then queried "version" again on every call it made -- both the
+        10-second status timer and updateStatus()'s own once-a-second calls
+        while Idle -- with no limit; see its attempt cap, which is what
+        actually stops the retries.
+
+        Everything that compares fw_version against a real release number
+        already parses it strictly and already degrades safely when it is
+        not numeric: Utils.digitize_v() returns 0 for a string with no
+        leading digits, so a plain branch/commit string reads as older than
+        every release and every "fw_version_digitized >= <threshold>"
+        feature gate in Controller.py and makera.kv stays off, same as for a
+        genuinely old machine. (A branch name that itself starts with a
+        release-shaped prefix, e.g. "2.0.0-my-feature", is the one case
+        digitize_v does not read as 0 -- worth knowing, not something this
+        fix changes.) updater.service's parse_version() returns None the
+        same way for its own comparisons. Neither of those needed to change.
+        """
+        remote_version = re.search(r"version = (\S+)", line)
+        if remote_version is None:
+            return
+        app = App.get_running_app()
+        self.fw_version = remote_version.group(1).strip()
+        app.is_community_firmware = bool(self.fw_version) and "c" in self.fw_version.lower()
+        self.controller.is_community_firmware = app.is_community_firmware
+        if not app.is_community_firmware or not CNC.can_rotate_wcs:
+            # Unprompted, off a version reply -- goes through the automatic-
+            # query path like the other connect-time queries (see
+            # Controller.viewWCS's docstring), not the WCS popup's own call.
+            self.controller.viewWCS(automatic=True)
+        app.fw_version_digitized = Utils.digitize_v(self.fw_version)
+        logger.debug(f"Firmware Version detected as {self.fw_version}")
+        Clock.schedule_once(partial(self.onFirmwareDetected, self.fw_version), 0)
+        Clock.schedule_once(lambda *_: self._refresh_firmware_update_state(), 0)
+        # Baud upgrade is deferred until after config download / sync
+        # (see attempt_usb_baud_upgrade_if_eligible). Running it on the
+        # version line races framed config transfer and breaks the link.
+
+    # -----------------------------------------------------------------------
     def switch_status(self, *args):
         self.status_index = self.status_index + 1
         if self.status_index >= 6:
@@ -3957,13 +4036,45 @@ class Makera(RelativeLayout):
         if self.controller.stream is None:
             return
 
-        # Check if model has been set and if not, query for it
+        # Check if model has been set and if not, query for it, up to a
+        # small number of attempts. This is called from two places that
+        # share the same counter: the 10-second status timer while the
+        # machine is not Idle, and updateStatus() at up to once a second
+        # while it is Idle and config has not loaded yet -- so on a fresh
+        # Idle connection the attempts are usually spent in a few seconds,
+        # not the roughly 30 seconds the 10-second cadence alone would
+        # suggest. A machine that never answers "model" at all (a dropped
+        # line, or an older protocol variant that does not send one) is
+        # queried this many times and then left alone until the next
+        # reconnect, or until "model" is typed directly into the console.
         if not app.model or app.model == "":
-            self.controller.queryModel()
+            if self.model_query_attempts < MACHINE_METADATA_QUERY_MAX_ATTEMPTS:
+                self.model_query_attempts += 1
+                self.controller.queryModel()
+            elif self.model_query_attempts == MACHINE_METADATA_QUERY_MAX_ATTEMPTS:
+                # One past the limit: log the give-up exactly once, then go
+                # quiet (the count no longer equals the limit on later calls).
+                self.model_query_attempts += 1
+                logger.info(
+                    f"Machine model unknown after {MACHINE_METADATA_QUERY_MAX_ATTEMPTS} "
+                    "attempts with no usable reply; no longer querying."
+                )
 
-        # Check if version has been set and if not, query for it
+        # Check if version has been set and if not, query for it: same
+        # attempt limit, same two callers, same reason. See
+        # _handle_version_reply() for why any non-empty reply is now
+        # accepted; this limit is what stops the query for a machine that
+        # never replies to "version" at all.
         if not self.fw_version or self.fw_version == "":
-            self.controller.queryVersion()
+            if self.fw_version_query_attempts < MACHINE_METADATA_QUERY_MAX_ATTEMPTS:
+                self.fw_version_query_attempts += 1
+                self.controller.queryVersion()
+            elif self.fw_version_query_attempts == MACHINE_METADATA_QUERY_MAX_ATTEMPTS:
+                self.fw_version_query_attempts += 1
+                logger.info(
+                    f"Firmware version unknown after {MACHINE_METADATA_QUERY_MAX_ATTEMPTS} "
+                    "attempts with no usable reply; no longer querying."
+                )
 
         self.machine_metadata_query_time = time.time()
 
@@ -4349,21 +4460,7 @@ class Makera(RelativeLayout):
                         if abs(Utils.local_unix_time() - int(remote_time[0].split("=")[1])) > 10:
                             self.controller.syncTime()
 
-                    remote_version = re.search(r"version = [0-9]+\.[0-9]+\.[0-9]+[a-zA-Z0-9\-_]*", line)
-                    app = App.get_running_app()
-                    if remote_version != None:
-                        self.fw_version = remote_version[0].split("=")[1].strip()
-                        app.is_community_firmware = bool(self.fw_version) and "c" in self.fw_version.lower()
-                        self.controller.is_community_firmware = app.is_community_firmware
-                        if not app.is_community_firmware or not CNC.can_rotate_wcs:
-                            self.controller.viewWCS(automatic=True)
-                        app.fw_version_digitized = Utils.digitize_v(self.fw_version)
-                        logger.debug(f"Firmware Version detected as {self.fw_version}")
-                        Clock.schedule_once(partial(self.onFirmwareDetected, self.fw_version), 0)
-                        Clock.schedule_once(lambda *_: self._refresh_firmware_update_state(), 0)
-                        # Baud upgrade is deferred until after config download / sync
-                        # (see attempt_usb_baud_upgrade_if_eligible). Running it on the
-                        # version line races framed config transfer and breaks the link.
+                    self._handle_version_reply(line)
 
                     remote_model = re.search(r"model = (\w+), (\d+), (\d+), (\d+)", line)
                     if remote_model != None:
@@ -6872,8 +6969,10 @@ class Makera(RelativeLayout):
                     self._config_apply_failed = False
                     self._config_download_failures = 0
                     self.fw_version = ""
+                    self.fw_version_query_attempts = 0
                     Clock.schedule_once(lambda *_: self._refresh_firmware_update_state(), 0)
                     app.model = ""
+                    self.model_query_attempts = 0
                     app.has_anchor2 = True
                     app.fw_version_digitized = 0
                     app.is_community_firmware = False
