@@ -873,9 +873,21 @@ class Controller:
         self.executeCommand(self.escape(mkdir_command))
 
     def md5Command(self, filename):
-        md5_command = "md5sum %s -e\n" % filename.replace(" ", "\x01")
+        """Ask the machine to md5sum an absolute path already on the card.
+
+        Unlike ls/cat/rm/mv/mkdir, the firmware's "md5sum" takes a path and
+        nothing else (SimpleShell::md5sum_command passes its whole parameter
+        string straight to absolute_from_relative and opens the result as a
+        filename) -- it does not parse a trailing "-e" the way those other
+        commands do, so appending one here would become part of the
+        filename and the machine would answer "File not found" for a file
+        that is there. ``filename`` is expected to already be absolute
+        (e.g. "/sd/firmware.bin"); md5sum_command resolves it itself, so
+        this method does not prepend "/sd/".
+        """
+        md5_command = "md5sum %s\n" % filename.replace(" ", "\x01")
         if "\\" in filename:
-            md5_command = "md5sum %s -e\n" % "/".join(filename.split("\\")).replace(" ", "\x01")
+            md5_command = "md5sum %s\n" % "/".join(filename.split("\\")).replace(" ", "\x01")
         self.executeCommand(self.escape(md5_command))
 
     def loadWiFiCommand(self):
