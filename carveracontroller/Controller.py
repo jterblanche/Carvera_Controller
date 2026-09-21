@@ -1916,11 +1916,16 @@ class Controller:
             # control character. A non-applicable negotiator resolves to
             # the legacy fallback immediately.
             link = LINK_USB if conn_type == CONN_USB else LINK_WIFI
-            # USB serial needs a longer post-reset grace; bulk USB and WiFi are ready
-            # sooner. Reused below for hello's own open-wait deadline (OPEN_TIMEOUT_S
-            # in machine/hello.py is sized against WiFi/bulk-USB reply latency, which
-            # is far too short for a link that may still be mid-boot — see the "why
-            # not on USB serial" question in the change explanation for this branch).
+            # USB serial needs a longer post-reset grace before the heartbeat-drop
+            # check (below) will call the link dead; bulk USB and WiFi are ready
+            # sooner, so they keep the ordinary 5.0s heartbeat grace. Only the 20.0s
+            # USB-reset case is also reused below, as hello's own open_timeout_s
+            # override: OPEN_TIMEOUT_S in machine/hello.py (the default a WiFi/bulk-USB
+            # link keeps) is sized against WiFi/bulk-USB reply latency, far too short
+            # for a link that may still be mid-boot — see the "why not on USB serial"
+            # question in the change explanation for this branch. The 5.0s branch
+            # below is NOT passed to the negotiator; a non-reset link stays on
+            # OPEN_TIMEOUT_S (open_timeout_s=None below resolves to it).
             grace = 20.0 if resets_on_open else 5.0
             self._hello = HelloNegotiator(
                 identity=self.identity,
@@ -1930,6 +1935,8 @@ class Controller:
                 # this negotiator waits for a first CRC-valid frame before giving up
                 # on the handshake ever starting at all.
                 opened_at=time.monotonic(),
+                # Only the USB-reset case overrides the default; None here means
+                # "use OPEN_TIMEOUT_S" (see the comment on `grace` above).
                 open_timeout_s=grace if resets_on_open else None,
             )
             self._reset_pending_sends()

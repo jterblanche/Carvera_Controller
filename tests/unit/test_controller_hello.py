@@ -49,6 +49,17 @@ def controller():
     c.close(allow_reconnect=False)
 
 
+def _drain_log_messages(controller):
+    """All (kind, text) pairs currently queued on controller.log, in order."""
+    messages = []
+    while True:
+        try:
+            messages.append(controller.log.get_nowait())
+        except Exception:
+            break
+    return messages
+
+
 def test_hello_not_sent_to_a_machine_that_never_replies(machine, controller):
     """No CRC-valid frame ever arrives from this machine, so hello must
     never be sent."""
@@ -82,6 +93,13 @@ def test_ordinary_command_flushed_after_open_timeout_against_a_silent_machine(ma
     assert sent == b"version"
     # Never identified (no ack ever arrived): still a legitimate fallback.
     assert controller._hello.resolution is Resolution.FALLBACK
+
+    # The reporting decision: a link that never answered at all gets one
+    # console line saying so, unlike the ordinary (silent) ack-wait
+    # fallback — see test_no_reply_message_not_logged_against_old_firmware
+    # for the negative case this is meaningless without.
+    messages = _drain_log_messages(controller)
+    assert any("No reply from the machine" in text for _kind, text in messages)
 
 
 def test_hello_sent_once_a_valid_frame_is_confirmed(machine, controller):
@@ -127,6 +145,27 @@ def test_nothing_but_realtime_and_hello_before_ack_then_unwrapped_fallback(machi
     assert m.wait_until(lambda: m.frames_of_type(PTYPE_CTRL_MULTI) != [], timeout=2.0)
     (sent,) = m.frames_of_type(PTYPE_CTRL_MULTI)
     assert sent == b"version"
+
+
+def test_no_reply_message_not_logged_against_old_firmware(machine, controller):
+    """The reporting decision, negative case: old firmware answers (it just
+    never acks hello), so this is the ordinary, expected ack-wait fallback —
+    it must stay silent, exactly as before this branch. Only a link that
+    never produces a single valid frame at all (test_ordinary_command_flushed_
+    after_open_timeout_against_a_silent_machine) gets the new console line.
+    Guards the "existing behaviour... unchanged" acceptance criterion: if
+    the never_answered/frame_seen guard in _advance_hello ever broke, every
+    connect to old (pre-hello) firmware — the common case — would start
+    printing this line."""
+    m = machine(mode="old")
+    controller.open(CONN_WIFI, m.address())
+
+    assert m.wait_until(lambda: len(m.hellos_received) >= 1)
+    time.sleep(1.3)  # past ACK_TIMEOUT_S (1.0s): ack-wait fallback has fired
+
+    assert controller._hello.resolution is Resolution.FALLBACK
+    messages = _drain_log_messages(controller)
+    assert not any("No reply from the machine" in text for _kind, text in messages)
 
 
 def test_re_hello_continues_then_stays_bounded_against_old_firmware(machine, controller):
