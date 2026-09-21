@@ -4537,6 +4537,25 @@ class Makera(RelativeLayout):
                     msg, line = self.controller.log.get_nowait()
                     line = line.rstrip("\n")
                     line = line.rstrip("\r")
+
+                    if msg == Controller.MSG_PUBLISHED:
+                        # A published line from another identified
+                        # controller (protocol contract section 6.10):
+                        # shown on the shared console, but deliberately
+                        # `continue`s here, before dispatch_serial_line()
+                        # and every regex side effect below (clock sync,
+                        # model/version detection, ...) -- those must only
+                        # ever run on this controller's own traffic, never
+                        # on what another controller sent or received. See
+                        # Controller._on_published_line.
+                        entry = {
+                            "text": line,
+                            "color": (150 / 255, 150 / 255, 150 / 255, 1),
+                            "entry_type": "output",
+                        }
+                        self._append_to_mdi([entry], log_to_mdi_data=False)
+                        continue
+
                     dispatch_serial_line(msg, line)
 
                     remote_time = re.search("time = [0-9]+", line)
