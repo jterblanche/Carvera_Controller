@@ -1,4 +1,4 @@
-from carveracontroller.machine.hello import ACK_TIMEOUT_S, HELLO_WINDOW_S, HelloNegotiator, Resolution
+from carveracontroller.machine.hello import ACK_TIMEOUT_S, HELLO_WINDOW_S, OPEN_TIMEOUT_S, HelloNegotiator, Resolution
 from carveracontroller.machine.identity import ControllerIdentity
 from carveracontroller.protocols.handshake import (
     HELLO_ACCEPTED,
@@ -24,7 +24,86 @@ def test_hello_not_sent_before_a_valid_frame():
     negotiator = HelloNegotiator(identity=IDENTITY, link=LINK_WIFI)
 
     assert not negotiator.resolved
-    assert negotiator.poll(now=10.0) is False  # nothing sent yet, nothing to time out
+    # Still well within the open-wait deadline: nothing to time out yet.
+    assert negotiator.poll(now=1.0) is False
+    assert not negotiator.resolved
+
+
+def test_fallback_after_open_timeout_elapses_with_no_valid_frame_ever():
+    """Direct coverage for the state machine's half of the fix: a link that
+    never produces a single CRC-valid frame. The ack-wait deadline (anchored
+    on the first hello, itself only sent after a valid frame) never starts,
+    so only the open-wait deadline (anchored at connection open,
+    ``opened_at``) can resolve this. This exercises the new API
+    (``opened_at``/``open_timeout_s`` didn't exist before this fix, so this
+    exact test wouldn't run against the pre-fix code at all — it would fail
+    at construction with a TypeError, not reach these assertions); the
+    behavioural regression test that fails on the actual bug (poll() never
+    firing, queue never flushing) is
+    test_controller_hello.py::test_ordinary_command_flushed_after_open_timeout_against_a_silent_machine."""
+    negotiator = HelloNegotiator(identity=IDENTITY, link=LINK_WIFI, opened_at=0.0)
+
+    assert negotiator.poll(now=OPEN_TIMEOUT_S - 0.01) is False
+    assert not negotiator.resolved
+    assert negotiator.frame_seen is False
+
+    assert negotiator.poll(now=OPEN_TIMEOUT_S) is True
+    assert negotiator.resolution is Resolution.FALLBACK
+    # Fires exactly once.
+    assert negotiator.poll(now=OPEN_TIMEOUT_S + 1) is False
+
+
+def test_open_timeout_s_override_replaces_the_default():
+    """Controller.open() passes an explicit, larger ``open_timeout_s`` for a
+    USB-serial connect (which resets the machine right before this
+    negotiator is built, so it may still be booting) instead of the
+    OPEN_TIMEOUT_S default sized for an already-live WiFi/bulk-USB link. An
+    override must actually replace the default, not just add to it."""
+    negotiator = HelloNegotiator(identity=IDENTITY, link=LINK_WIFI, opened_at=0.0, open_timeout_s=20.0)
+
+    # Long past the *default* OPEN_TIMEOUT_S (3.0s): must not resolve yet.
+    assert negotiator.poll(now=OPEN_TIMEOUT_S + 1.0) is False
+    assert not negotiator.resolved
+
+    assert negotiator.poll(now=20.0 - 0.01) is False
+    assert negotiator.poll(now=20.0) is True
+    assert negotiator.resolution is Resolution.FALLBACK
+
+
+def test_open_timeout_s_defaults_to_the_module_constant():
+    negotiator = HelloNegotiator(identity=IDENTITY, link=LINK_WIFI)
+
+    assert negotiator.open_timeout_s == OPEN_TIMEOUT_S
+
+
+def test_open_timeout_is_measured_from_opened_at_not_from_a_fixed_zero():
+    """The open-wait deadline is anchored at this negotiator's own
+    ``opened_at`` (connection open), not at an arbitrary global zero — a
+    negotiator opened later in wall-clock/monotonic time must not resolve
+    before its own OPEN_TIMEOUT_S has actually elapsed since then."""
+    negotiator = HelloNegotiator(identity=IDENTITY, link=LINK_WIFI, opened_at=100.0)
+
+    assert negotiator.poll(now=100.0 + OPEN_TIMEOUT_S - 0.01) is False
+    assert not negotiator.resolved
+
+    assert negotiator.poll(now=100.0 + OPEN_TIMEOUT_S) is True
+    assert negotiator.resolution is Resolution.FALLBACK
+
+
+def test_late_valid_frame_after_open_timeout_still_sends_hello():
+    """The open-wait fallback only stops the controller from waiting on
+    queued sends; it must not stop hello being sent, or identify being
+    possible, once a valid frame does eventually arrive (a machine that was
+    just slow to boot, not one that's actually broken)."""
+    negotiator = HelloNegotiator(identity=IDENTITY, link=LINK_WIFI, opened_at=0.0)
+    negotiator.poll(now=OPEN_TIMEOUT_S)
+    assert negotiator.resolution is Resolution.FALLBACK
+
+    frame = negotiator.on_valid_frame(now=OPEN_TIMEOUT_S + 0.5)
+
+    assert frame is not None
+    assert frame[4] == 0x60  # PTYPE_HELLO
+    assert negotiator.frame_seen is True
 
 
 def test_hello_sent_once_after_first_valid_frame():

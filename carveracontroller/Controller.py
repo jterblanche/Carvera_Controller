@@ -1886,9 +1886,14 @@ class Controller:
                 self.log.put((self.MSG_ERROR, "Connection Failed!"))
                 return False
 
-            if conn_type == CONN_USB and getattr(transport, "resets_on_open", True):
-                # USB serial open toggles DTR and resets the machine; wait for firmware boot
-                # before protocol probe / status polling. Vendor bulk USB does not reset.
+            # USB serial open toggles DTR and resets the machine; a bulk USB or WiFi
+            # link does not. Drives both the pre-probe sleep below and, further down,
+            # how long this connection is given the benefit of the doubt before
+            # concluding it's actually unresponsive (heartbeat grace, hello's
+            # open-wait deadline) rather than just still booting.
+            resets_on_open = conn_type == CONN_USB and getattr(transport, "resets_on_open", True)
+            if resets_on_open:
+                # Wait for firmware boot before protocol probe / status polling.
                 time.sleep(2.0)
 
             CNC.vars["state"] = CONNECTED
@@ -1911,18 +1916,34 @@ class Controller:
             # control character. A non-applicable negotiator resolves to
             # the legacy fallback immediately.
             link = LINK_USB if conn_type == CONN_USB else LINK_WIFI
-            self._hello = HelloNegotiator(identity=self.identity, link=link, applicable=self.comms.uses_framed_transfer)
+            # USB serial needs a longer post-reset grace before the heartbeat-drop
+            # check (below) will call the link dead; bulk USB and WiFi are ready
+            # sooner, so they keep the ordinary 5.0s heartbeat grace. Only the 20.0s
+            # USB-reset case is also reused below, as hello's own open_timeout_s
+            # override: OPEN_TIMEOUT_S in machine/hello.py (the default a WiFi/bulk-USB
+            # link keeps) is sized against WiFi/bulk-USB reply latency, far too short
+            # for a link that may still be mid-boot. The 5.0s branch
+            # below is NOT passed to the negotiator; a non-reset link stays on
+            # OPEN_TIMEOUT_S (open_timeout_s=None below resolves to it).
+            grace = 20.0 if resets_on_open else 5.0
+            self._hello = HelloNegotiator(
+                identity=self.identity,
+                link=link,
+                applicable=self.comms.uses_framed_transfer,
+                # Anchors OPEN_TIMEOUT_S/open_timeout_s (machine/hello.py): how long
+                # this negotiator waits for a first CRC-valid frame before giving up
+                # on the handshake ever starting at all.
+                opened_at=time.monotonic(),
+                # Only the USB-reset case overrides the default; None here means
+                # "use OPEN_TIMEOUT_S" (see the comment on `grace` above).
+                open_timeout_s=grace if resets_on_open else None,
+            )
             self._reset_pending_sends()
             self.connected_clients = ()
             self.stream = transport
             self.thread = threading.Thread(target=self.streamIO)
             self.thread.start()
             self._refresh_heartbeat = True
-            # USB serial needs a longer post-reset grace; bulk USB and WiFi are ready sooner.
-            if conn_type == CONN_USB and getattr(transport, "resets_on_open", True):
-                grace = 20.0
-            else:
-                grace = 5.0
             self._heartbeat_grace_until = time.time() + grace
             return True
         finally:
@@ -2572,16 +2593,37 @@ class Controller:
                     self.load_buffer_size += len(line2) + 1
 
     def _advance_hello(self, now):
-        """Called every streamIO tick: sends hello once a frame is confirmed,
-        and resolves the ack-wait timeout (machine/hello.py's ``poll``)."""
+        """Called every streamIO tick. Sends hello the first time a frame is
+        confirmed — even after the open-wait deadline already resolved this
+        to FALLBACK (see OPEN_TIMEOUT_S in machine/hello.py), since a late
+        first frame (e.g. a machine that was still booting) can still send
+        hello and identify this controller; the same "late ack after
+        FALLBACK still identifies" behaviour ACK_TIMEOUT_S already allows
+        (test_late_ack_after_fallback_still_identifies). Also resolves
+        whichever fallback timeout is still live (machine/hello.py's
+        ``poll``): the ack-wait deadline (a link that answered but never
+        acked — old firmware, common, stays silent) or the open-wait
+        deadline (a link that never answered at all — unusual enough to say
+        so)."""
         negotiator = self._hello
-        if negotiator is None or self.stream is None or negotiator.resolved:
+        if negotiator is None or self.stream is None:
             return
         if self.comms.frame_confirmed:
             frame = negotiator.on_valid_frame(now)
             if frame is not None:
                 self._send_raw(frame)
+        if negotiator.resolved:
+            return
+        never_answered = not negotiator.frame_seen
         if negotiator.poll(now):
+            if never_answered:
+                self.log.put(
+                    (
+                        self.MSG_NORMAL,
+                        f"No reply from the machine after {negotiator.open_timeout_s:g}s; "
+                        "sending queued commands anyway",
+                    )
+                )
             self._flush_pending_sends()
 
     def _on_hello_ack(self, payload):
