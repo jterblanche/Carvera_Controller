@@ -16,6 +16,7 @@ from carveracontroller.CNC import CNC
 from carveracontroller.Controller import CONN_USB, CONN_WIFI, Controller
 from carveracontroller.machine.hello import OPEN_TIMEOUT_S, Resolution
 from carveracontroller.machine.identity import ControllerIdentity
+from carveracontroller.machine.peer_closed import PeerClosedError
 from carveracontroller.protocols.framing import (
     PTYPE_AUTO_COMMAND,
     PTYPE_CTRL_MULTI,
@@ -396,3 +397,123 @@ def test_usb_empty_read_does_not_trigger_busy_before_identify(controller):
         controller.thread.join(timeout=1.0)
         controller.stop.clear()
         controller.stream = None
+
+
+def test_peer_closed_after_established_session_is_surfaced_not_silently_absorbed():
+    """The shape actually measured on hardware for an eviction: the link
+    worked — a valid frame had already been confirmed, hello had already
+    been accepted — and then the peer closed it. Before this fix, nothing
+    in streamIO's loop ever noticed: recv() keeps returning b"" forever on
+    a closed socket (select() keeps reporting it readable, so
+    waiting_for_recv() stays True), and every queued send just raised a
+    "Broken pipe" that got logged once and forgotten. Must now be treated
+    as a lost connection, not the "machine busy" outcome
+    _handle_closed_before_identify exists for — that path requires the
+    peer to close before any frame ever arrived, which is not this case."""
+    m = FakeMachine(mode="new", close_after_ack=0.3)
+    controller = Controller(CNC(), callback=None, identity=IDENTITY)
+    fake_app = MagicMock()
+    try:
+        with (
+            patch.object(controller_module, "App") as mock_app_cls,
+            patch.object(controller_module, "Clock") as mock_clock,
+        ):
+            mock_app_cls.get_running_app.return_value = fake_app
+            controller.open(CONN_WIFI, m.address())
+            streamio_thread = controller.thread
+
+            # Confirm the session actually got established before the fake
+            # machine closes it: a valid frame arrived and hello was
+            # accepted, not just "a connection was opened".
+            assert m.wait_until(lambda: controller.comms.frame_confirmed is True, timeout=2.0)
+            assert m.wait_until(lambda: controller._hello is not None and controller._hello.identified, timeout=2.0)
+
+            deadline_ok = m.wait_until(lambda: controller.stream is None, timeout=2.0)
+            assert deadline_ok, "controller must give up the link once the peer closes it"
+
+            streamio_thread.join(timeout=2.0)
+            assert not streamio_thread.is_alive()
+            assert controller._manual_disconnect is True
+
+            scheduled = [call.args[0] for call in mock_clock.schedule_once.call_args_list]
+            for fn in scheduled:
+                fn(0)
+            fake_app.root.show_peer_closed_popup.assert_called_once()
+            # The two paths must not regress into each other: this is not
+            # the before-identify "machine busy" outcome.
+            fake_app.root.show_machine_busy_before_identify_popup.assert_not_called()
+    finally:
+        controller.close(allow_reconnect=False)
+        m.stop()
+
+
+class _PeerClosedStream:
+    """A USB transport whose link has just failed — as a real USBStream
+    would raise via PeerClosedError, from a caught
+    serial.SerialException (see USBStream.recv/send and
+    test_usb_stream.py). No real serial port involved: this tests
+    Controller.streamIO's own handling of PeerClosedError directly, the
+    same way _EmptyReadStream above tests its handling of USB's b"".
+    Unlike the WiFi mid-session-close test above, this doesn't need to
+    first establish a session: USB's PeerClosedError is routed to the
+    same handler regardless of whether a frame had ever been confirmed,
+    because a failed read or write carries no equivalent evidence that
+    this is the WiFi "machine busy" pattern rather than the cable coming
+    out (see the PeerClosedError handling in streamIO)."""
+
+    def __init__(self):
+        self.closed = False
+
+    def waiting_for_recv(self):
+        return True
+
+    def recv(self):
+        raise PeerClosedError("device gone")
+
+    def send(self, data):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+def test_usb_peer_closed_error_is_surfaced_not_silently_absorbed(controller):
+    """USB's counterpart to the WiFi mid-session-close test above: a
+    PeerClosedError (standing in for a real device disappearing) must be
+    surfaced, not swallowed by the generic `except Exception` catch-all
+    that used to just log it — the same "Broken pipe, over and over,
+    nothing else happens" shape WiFi had, just with a different exception
+    underneath."""
+    fake_app = MagicMock()
+    stream = _PeerClosedStream()
+    with (
+        patch.object(controller_module, "App") as mock_app_cls,
+        patch.object(controller_module, "Clock") as mock_clock,
+    ):
+        mock_app_cls.get_running_app.return_value = fake_app
+        controller.connection_type = CONN_USB
+        controller.stream = stream
+        controller.stop.clear()
+        controller.thread = threading.Thread(target=controller.streamIO)
+        controller.thread.start()
+        try:
+            deadline = time.time() + 2.0
+            while time.time() < deadline and controller.stream is not None:
+                time.sleep(0.02)
+            assert controller.stream is None, "controller must give up the link once the device fails"
+
+            controller.thread.join(timeout=2.0)
+            assert not controller.thread.is_alive()
+            assert controller._manual_disconnect is True
+            assert stream.closed is True
+
+            scheduled = [call.args[0] for call in mock_clock.schedule_once.call_args_list]
+            for fn in scheduled:
+                fn(0)
+            fake_app.root.show_peer_closed_popup.assert_called_once()
+        finally:
+            controller.stop.set()
+            if controller.thread.is_alive():
+                controller.thread.join(timeout=1.0)
+            controller.stop.clear()
+            controller.stream = None

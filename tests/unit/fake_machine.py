@@ -27,6 +27,15 @@ client already attached: the machine accepts the TCP connection, then
 closes it unconditionally after that many seconds without answering
 anything at all — an accept immediately followed by a close, not a normal
 "stayed connected but never answered" case.
+
+``close_after_ack`` models the shape actually measured on hardware for an
+eviction: the machine accepts a hello, acks it, keeps working normally
+(answering polls) for a while, and then closes the link out from under a
+session that had been fine — because another client has since identified
+and this one hadn't (today's controller always identifies, so this is
+standing in for the case where something else closes an established link
+that already worked; the mechanism a real eviction uses to decide *when*
+to close isn't reproduced here, only the shape of the close itself).
 """
 
 from __future__ import annotations
@@ -51,11 +60,12 @@ _HEADER = bytes([0x86, 0x68])
 
 
 class FakeMachine:
-    def __init__(self, mode="new", ack_delay=0.0, ack_result=HELLO_ACCEPTED, close_after=None):
+    def __init__(self, mode="new", ack_delay=0.0, ack_result=HELLO_ACCEPTED, close_after=None, close_after_ack=None):
         self.mode = mode
         self.ack_delay = ack_delay
         self.ack_result = ack_result
         self.close_after = close_after
+        self.close_after_ack = close_after_ack
 
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -204,6 +214,8 @@ class FakeMachine:
             if self.ack_delay:
                 time.sleep(self.ack_delay)
             self._send(conn, build_frame(PTYPE_HELLO_ACK, bytes([1, self.ack_result, 0])))
+            if self.close_after_ack is not None:
+                threading.Thread(target=self._close_after_ack, args=(conn,), daemon=True).start()
             return
 
         if ptype == PTYPE_CLIENT_LIST_REQ:
@@ -213,6 +225,13 @@ class FakeMachine:
             entry = (0xAAAABBBBCCCCDDDD).to_bytes(8, "big") + bytes([len(name)]) + name + bytes([0, 1])
             self._send(conn, build_frame(PTYPE_CLIENT_LIST_REPLY, bytes([1]) + entry))
             return
+
+    def _close_after_ack(self, conn):
+        time.sleep(self.close_after_ack)
+        try:
+            conn.close()
+        except OSError:
+            pass
 
     def _send(self, conn, frame):
         try:
