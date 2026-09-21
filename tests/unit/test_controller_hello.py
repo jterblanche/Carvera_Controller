@@ -14,6 +14,7 @@ import pytest
 import carveracontroller.Controller as controller_module
 from carveracontroller.CNC import CNC
 from carveracontroller.Controller import CONN_USB, CONN_WIFI, Controller
+from carveracontroller.machine.hello import OPEN_TIMEOUT_S, Resolution
 from carveracontroller.machine.identity import ControllerIdentity
 from carveracontroller.protocols.framing import (
     PTYPE_AUTO_COMMAND,
@@ -58,6 +59,29 @@ def test_hello_not_sent_to_a_machine_that_never_replies(machine, controller):
 
     assert m.hellos_received == []
     assert controller.comms.frame_confirmed is False
+
+
+def test_ordinary_command_flushed_after_open_timeout_against_a_silent_machine(machine, controller):
+    """Regression for ticket #79: a link that accepts the connection and
+    then never sends a single CRC-valid frame used to queue every ordinary
+    send forever. The ack-wait fallback (ACK_TIMEOUT_S) can only start once
+    a valid frame has let hello be sent, so against a machine that never
+    answers at all it never got the chance to fire, and nothing else timed
+    it out either. With the open-wait deadline (OPEN_TIMEOUT_S) added, a
+    command queued behind the handshake must still reach the machine,
+    unwrapped, within a bounded delay."""
+    m = machine(mode="silent")
+    controller.open(CONN_WIFI, m.address())
+    controller.executeCommand("version")
+
+    time.sleep(OPEN_TIMEOUT_S - 0.5)  # still well inside the open-wait window
+    assert m.frames_of_type(PTYPE_CTRL_MULTI) == []
+
+    assert m.wait_until(lambda: m.frames_of_type(PTYPE_CTRL_MULTI) != [], timeout=OPEN_TIMEOUT_S + 2.0)
+    (sent,) = m.frames_of_type(PTYPE_CTRL_MULTI)
+    assert sent == b"version"
+    # Never identified (no ack ever arrived): still a legitimate fallback.
+    assert controller._hello.resolution is Resolution.FALLBACK
 
 
 def test_hello_sent_once_a_valid_frame_is_confirmed(machine, controller):

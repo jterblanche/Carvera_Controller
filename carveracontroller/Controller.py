@@ -20,7 +20,7 @@ from functools import partial
 
 from . import Utils
 from .CNC import CMDPAT, CNC, LASER_TOOL_NUMBER, PARENPAT, SEMIPAT, ZPROBE_TOOL_NUMBER
-from .machine.hello import HelloNegotiator, Resolution
+from .machine.hello import OPEN_TIMEOUT_S, HelloNegotiator, Resolution
 from .machine.identity import ControllerIdentity, default_name, generate_id
 from .protocols import (
     HELLO_REJECTED_CAP,
@@ -1911,7 +1911,15 @@ class Controller:
             # control character. A non-applicable negotiator resolves to
             # the legacy fallback immediately.
             link = LINK_USB if conn_type == CONN_USB else LINK_WIFI
-            self._hello = HelloNegotiator(identity=self.identity, link=link, applicable=self.comms.uses_framed_transfer)
+            self._hello = HelloNegotiator(
+                identity=self.identity,
+                link=link,
+                applicable=self.comms.uses_framed_transfer,
+                # Anchors OPEN_TIMEOUT_S (machine/hello.py): how long this
+                # negotiator waits for a first CRC-valid frame before giving
+                # up on the handshake ever starting at all.
+                opened_at=time.monotonic(),
+            )
             self._reset_pending_sends()
             self.connected_clients = ()
             self.stream = transport
@@ -2572,16 +2580,36 @@ class Controller:
                     self.load_buffer_size += len(line2) + 1
 
     def _advance_hello(self, now):
-        """Called every streamIO tick: sends hello once a frame is confirmed,
-        and resolves the ack-wait timeout (machine/hello.py's ``poll``)."""
+        """Called every streamIO tick. Sends hello the first time a frame is
+        confirmed — even after the open-wait deadline already resolved this
+        to FALLBACK (see OPEN_TIMEOUT_S in machine/hello.py), since a late
+        first frame (e.g. a machine that was still booting) can still send
+        hello and identify this controller; the same "late ack after
+        FALLBACK still identifies" behaviour ACK_TIMEOUT_S already allows
+        (test_late_ack_after_fallback_still_identifies). Also resolves
+        whichever fallback timeout is still live (machine/hello.py's
+        ``poll``): the ack-wait deadline (a link that answered but never
+        acked — old firmware, common, stays silent) or the open-wait
+        deadline (a link that never answered at all — unusual enough to say
+        so)."""
         negotiator = self._hello
-        if negotiator is None or self.stream is None or negotiator.resolved:
+        if negotiator is None or self.stream is None:
             return
         if self.comms.frame_confirmed:
             frame = negotiator.on_valid_frame(now)
             if frame is not None:
                 self._send_raw(frame)
+        if negotiator.resolved:
+            return
+        never_answered = not negotiator.frame_seen
         if negotiator.poll(now):
+            if never_answered:
+                self.log.put(
+                    (
+                        self.MSG_NORMAL,
+                        f"No reply from the machine after {OPEN_TIMEOUT_S:g}s; sending queued commands anyway",
+                    )
+                )
             self._flush_pending_sends()
 
     def _on_hello_ack(self, payload):
