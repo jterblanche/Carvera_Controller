@@ -6166,6 +6166,12 @@ class Makera(RelativeLayout):
             )
         self.show_message_popup(message, False)
 
+    def show_peer_closed_popup(self, *args):
+        # Shown for a link that was working and then wasn't (see
+        # Controller._handle_peer_closed): unlike the busy/rejected
+        # messages above, there's no more precise reason to give here.
+        self.show_message_popup(tr._("Disconnected: the connection to the machine was lost."), False)
+
     def update_connected_controllers(self, entries):
         own_id = self.identity.id if getattr(self, "identity", None) is not None else None
         rows = rows_for_display(entries, own_id) if own_id is not None else ()
