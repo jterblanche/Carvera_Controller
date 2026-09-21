@@ -1922,8 +1922,7 @@ class Controller:
             # USB-reset case is also reused below, as hello's own open_timeout_s
             # override: OPEN_TIMEOUT_S in machine/hello.py (the default a WiFi/bulk-USB
             # link keeps) is sized against WiFi/bulk-USB reply latency, far too short
-            # for a link that may still be mid-boot — see the "why not on USB serial"
-            # question in the change explanation for this branch. The 5.0s branch
+            # for a link that may still be mid-boot. The 5.0s branch
             # below is NOT passed to the negotiator; a non-reset link stays on
             # OPEN_TIMEOUT_S (open_timeout_s=None below resolves to it).
             grace = 20.0 if resets_on_open else 5.0

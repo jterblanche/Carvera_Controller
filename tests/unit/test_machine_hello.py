@@ -40,8 +40,7 @@ def test_fallback_after_open_timeout_elapses_with_no_valid_frame_ever():
     at construction with a TypeError, not reach these assertions); the
     behavioural regression test that fails on the actual bug (poll() never
     firing, queue never flushing) is
-    test_controller_hello.py::test_ordinary_command_flushed_after_open_timeout_against_a_silent_machine.
-    See ticket #79."""
+    test_controller_hello.py::test_ordinary_command_flushed_after_open_timeout_against_a_silent_machine."""
     negotiator = HelloNegotiator(identity=IDENTITY, link=LINK_WIFI, opened_at=0.0)
 
     assert negotiator.poll(now=OPEN_TIMEOUT_S - 0.01) is False

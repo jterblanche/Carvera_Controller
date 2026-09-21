@@ -73,7 +73,7 @@ def test_hello_not_sent_to_a_machine_that_never_replies(machine, controller):
 
 
 def test_ordinary_command_flushed_after_open_timeout_against_a_silent_machine(machine, controller):
-    """Regression for ticket #79: a link that accepts the connection and
+    """Regression: a link that accepts the connection and
     then never sends a single CRC-valid frame used to queue every ordinary
     send forever. The ack-wait fallback (ACK_TIMEOUT_S) can only start once
     a valid frame has let hello be sent, so against a machine that never

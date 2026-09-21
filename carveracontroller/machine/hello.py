@@ -39,8 +39,9 @@ HELLO_WINDOW_S = 5.0
 # deadline is anchored on (on_valid_frame -> _first_hello_sent_at). Without
 # this second anchor, a link that never yields a single valid frame never
 # starts that deadline, so poll() never fires and every gated send queues
-# forever (the bug this constant fixes: see the change explanation for the
-# fake-machine scenario that exposed it).
+# forever. That is the bug this constant fixes; it was found by pointing the
+# controller at a machine that accepts the connection and then sends nothing
+# a frame decoder would accept.
 #
 # This default is sized for a link that was already live when this
 # negotiator was constructed (WiFi, or bulk USB, neither of which reset the
@@ -62,11 +63,10 @@ HELLO_WINDOW_S = 5.0
 # This deadline only decides how long queued sends are held, not whether
 # hello can still happen.
 #
-# Grounded in what's measured elsewhere in this repo, not a round number:
+# Grounded in measurement, not a round number:
 #   - a live machine's own first reply, over WiFi, has been observed
-#     56-668 ms after connect (docs/testing/connection-follows-me/results/
-#     2026-09-20_upload-per-client-461336c/report.md) — well under 1 s even
-#     at the slow end seen so far.
+#     between 56 ms and 668 ms after connect — well under 1 s even at the
+#     slow end seen so far.
 #   - an accepted hello ack alone (a strict subset of "any valid frame",
 #     since the ack is itself carried in one) measures ~70 ms round trip in
 #     practice, the basis ACK_TIMEOUT_S's 1.0 s was chosen against.
