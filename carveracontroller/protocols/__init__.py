@@ -10,10 +10,12 @@ from .handshake import (
     LINK_WIFI,
     ClientEntry,
     HelloAck,
+    PublishedLineFragment,
     decode_client_list,
     decode_hello_ack,
+    decode_published_line,
 )
-from .makera import encode_automatic_command, encode_client_list_request, encode_hello
+from .makera import encode_automatic_command, encode_client_list_request, encode_heartbeat, encode_hello
 from .messages import MessageKind, ParsedMessage
 from .registry import (
     DEFAULT_PROTOCOL,
@@ -36,13 +38,16 @@ __all__ = [
     "MessageKind",
     "ParsedMessage",
     "ProtocolSession",
+    "PublishedLineFragment",
     "available_protocols",
     "create_protocol",
     "decode_client_list",
     "decode_hello_ack",
+    "decode_published_line",
     "detect_protocol_name",
     "encode_automatic_command",
     "encode_client_list_request",
+    "encode_heartbeat",
     "encode_hello",
     "protocol_name_from_announcement",
     "register_protocol",

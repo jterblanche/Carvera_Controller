@@ -1,5 +1,6 @@
-"""Decoders for the identify-handshake and client-list wire messages: hello
-ack (`0x61`) and client-list reply (`0x64`). This module only decodes;
+"""Decoders for the identify-handshake, client-list and published-console-
+line wire messages: hello ack (`0x61`), client-list reply (`0x64`) and one
+published-console-line fragment (`0x69`). This module only decodes;
 encoding lives in ``protocols/makera.py`` alongside the rest of the Makera
 frame builders.
 """
@@ -71,3 +72,43 @@ def decode_client_list(payload: bytes) -> tuple[ClientEntry, ...]:
         offset += 1
         entries.append(ClientEntry(id=client_id, name=name, link=link, has_control=has_control))
     return tuple(entries)
+
+
+@dataclass(frozen=True)
+class PublishedLineFragment:
+    """One `0x69` frame: a slice of a command's text or its reply, as
+    published by the machine to every identified client (protocol contract
+    section 6.10). ``source_id``/``source_name`` are on every fragment, not
+    just the first, so a fragment never needs to be paired with an earlier
+    one to know who it's from.
+    """
+
+    source_id: int
+    source_name: str
+    more: bool
+    text: bytes
+
+
+def decode_published_line(payload: bytes) -> PublishedLineFragment | None:
+    """Decode one published-console-line payload: source_id(8) +
+    source_name_len(1) + source_name(<=31) + more(1) + text(remainder).
+
+    Returns None if the payload is too short to hold its own fixed fields,
+    or the declared name is longer than fits — the caller then drops the
+    fragment silently, the same tolerant style ``decode_client_list`` above
+    already uses for a malformed entry.
+    """
+    if len(payload) < 8 + 1 + 1:
+        return None
+    source_id = int.from_bytes(payload[0:8], "big")
+    offset = 8
+    name_len = payload[offset]
+    offset += 1
+    if name_len > _MAX_NAME_BYTES or offset + name_len + 1 > len(payload):
+        return None
+    source_name = payload[offset : offset + name_len].decode("utf-8", errors="replace")
+    offset += name_len
+    more = payload[offset] != 0
+    offset += 1
+    text = payload[offset:]
+    return PublishedLineFragment(source_id=source_id, source_name=source_name, more=more, text=text)
