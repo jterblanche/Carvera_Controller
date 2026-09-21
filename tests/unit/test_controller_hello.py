@@ -433,7 +433,21 @@ def test_peer_closed_after_established_session_is_surfaced_not_silently_absorbed
 
             streamio_thread.join(timeout=2.0)
             assert not streamio_thread.is_alive()
+
+            # A connection the machine closed is never reconnected
+            # automatically. Both UI sites that would otherwise offer one
+            # (main.py's heartbeat check and its updateStatus state-change
+            # handler) are guarded by `not controller._manual_disconnect`,
+            # so setting that flag is what actually suppresses them --
+            # assert it directly rather than relying on the absence of a
+            # popup this Controller-level test cannot see. Reconnecting
+            # here would re-enter the machine as an unidentified client and
+            # be evicted again, which is a flapping loop, not a recovery.
             assert controller._manual_disconnect is True
+            # Nothing in this path may kick off the retry loop itself.
+            assert controller.start_reconnection not in [
+                call.args[0] for call in mock_clock.schedule_once.call_args_list
+            ]
 
             scheduled = [call.args[0] for call in mock_clock.schedule_once.call_args_list]
             for fn in scheduled:

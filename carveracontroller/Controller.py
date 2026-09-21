@@ -2746,7 +2746,14 @@ class Controller:
         rather than guess why. Reuses _close_inline for the same reasons
         the other two callers do: it stops streamIO from this thread
         without deadlocking, and marks the disconnect so the heartbeat
-        checks in main.py don't also try to react to it a moment later."""
+        checks in main.py don't also try to react to it a moment later.
+
+        Deliberately does not reconnect, and must not be changed to. The
+        machine closes an established session when it decides this client
+        should not be holding one -- most often because another controller
+        identified itself. Reconnecting would come back as an unidentified
+        client and be closed again for the same reason: a flapping loop,
+        not a recovery. The user is told, and chooses."""
         self._close_inline()
         self._notify_peer_closed()
 
