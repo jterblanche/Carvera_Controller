@@ -3,6 +3,7 @@ import time
 
 import serial
 
+from .machine.peer_closed import PeerClosedError
 from .XMODEM import XMODEM
 
 logger = logging.getLogger(__name__)
@@ -35,7 +36,11 @@ class USBStream:
             return
         if isinstance(data, str):
             data = data.encode("utf-8", errors="replace")
-        self.serial.write(data)
+        try:
+            self.serial.write(data)
+        except serial.SerialException as exc:
+            self._fail(exc)
+            raise PeerClosedError(str(exc)) from exc
         if not self.log_sent_receive:
             return
         if data == b"?":
@@ -56,7 +61,11 @@ class USBStream:
     def recv(self):
         if self.serial is None:
             return b""
-        data = self.serial.read()
+        try:
+            data = self.serial.read()
+        except serial.SerialException as exc:
+            self._fail(exc)
+            raise PeerClosedError(str(exc)) from exc
         if self.log_sent_receive and data:
             self._recv_log_buffer += data
             while b"\n" in self._recv_log_buffer:
@@ -159,6 +168,22 @@ class USBStream:
         except Exception:
             logger.exception("Failed to reopen serial at %s baud", baud)
             return False
+
+    # ----------------------------------------------------------------------
+    def _fail(self, exc):
+        """Tear down a serial port that just proved it's gone (read or
+        write raised), without close()'s deliberate 0.5s settle delay —
+        that delay is for an intentional close, and only slows down
+        reporting a link that has already failed."""
+        logger.error("USB link failed: %s", exc)
+        if self.serial is not None:
+            try:
+                self.serial.close()
+            except Exception:
+                pass
+        self.serial = None
+        self._send_log_buffer = b""
+        self._recv_log_buffer = b""
 
     # ----------------------------------------------------------------------
     def close(self):

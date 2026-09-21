@@ -22,6 +22,7 @@ from . import Utils
 from .CNC import CMDPAT, CNC, LASER_TOOL_NUMBER, PARENPAT, SEMIPAT, ZPROBE_TOOL_NUMBER
 from .machine.hello import HelloNegotiator, Resolution
 from .machine.identity import ControllerIdentity, default_name, generate_id
+from .machine.peer_closed import PeerClosedError
 from .protocols import (
     HELLO_REJECTED_CAP,
     LINK_USB,
@@ -2678,9 +2679,9 @@ class Controller:
         message this exists to show would be followed a moment later by a
         reconnect popup and repeated attempts against a machine that just
         refused the connection — exactly what this method exists to avoid.
-        Never starts a reconnect loop for the same reason: both callers
-        below are cases where retrying the exact same thing would just
-        repeat the same outcome.
+        Never starts a reconnect loop for the same reason: the callers
+        below are all cases where retrying immediately, without knowing why
+        the link went away, risks just repeating whatever caused it.
         """
         self.stopRun()
         self._runLines = 0
@@ -2731,6 +2732,41 @@ class Controller:
         if hasattr(root, "show_machine_busy_before_identify_popup"):
             Clock.schedule_once(lambda dt: root.show_machine_busy_before_identify_popup(), 0)
 
+    def _handle_peer_closed(self):
+        """The underlying link is gone after this had been a working
+        session: a WiFi peer close once a valid frame had already been
+        confirmed (most often the machine evicting this controller once
+        another one identifies — see the WiFi branch in streamIO), or any
+        USB PeerClosedError, at any point (there is no equivalent evidence
+        for USB to tell "never worked at all" apart from "was working";
+        see the PeerClosedError handling in streamIO).
+
+        Unlike _handle_closed_before_identify, there is no precise reason
+        to name here, so this says plainly that the connection was lost
+        rather than guess why. Reuses _close_inline for the same reasons
+        the other two callers do: it stops streamIO from this thread
+        without deadlocking, and marks the disconnect so the heartbeat
+        checks in main.py don't also try to react to it a moment later.
+
+        Deliberately does not reconnect, and must not be changed to. The
+        machine closes an established session when it decides this client
+        should not be holding one -- most often because another controller
+        identified itself. Reconnecting would come back as an unidentified
+        client and be closed again for the same reason: a flapping loop,
+        not a recovery. The user is told, and chooses."""
+        self._close_inline()
+        self._notify_peer_closed()
+
+    def _notify_peer_closed(self):
+        if App is None or Clock is None:
+            return
+        app = App.get_running_app()
+        if app is None or getattr(app, "root", None) is None:
+            return
+        root = app.root
+        if hasattr(root, "show_peer_closed_popup"):
+            Clock.schedule_once(lambda dt: root.show_peer_closed_popup(), 0)
+
     def _notify_client_list_updated(self, entries):
         if App is None or Clock is None:
             return
@@ -2779,20 +2815,35 @@ class Controller:
                         allow_wire_switch = self.sendNUM == 0 and self.loadNUM == 0
                         for message in self.comms.feed(data, allow_wire_switch=allow_wire_switch):
                             self._handle_protocol_message(message)
-                    elif (
-                        data == b""
-                        and self.connection_type == CONN_WIFI
-                        and self.comms.uses_framed_transfer
-                        and not self.comms.frame_confirmed
-                    ):
+                    elif data == b"" and self.connection_type == CONN_WIFI and self.comms.uses_framed_transfer:
                         # WiFi only: a TCP recv() of b"" after select() said
-                        # readable is the standard peer-closed signal. USB
-                        # serial's recv() can return b"" on an ordinary read
-                        # timeout with nothing wrong, so this check would
-                        # misfire there — the old-firmware-busy race this
-                        # exists for is inherently a WiFi TCP accept/close
-                        # pattern, not something that can happen over USB.
-                        self._handle_closed_before_identify()
+                        # readable is the standard peer-closed signal,
+                        # unambiguous on this socket because it has a receive
+                        # timeout set (SOCKET_TIMEOUT) — "nothing arrived
+                        # yet" raises socket.timeout instead of returning
+                        # b"", caught by the except below. USB serial's
+                        # recv() can return b"" on an ordinary read timeout
+                        # with nothing wrong, so this check would misfire
+                        # there (see USBStream's own PeerClosedError
+                        # instead). Framed-protocol only: a plain/Smoothie
+                        # link has no valid-frame signal to weigh this
+                        # against.
+                        if self.comms.frame_confirmed:
+                            # At least one valid frame had already arrived:
+                            # this was a working session, most often the
+                            # machine evicting this controller once another
+                            # one identifies. Left alone, nothing else in
+                            # this loop would ever notice — recv() keeps
+                            # returning b"" forever on a closed socket
+                            # (select() keeps reporting it readable), and a
+                            # queued send just raises a "Broken pipe" that
+                            # gets logged below without changing any state.
+                            self._handle_peer_closed()
+                        else:
+                            # The link never produced a single valid frame
+                            # before the peer closed it — see
+                            # _handle_closed_before_identify.
+                            self._handle_closed_before_identify()
                     dynamic_delay = 0
                 else:
                     if self.sendNUM == 0 and self.loadNUM == 0:
@@ -2807,6 +2858,22 @@ class Controller:
                 # could otherwise stall the fallback (clock jumps back) or
                 # end re-hello early (clock jumps forward).
                 self._advance_hello(time.monotonic())
+
+            except PeerClosedError:
+                # USB's version of the WiFi b"" case just above: the device
+                # itself is gone (unplugged, or the OS reclaimed the port).
+                # Raised by USBStream.recv()/send() from a caught
+                # serial.SerialException, so it can arrive from either call
+                # in this same try block. Always treated as an established
+                # session ending, regardless of self.comms.frame_confirmed:
+                # unlike the WiFi "accepted then closed at once" signature
+                # (see _handle_closed_before_identify), a failed USB read or
+                # write carries no equivalent evidence that this is a
+                # "machine busy" pattern rather than the cable coming out,
+                # so this says plainly that the connection was lost rather
+                # than guess why.
+                self.comms.reset_parser()
+                self._handle_peer_closed()
 
             except Exception:
                 self.comms.reset_parser()
