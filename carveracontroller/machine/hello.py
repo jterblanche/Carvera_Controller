@@ -34,13 +34,25 @@ ACK_TIMEOUT_S = 1.0
 # already decided this link is not going to identify itself.
 HELLO_WINDOW_S = 5.0
 
-# How long the controller waits, from connection open, for the link to
-# produce even one CRC-valid frame — the event ACK_TIMEOUT_S's own deadline
-# is anchored on (on_valid_frame -> _first_hello_sent_at). Without this
-# second anchor, a link that never yields a single valid frame never starts
-# that deadline, so poll() never fires and every gated send queues forever
-# (the bug this constant fixes: see the change explanation for the fake-
-# machine scenario that exposed it).
+# Default for how long the controller waits, from connection open, for the
+# link to produce even one CRC-valid frame — the event ACK_TIMEOUT_S's own
+# deadline is anchored on (on_valid_frame -> _first_hello_sent_at). Without
+# this second anchor, a link that never yields a single valid frame never
+# starts that deadline, so poll() never fires and every gated send queues
+# forever (the bug this constant fixes: see the change explanation for the
+# fake-machine scenario that exposed it).
+#
+# This default is sized for a link that was already live when this
+# negotiator was constructed (WiFi, or bulk USB, neither of which reset the
+# machine on open) — see the measurements below. It is NOT long enough for
+# a USB-serial connect, which toggles DTR and resets the machine right
+# before this negotiator is built: the board may still be mid-boot, which
+# is exactly why Controller.open() already gives that case a much longer
+# heartbeat grace (20 s) before an unrelated check would call the link
+# dead. Controller.open() passes that same 20 s as this negotiator's
+# ``open_timeout_s`` for a USB-serial connect, overriding this default,
+# rather than risk flushing queued commands into a machine that hasn't
+# finished booting yet.
 #
 # Firing this does NOT give up on hello for good: _advance_hello (Controller.py)
 # keeps calling on_valid_frame every tick even after this resolves to
@@ -104,6 +116,17 @@ class HelloNegotiator:
     # small `now` values starting near zero, exactly as they already do for
     # on_valid_frame/poll/on_status_reply.
     opened_at: float = 0.0
+    # How long, from opened_at, this negotiator waits for a first CRC-valid
+    # frame before giving up on the handshake ever starting at all (see
+    # ``poll``). None (the default) resolves to OPEN_TIMEOUT_S in
+    # __post_init__ — the value grounded in measured WiFi/bulk-USB reply
+    # latency above. A caller passes an explicit, larger value for a link
+    # that may still be mid-boot when this negotiator is constructed (a
+    # USB-serial connect after the DTR-triggered reset): OPEN_TIMEOUT_S is
+    # far too short there — Controller.open() passes the same grace period
+    # it already gives the unrelated heartbeat-drop check for exactly that
+    # link, rather than inventing a second unjustified number.
+    open_timeout_s: float | None = None
     # When the *first* hello was sent. The ack-wait deadline is anchored
     # here and never moves — see _last_hello_sent_at below for why that
     # matters.
@@ -118,6 +141,8 @@ class HelloNegotiator:
     _identified: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
+        if self.open_timeout_s is None:
+            self.open_timeout_s = OPEN_TIMEOUT_S
         if not self.applicable:
             self._resolution = Resolution.FALLBACK
 
@@ -182,12 +207,12 @@ class HelloNegotiator:
             hello sent, once a valid frame has made that possible. A
             re-hello triggered by a live status reply cannot push this
             deadline back — see _last_hello_sent_at above.
-          - the open-wait deadline (OPEN_TIMEOUT_S), measured from
-            connection open, for the case the first one can never even
-            start: no valid frame has arrived at all, so no hello has been
-            sent, so there is no ack to wait for. Without this, a link that
-            never yields a single valid frame would hold every gated send
-            forever.
+          - the open-wait deadline (``open_timeout_s``, OPEN_TIMEOUT_S
+            unless the caller overrode it), measured from connection open,
+            for the case the first one can never even start: no valid frame
+            has arrived at all, so no hello has been sent, so there is no
+            ack to wait for. Without this, a link that never yields a
+            single valid frame would hold every gated send forever.
         """
         if self._resolution is not None:
             return False
@@ -196,7 +221,11 @@ class HelloNegotiator:
                 self._resolution = Resolution.FALLBACK
                 return True
             return False
-        if now - self.opened_at >= OPEN_TIMEOUT_S:
+        # __post_init__ always resolves None to OPEN_TIMEOUT_S, so this is
+        # always a float by the time poll() can run; the assert is only to
+        # satisfy the type checker across that dataclass-field boundary.
+        assert self.open_timeout_s is not None
+        if now - self.opened_at >= self.open_timeout_s:
             self._resolution = Resolution.FALLBACK
             return True
         return False

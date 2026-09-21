@@ -30,12 +30,18 @@ def test_hello_not_sent_before_a_valid_frame():
 
 
 def test_fallback_after_open_timeout_elapses_with_no_valid_frame_ever():
-    """Regression test for the bug this fix addresses: a link that never
-    produces a single CRC-valid frame. The ack-wait deadline (anchored on
-    the first hello, itself only sent after a valid frame) never starts, so
-    only the open-wait deadline (anchored at connection open, ``opened_at``)
-    can resolve this. Before this fix, ``poll()`` returned False forever in
-    this case and every gated send queued indefinitely — see ticket #79."""
+    """Direct coverage for the state machine's half of the fix: a link that
+    never produces a single CRC-valid frame. The ack-wait deadline (anchored
+    on the first hello, itself only sent after a valid frame) never starts,
+    so only the open-wait deadline (anchored at connection open,
+    ``opened_at``) can resolve this. This exercises the new API
+    (``opened_at``/``open_timeout_s`` didn't exist before this fix, so this
+    exact test wouldn't run against the pre-fix code at all — it would fail
+    at construction with a TypeError, not reach these assertions); the
+    behavioural regression test that fails on the actual bug (poll() never
+    firing, queue never flushing) is
+    test_controller_hello.py::test_ordinary_command_flushed_after_open_timeout_against_a_silent_machine.
+    See ticket #79."""
     negotiator = HelloNegotiator(identity=IDENTITY, link=LINK_WIFI, opened_at=0.0)
 
     assert negotiator.poll(now=OPEN_TIMEOUT_S - 0.01) is False
@@ -46,6 +52,29 @@ def test_fallback_after_open_timeout_elapses_with_no_valid_frame_ever():
     assert negotiator.resolution is Resolution.FALLBACK
     # Fires exactly once.
     assert negotiator.poll(now=OPEN_TIMEOUT_S + 1) is False
+
+
+def test_open_timeout_s_override_replaces_the_default():
+    """Controller.open() passes an explicit, larger ``open_timeout_s`` for a
+    USB-serial connect (which resets the machine right before this
+    negotiator is built, so it may still be booting) instead of the
+    OPEN_TIMEOUT_S default sized for an already-live WiFi/bulk-USB link. An
+    override must actually replace the default, not just add to it."""
+    negotiator = HelloNegotiator(identity=IDENTITY, link=LINK_WIFI, opened_at=0.0, open_timeout_s=20.0)
+
+    # Long past the *default* OPEN_TIMEOUT_S (3.0s): must not resolve yet.
+    assert negotiator.poll(now=OPEN_TIMEOUT_S + 1.0) is False
+    assert not negotiator.resolved
+
+    assert negotiator.poll(now=20.0 - 0.01) is False
+    assert negotiator.poll(now=20.0) is True
+    assert negotiator.resolution is Resolution.FALLBACK
+
+
+def test_open_timeout_s_defaults_to_the_module_constant():
+    negotiator = HelloNegotiator(identity=IDENTITY, link=LINK_WIFI)
+
+    assert negotiator.open_timeout_s == OPEN_TIMEOUT_S
 
 
 def test_open_timeout_is_measured_from_opened_at_not_from_a_fixed_zero():

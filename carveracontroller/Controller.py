@@ -20,7 +20,7 @@ from functools import partial
 
 from . import Utils
 from .CNC import CMDPAT, CNC, LASER_TOOL_NUMBER, PARENPAT, SEMIPAT, ZPROBE_TOOL_NUMBER
-from .machine.hello import OPEN_TIMEOUT_S, HelloNegotiator, Resolution
+from .machine.hello import HelloNegotiator, Resolution
 from .machine.identity import ControllerIdentity, default_name, generate_id
 from .protocols import (
     HELLO_REJECTED_CAP,
@@ -1886,9 +1886,14 @@ class Controller:
                 self.log.put((self.MSG_ERROR, "Connection Failed!"))
                 return False
 
-            if conn_type == CONN_USB and getattr(transport, "resets_on_open", True):
-                # USB serial open toggles DTR and resets the machine; wait for firmware boot
-                # before protocol probe / status polling. Vendor bulk USB does not reset.
+            # USB serial open toggles DTR and resets the machine; a bulk USB or WiFi
+            # link does not. Drives both the pre-probe sleep below and, further down,
+            # how long this connection is given the benefit of the doubt before
+            # concluding it's actually unresponsive (heartbeat grace, hello's
+            # open-wait deadline) rather than just still booting.
+            resets_on_open = conn_type == CONN_USB and getattr(transport, "resets_on_open", True)
+            if resets_on_open:
+                # Wait for firmware boot before protocol probe / status polling.
                 time.sleep(2.0)
 
             CNC.vars["state"] = CONNECTED
@@ -1911,14 +1916,21 @@ class Controller:
             # control character. A non-applicable negotiator resolves to
             # the legacy fallback immediately.
             link = LINK_USB if conn_type == CONN_USB else LINK_WIFI
+            # USB serial needs a longer post-reset grace; bulk USB and WiFi are ready
+            # sooner. Reused below for hello's own open-wait deadline (OPEN_TIMEOUT_S
+            # in machine/hello.py is sized against WiFi/bulk-USB reply latency, which
+            # is far too short for a link that may still be mid-boot — see the "why
+            # not on USB serial" question in the change explanation for this branch).
+            grace = 20.0 if resets_on_open else 5.0
             self._hello = HelloNegotiator(
                 identity=self.identity,
                 link=link,
                 applicable=self.comms.uses_framed_transfer,
-                # Anchors OPEN_TIMEOUT_S (machine/hello.py): how long this
-                # negotiator waits for a first CRC-valid frame before giving
-                # up on the handshake ever starting at all.
+                # Anchors OPEN_TIMEOUT_S/open_timeout_s (machine/hello.py): how long
+                # this negotiator waits for a first CRC-valid frame before giving up
+                # on the handshake ever starting at all.
                 opened_at=time.monotonic(),
+                open_timeout_s=grace if resets_on_open else None,
             )
             self._reset_pending_sends()
             self.connected_clients = ()
@@ -1926,11 +1938,6 @@ class Controller:
             self.thread = threading.Thread(target=self.streamIO)
             self.thread.start()
             self._refresh_heartbeat = True
-            # USB serial needs a longer post-reset grace; bulk USB and WiFi are ready sooner.
-            if conn_type == CONN_USB and getattr(transport, "resets_on_open", True):
-                grace = 20.0
-            else:
-                grace = 5.0
             self._heartbeat_grace_until = time.time() + grace
             return True
         finally:
@@ -2607,7 +2614,8 @@ class Controller:
                 self.log.put(
                     (
                         self.MSG_NORMAL,
-                        f"No reply from the machine after {OPEN_TIMEOUT_S:g}s; sending queued commands anyway",
+                        f"No reply from the machine after {negotiator.open_timeout_s:g}s; "
+                        "sending queued commands anyway",
                     )
                 )
             self._flush_pending_sends()
