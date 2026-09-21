@@ -949,6 +949,13 @@ class Controller:
         self.executeCommand("wlan -e\n")
 
     def disconnectWiFiCommand(self):
+        # The trailing "disconnect" is not decorative -- do not remove it.
+        # SimpleShell::wlan_command (SimpleShell.cpp:1040) treats any
+        # non-flag word as the SSID; "disconnect" is that word here, so its
+        # only job is to keep the parsed SSID non-empty. At line 1064 the
+        # command branches on ssid.empty(): empty means "scan for wifi
+        # signals", non-empty (with -d) means "disconnect". Drop the word
+        # and this silently becomes a scan instead of a disconnect.
         self.executeCommand("wlan -d disconnect\n")
 
     def connectWiFiCommand(self, ssid, password):
