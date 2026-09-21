@@ -36,6 +36,16 @@ and this one hadn't (today's controller always identifies, so this is
 standing in for the case where something else closes an established link
 that already worked; the mechanism a real eviction uses to decide *when*
 to close isn't reproduced here, only the shape of the close itself).
+
+``publish_status=True`` stands in for the firmware's own proactive status
+publish (protocol contract section 6.9): once "new" mode accepts a hello,
+a background thread sends an unsolicited PTYPE_STATUS_RES frame to that
+client every ``status_interval_s`` seconds, same as an identified client
+would receive without polling. ``publish_status()`` and
+``send_published_line()`` let a test send one of either on demand, to the
+currently-connected client (there is only ever one in these tests) —
+standing in for the machine relaying another controller's command/reply as
+a PTYPE_PUBLISHED_LINE frame (protocol contract section 6.10).
 """
 
 from __future__ import annotations
@@ -50,6 +60,7 @@ from carveracontroller.protocols.framing import (
     PTYPE_CTRL_SINGLE,
     PTYPE_HELLO,
     PTYPE_HELLO_ACK,
+    PTYPE_PUBLISHED_LINE,
     PTYPE_STATUS_RES,
     build_frame,
     validate_packet_data,
@@ -58,14 +69,27 @@ from carveracontroller.protocols.handshake import HELLO_ACCEPTED
 
 _HEADER = bytes([0x86, 0x68])
 
+DEFAULT_STATUS = b"<Idle,MPos:0.000,0.000,0.000,WPos:0.000,0.000,0.000>"
+
 
 class FakeMachine:
-    def __init__(self, mode="new", ack_delay=0.0, ack_result=HELLO_ACCEPTED, close_after=None, close_after_ack=None):
+    def __init__(
+        self,
+        mode="new",
+        ack_delay=0.0,
+        ack_result=HELLO_ACCEPTED,
+        close_after=None,
+        close_after_ack=None,
+        publish_status=False,
+        status_interval_s=0.05,
+    ):
         self.mode = mode
         self.ack_delay = ack_delay
         self.ack_result = ack_result
         self.close_after = close_after
         self.close_after_ack = close_after_ack
+        self.publish_status_enabled = publish_status
+        self.status_interval_s = status_interval_s
 
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -79,6 +103,7 @@ class FakeMachine:
         self.frames_received = []  # list[tuple[int, bytes]]: (ptype, payload)
         self.client_list_requests = 0
         self.smoothie_bytes_received = bytearray()  # "smoothie" mode only
+        self._active_conn = None  # the one connected client's socket, or None
 
         self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._accept_thread.start()
@@ -119,6 +144,8 @@ class FakeMachine:
             self._serve_smoothie(conn)
             return
 
+        with self._lock:
+            self._active_conn = conn
         conn.settimeout(0.2)
         buf = bytearray()
         try:
@@ -134,6 +161,9 @@ class FakeMachine:
                 buf.extend(chunk)
                 self._consume(conn, buf)
         finally:
+            with self._lock:
+                if self._active_conn is conn:
+                    self._active_conn = None
             try:
                 conn.close()
             except OSError:
@@ -197,7 +227,7 @@ class FakeMachine:
 
         if ptype == PTYPE_CTRL_SINGLE:
             if payload[:1] == b"?":
-                self._send(conn, build_frame(PTYPE_STATUS_RES, b"<Idle,MPos:0.000,0.000,0.000,WPos:0.000,0.000,0.000>"))
+                self._send(conn, build_frame(PTYPE_STATUS_RES, DEFAULT_STATUS))
             return
 
         if ptype == PTYPE_HELLO:
@@ -216,6 +246,8 @@ class FakeMachine:
             self._send(conn, build_frame(PTYPE_HELLO_ACK, bytes([1, self.ack_result, 0])))
             if self.close_after_ack is not None:
                 threading.Thread(target=self._close_after_ack, args=(conn,), daemon=True).start()
+            if self.publish_status_enabled and self.ack_result == HELLO_ACCEPTED:
+                threading.Thread(target=self._publish_status_loop, args=(conn,), daemon=True).start()
             return
 
         if ptype == PTYPE_CLIENT_LIST_REQ:
@@ -233,11 +265,56 @@ class FakeMachine:
         except OSError:
             pass
 
+    def _publish_status_loop(self, conn):
+        """Stands in for the firmware's own proactive status publish
+        (protocol contract section 6.9) once this client is identified:
+        sends an unsolicited PTYPE_STATUS_RES on a fixed interval, same
+        shape as the on-demand `?` reply, until the connection closes or
+        the machine stops. See publish_status() for a one-shot version a
+        test can call directly instead/as well.
+        """
+        while not self._stop.is_set():
+            time.sleep(self.status_interval_s)
+            with self._lock:
+                still_active = self._active_conn is conn
+            if not still_active:
+                return
+            self._send(conn, build_frame(PTYPE_STATUS_RES, DEFAULT_STATUS))
+
+    def publish_status(self, text=DEFAULT_STATUS):
+        """Test helper: send one unsolicited PTYPE_STATUS_RES to the
+        currently-connected client right now, as the machine's own publish
+        would (protocol contract section 6.9). Returns False if there is no
+        connected client to send to."""
+        with self._lock:
+            conn = self._active_conn
+        if conn is None:
+            return False
+        self._send(conn, build_frame(PTYPE_STATUS_RES, text))
+        return True
+
+    def send_published_line(self, source_id, source_name, text, more=False):
+        """Test helper: publish one PTYPE_PUBLISHED_LINE frame to the
+        currently-connected client, as the machine would relay another
+        (or this) controller's command/reply (protocol contract section
+        6.10). ``source_name``/``text`` are bytes. Returns False if there
+        is no connected client to send to."""
+        with self._lock:
+            conn = self._active_conn
+        if conn is None:
+            return False
+        payload = (
+            source_id.to_bytes(8, "big") + bytes([len(source_name)]) + source_name + bytes([1 if more else 0]) + text
+        )
+        self._send(conn, build_frame(PTYPE_PUBLISHED_LINE, payload))
+        return True
+
     def _send(self, conn, frame):
-        try:
-            conn.sendall(frame)
-        except OSError:
-            pass
+        with self._lock:
+            try:
+                conn.sendall(frame)
+            except OSError:
+                pass
 
     # -- assertion helpers -----------------------------------------------
 
