@@ -1,7 +1,10 @@
 from carveracontroller.protocols.handshake import (
+    EVENT_KIND_CONTROL_CHANGED,
     ClientEntry,
+    ControlChanged,
     PublishedLineFragment,
     decode_client_list,
+    decode_control_changed_event,
     decode_hello_ack,
     decode_published_line,
 )
@@ -96,3 +99,43 @@ def test_decode_published_line_truncated_name_returns_none():
     # name_len says 5 but only 2 bytes of name (and nothing else) follow.
     payload = (1).to_bytes(8, "big") + bytes([5]) + b"ab"
     assert decode_published_line(payload) is None
+
+
+def test_decode_control_changed_event():
+    payload = bytes([EVENT_KIND_CONTROL_CHANGED]) + (0x0102030405060708).to_bytes(8, "big") + bytes([9]) + b"Office PC"
+
+    event = decode_control_changed_event(payload)
+
+    assert event == ControlChanged(holder_id=0x0102030405060708, holder_name="Office PC")
+
+
+def test_decode_control_changed_event_nobody_has_control():
+    # The machine's own encoding for "nobody": holder_id 0, empty name.
+    payload = bytes([EVENT_KIND_CONTROL_CHANGED]) + (0).to_bytes(8, "big") + bytes([0])
+
+    event = decode_control_changed_event(payload)
+
+    assert event == ControlChanged(holder_id=0, holder_name="")
+
+
+def test_decode_control_changed_event_wrong_kind_returns_none():
+    # kind 4 (alarm/halt) is a real event kind, just not this one.
+    payload = bytes([4]) + (1).to_bytes(8, "big") + bytes([0])
+    assert decode_control_changed_event(payload) is None
+
+
+def test_decode_control_changed_event_too_short_returns_none():
+    assert decode_control_changed_event(b"") is None
+    # kind + holder_id, but nothing for the mandatory name-length byte.
+    assert decode_control_changed_event(bytes([EVENT_KIND_CONTROL_CHANGED]) + (1).to_bytes(8, "big")) is None
+
+
+def test_decode_control_changed_event_oversized_name_returns_none():
+    payload = bytes([EVENT_KIND_CONTROL_CHANGED]) + (1).to_bytes(8, "big") + bytes([32]) + b"x" * 32
+    assert decode_control_changed_event(payload) is None
+
+
+def test_decode_control_changed_event_truncated_name_returns_none():
+    # name_len says 5 but only 2 bytes of name follow.
+    payload = bytes([EVENT_KIND_CONTROL_CHANGED]) + (1).to_bytes(8, "big") + bytes([5]) + b"ab"
+    assert decode_control_changed_event(payload) is None
