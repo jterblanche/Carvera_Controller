@@ -2,12 +2,15 @@ import pytest
 
 from carveracontroller.protocols.framing import (
     PTYPE_CLIENT_LIST_REPLY,
+    PTYPE_EVENT,
     PTYPE_FILE_MD5,
+    PTYPE_HEARTBEAT,
     PTYPE_HELLO_ACK,
     PTYPE_LOAD_ERROR,
     PTYPE_LOAD_FINISH,
     PTYPE_LOAD_INFO,
     PTYPE_NORMAL_INFO,
+    PTYPE_PUBLISHED_LINE,
     PTYPE_STATUS_RES,
     build_frame,
     validate_packet_data,
@@ -17,6 +20,7 @@ from carveracontroller.protocols.makera import (
     MakeraProtocol,
     encode_automatic_command,
     encode_client_list_request,
+    encode_heartbeat,
     encode_hello,
 )
 from carveracontroller.protocols.messages import MessageKind
@@ -247,3 +251,63 @@ def test_encode_automatic_command_matches_ordinary_channel_normalisation():
     file_wrapped = encode_automatic_command(1, b"download /sd/a.nc")
     assert b"download /sd/a.nc\n" in file_ordinary
     assert b"download /sd/a.nc\n" in file_wrapped
+
+
+def test_encode_heartbeat_is_an_empty_payload_frame():
+    frame = encode_heartbeat()
+    assert frame[:2] == b"\x86\x68"
+    assert frame[-2:] == b"\x55\xaa"
+    parsed = validate_packet_data(frame[2:-2])
+    assert parsed is not None
+    assert parsed.ptype == PTYPE_HEARTBEAT
+    assert parsed.payload == b""
+
+
+def _published_line_payload(source_id, name, text, more=False):
+    return source_id.to_bytes(8, "big") + bytes([len(name)]) + name + bytes([1 if more else 0]) + text
+
+
+def test_published_line_dispatched_as_a_single_fragment():
+    payload = _published_line_payload(0x0102030405060708, b"Shop PC", b"version")
+    msgs = MakeraProtocol().feed(build_frame(PTYPE_PUBLISHED_LINE, payload))
+
+    assert len(msgs) == 1
+    assert msgs[0].kind == MessageKind.PUBLISHED_LINE
+    assert msgs[0].source_id == 0x0102030405060708
+    assert msgs[0].source_name == "Shop PC"
+    assert msgs[0].text == "version"
+
+
+def test_published_line_reassembled_across_more_fragments():
+    proto = MakeraProtocol()
+    first = _published_line_payload(1, b"Shop PC", b"hello ", more=True)
+    assert proto.feed(build_frame(PTYPE_PUBLISHED_LINE, first)) == []
+
+    second = _published_line_payload(1, b"Shop PC", b"world", more=False)
+    msgs = proto.feed(build_frame(PTYPE_PUBLISHED_LINE, second))
+
+    assert len(msgs) == 1
+    assert msgs[0].kind == MessageKind.PUBLISHED_LINE
+    assert msgs[0].source_id == 1
+    assert msgs[0].source_name == "Shop PC"
+    assert msgs[0].text == "hello world"
+
+
+def test_published_line_reset_discards_a_partial_fragment():
+    proto = MakeraProtocol()
+    first = _published_line_payload(1, b"Shop PC", b"partial", more=True)
+    assert proto.feed(build_frame(PTYPE_PUBLISHED_LINE, first)) == []
+
+    proto.reset()
+
+    second = _published_line_payload(1, b"Shop PC", b"fresh", more=False)
+    msgs = proto.feed(build_frame(PTYPE_PUBLISHED_LINE, second))
+    assert len(msgs) == 1
+    assert msgs[0].text == "fresh"  # not "partialfresh": the old fragment was dropped
+
+
+def test_event_dispatched_and_not_swallowed_by_the_unknown_type_fallback():
+    msgs = MakeraProtocol().feed(build_frame(PTYPE_EVENT, b"\x01\x02"))
+    assert len(msgs) == 1
+    assert msgs[0].kind == MessageKind.EVENT
+    assert msgs[0].payload == b"\x01\x02"

@@ -20,6 +20,7 @@ from functools import partial
 
 from . import Utils
 from .CNC import CMDPAT, CNC, LASER_TOOL_NUMBER, PARENPAT, SEMIPAT, ZPROBE_TOOL_NUMBER
+from .machine.heartbeat import heartbeat_due
 from .machine.hello import HelloNegotiator, Resolution
 from .machine.identity import ControllerIdentity, default_name, generate_id
 from .machine.peer_closed import PeerClosedError
@@ -34,6 +35,7 @@ from .protocols import (
     decode_hello_ack,
     encode_automatic_command,
     encode_client_list_request,
+    encode_heartbeat,
 )
 from .USBBulkStream import USBBulkStream, is_usb_bulk_address
 from .USBStream import USBStream
@@ -146,6 +148,11 @@ class Controller:
     MSG_NORMAL = 0
     MSG_ERROR = 1
     MSG_INTERIOR = 2
+    # A published console line (0x69) from another identified controller —
+    # never this controller's own reply/status handling (parseLine), so a
+    # UI listener must not run its own-traffic side effects (clock sync,
+    # model/version detection, ...) on one of these. See _on_published_line.
+    MSG_PUBLISHED = 3
 
     JOG_MODE_STEP = 0
     JOG_MODE_CONTINUOUS = 1
@@ -245,6 +252,13 @@ class Controller:
 
         self._baud_upgrade_attempted = False
         self._baud_switch_in_progress = False
+        # time.monotonic() of the last byte this controller actually sent
+        # on the current link, of any kind (ordinary command, automatic
+        # query, realtime byte, or a heartbeat itself) — see _send_wire().
+        # None means nothing has been sent yet on this connection. Drives
+        # _advance_heartbeat(): a subscribed controller with nothing else
+        # to say sends a heartbeat before this goes quiet for too long.
+        self._last_send_monotonic = None
         self._refresh_heartbeat = False
         # True from open() start until streamIO is running (hides half-open links from heartbeat).
         self._connecting = False
@@ -342,7 +356,7 @@ class Controller:
                         display = display[:-4] + "\n"
                 if self._gate_send(0, payload, display):
                     return
-                self.stream.send(self.comms.encode_command(payload))
+                self._send_wire(self.comms.encode_command(payload))
                 if display is not None:
                     self.execCallback(display)
             except Exception:
@@ -442,9 +456,20 @@ class Controller:
 
     def _send_raw(self, frame):
         try:
-            self.stream.send(frame)
+            self._send_wire(frame)
         except Exception:
             self.log.put((Controller.MSG_ERROR, str(sys.exc_info()[1])))
+
+    def _send_wire(self, frame):
+        """The one place every byte actually reaches the wire, for whichever
+        channel sent it (ordinary command, automatic query, realtime bytes,
+        heartbeat). Records when, so _advance_heartbeat can tell "nothing
+        else was sent" from "something was" — see machine/heartbeat.py.
+        Callers keep their own try/except around this; a failed send must
+        not be recorded as if it had gone out.
+        """
+        self.stream.send(frame)
+        self._last_send_monotonic = time.monotonic()
 
     def _notify_usb_reset_blocked(self):
         if App is None or Clock is None:
@@ -475,7 +500,7 @@ class Controller:
                 if isinstance(char, (bytes, bytearray)):
                     char = char[0]
                 payload.extend(self.comms.encode_realtime(int(char)))
-            self.stream.send(bytes(payload))
+            self._send_wire(bytes(payload))
         except Exception:
             self.log.put((Controller.MSG_ERROR, str(sys.exc_info()[1])))
 
@@ -501,7 +526,7 @@ class Controller:
                         display = display[:-4] + "\n"
                 if self._gate_send(1, payload, display):
                     return False
-                self.stream.send(self.comms.encode_file_command(payload))
+                self._send_wire(self.comms.encode_file_command(payload))
                 if display is not None:
                     self.execCallback(display)
                 return True
@@ -1836,6 +1861,7 @@ class Controller:
             self.stream = None
         self.comms.reset()
         self._hello = None
+        self._last_send_monotonic = None
         self._reset_pending_sends()
         self.connected_clients = ()
         self.clearRun()
@@ -1977,6 +2003,7 @@ class Controller:
         self.stream = None
         self.comms.reset()
         self._hello = None
+        self._last_send_monotonic = None
         self._reset_pending_sends()
         self.connected_clients = ()
         CNC.vars["state"] = NOT_CONNECTED
@@ -2007,6 +2034,7 @@ class Controller:
         self.stream = None
         self.comms.reset()
         self._hello = None
+        self._last_send_monotonic = None
         self._reset_pending_sends()
         self.connected_clients = ()
         # Set a flag to indicate this was a manual disconnection
@@ -2569,6 +2597,16 @@ class Controller:
         if message.kind == MessageKind.LOAD_ERROR:
             self.loadERR = True
             return
+        if message.kind == MessageKind.PUBLISHED_LINE:
+            self._on_published_line(message.source_id, message.source_name, message.text)
+            return
+        if message.kind == MessageKind.EVENT:
+            # Reserved for a future ticket (protocol contract section 6.8:
+            # upload finished, play started, job ended, alarm/halt).
+            # Intercepted here only so it can never fall through to the
+            # unknown-type-becomes-console-LINE path below and show up as
+            # garbled text.
+            return
 
         text = message.text or ""
         if message.kind == MessageKind.LOAD_CHUNK:
@@ -2634,6 +2672,32 @@ class Controller:
                 )
             self._flush_pending_sends()
 
+    def _status_subscribed(self):
+        """True once this connection is subscribed: identified by firmware
+        that understands the identify handshake, so it publishes status on
+        its own (protocol contract section 6.9) instead of only answering
+        polls. False for old firmware (never identifies — see
+        HelloNegotiator.identified) and while the handshake is still
+        unresolved, both of which keep the pre-subscribe polling behaviour
+        exactly as it was before this feature existed (ADR-0001's hard
+        compatibility constraint)."""
+        negotiator = self._hello
+        return negotiator is not None and negotiator.identified
+
+    def _advance_heartbeat(self, now):
+        """Called every streamIO tick. Sends an automatic heartbeat (0x62)
+        once this connection is subscribed and nothing else has gone out on
+        the link recently — see machine/heartbeat.py for the timing
+        decision. Never sent to an old-firmware fallback session or while
+        the handshake is unresolved: that firmware never asked for it, and
+        sending anything it doesn't understand would be a behaviour change
+        for a case ADR-0001 requires to stay exactly as it is today.
+        """
+        if not self._status_subscribed() or self.stream is None:
+            return
+        if heartbeat_due(now, self._last_send_monotonic):
+            self._send_raw(encode_heartbeat())
+
     def _on_hello_ack(self, payload):
         negotiator = self._hello
         if negotiator is None:
@@ -2665,6 +2729,31 @@ class Controller:
         self.connected_clients = decode_client_list(payload)
         self._notify_client_list_updated(self.connected_clients)
 
+    def _on_published_line(self, source_id, source_name, text):
+        """A command's own text or its reply, published by the machine to
+        every identified client (protocol contract section 6.10) — from any
+        controller, including this one's own: the machine publishes
+        symmetrically, with no "everyone but the sender" exclusion (see the
+        firmware's own change explanation, feat-publish-to-clients.md). This
+        controller's own traffic is already shown through the ordinary
+        reply path (parseLine/execCallback), so its self-published echo is
+        dropped here to avoid displaying it twice.
+
+        Deliberately never calls parseLine: a published line is always
+        someone else's traffic on the shared console, never this
+        controller's own reply, so it must not be able to affect this
+        controller's own reply/status handling (sendNUM/loadNUM counters,
+        the alarm/error detection in parseLine, hello re-send-on-reply) —
+        the isolation the ticket's acceptance criterion asks for. It is
+        queued with MSG_PUBLISHED, a kind distinct from MSG_NORMAL/
+        MSG_ERROR, so a UI listener can tell it apart too and skip any
+        side effects (main.py's own clock-sync/model-detection regexes)
+        that must only run on this controller's own traffic.
+        """
+        if source_id == self.identity.id:
+            return
+        self.log.put((self.MSG_PUBLISHED, f"[{source_name}] {text}"))
+
     def _close_inline(self):
         """Close the current link from within the streamIO thread itself.
 
@@ -2693,6 +2782,7 @@ class Controller:
         self.stopRun()
         self._runLines = 0
         self._hello = None
+        self._last_send_monotonic = None
         self._reset_pending_sends()
         self.connected_clients = ()
         if self.stream is not None:
@@ -2806,7 +2896,13 @@ class Controller:
             running = self.sendNUM > 0 or self.loadNUM > 0 or self.pausing
             try:
                 if not running and self.protocol_ready:
-                    if t - tr > STREAM_POLL:
+                    # Subscribed (new firmware, identified): status arrives
+                    # from the machine's own published ticks (protocol
+                    # contract section 6.9), so polling for it here would
+                    # just be redundant traffic. Old firmware, or a
+                    # still-unresolved handshake, keeps polling exactly as
+                    # today — see _status_subscribed().
+                    if not self._status_subscribed() and t - tr > STREAM_POLL:
                         self.viewStatusReport(True)
                         tr = t
                     if self.diagnosing and t - td > DIAGNOSE_POLL:
@@ -2865,6 +2961,7 @@ class Controller:
                 # could otherwise stall the fallback (clock jumps back) or
                 # end re-hello early (clock jumps forward).
                 self._advance_hello(time.monotonic())
+                self._advance_heartbeat(time.monotonic())
 
             except PeerClosedError:
                 # USB's version of the WiFi b"" case just above: the device

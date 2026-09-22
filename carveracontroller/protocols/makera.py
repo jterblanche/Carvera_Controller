@@ -14,6 +14,7 @@ from .framing import (
     PTYPE_CLIENT_LIST_REQ,
     PTYPE_CTRL_MULTI,
     PTYPE_CTRL_SINGLE,
+    PTYPE_EVENT,
     PTYPE_FILE_CAN,
     PTYPE_FILE_DATA,
     PTYPE_FILE_END,
@@ -21,15 +22,18 @@ from .framing import (
     PTYPE_FILE_RETRY,
     PTYPE_FILE_START,
     PTYPE_FILE_VIEW,
+    PTYPE_HEARTBEAT,
     PTYPE_HELLO,
     PTYPE_HELLO_ACK,
     PTYPE_LOAD_ERROR,
     PTYPE_LOAD_FINISH,
     PTYPE_LOAD_INFO,
     PTYPE_NORMAL_INFO,
+    PTYPE_PUBLISHED_LINE,
     build_frame,
     validate_packet_data,
 )
+from .handshake import decode_published_line
 from .messages import MessageKind, ParsedMessage
 
 # Identify-handshake protocol version, carried in the hello frame and
@@ -55,6 +59,15 @@ def encode_hello(controller_id: int, name: bytes, link: int) -> bytes:
 def encode_client_list_request() -> bytes:
     """Build a client-list request (0x63) frame. Empty payload."""
     return build_frame(PTYPE_CLIENT_LIST_REQ, b"")
+
+
+def encode_heartbeat() -> bytes:
+    """Build a heartbeat (0x62) frame. Empty payload — automatic traffic a
+    subscribed controller sends whenever nothing else went out recently, so
+    the machine (and the WiFi module's own idle timer) keeps seeing this
+    link as live. See the protocol contract, sections 4.4 and 6.3, and
+    ``machine/heartbeat.py`` for the timing decision."""
+    return build_frame(PTYPE_HEARTBEAT, b"")
 
 
 def encode_automatic_command(kind: int, data: bytes) -> bytes:
@@ -115,6 +128,16 @@ class MakeraProtocol(CommunicationProtocol):
         # PTYPE_NORMAL_INFO payloads are fragments of a text line, not
         # complete outputs. Buffer until a newline completes the line.
         self._normal_info_line = bytearray()
+        # PTYPE_PUBLISHED_LINE fragments (0x69): buffered until a fragment
+        # arrives with more=False. Every fragment carries its own
+        # source_id/source_name (see PublishedLineFragment), so only the
+        # text needs accumulating; _published_line_source is refreshed from
+        # each fragment and used once the line completes. The protocol
+        # contract guarantees fragments from one source are never
+        # interleaved with another's, so one buffer (not one per source) is
+        # enough.
+        self._published_line_text = bytearray()
+        self._published_line_source: tuple[int, str] | None = None
 
     def encode_command(self, data: bytes) -> bytes:
         if not isinstance(data, (bytes, bytearray)):
@@ -207,6 +230,14 @@ class MakeraProtocol(CommunicationProtocol):
             return [ParsedMessage(MessageKind.HELLO_ACK, payload=parsed.payload)]
         if parsed.ptype == PTYPE_CLIENT_LIST_REPLY:
             return [ParsedMessage(MessageKind.CLIENT_LIST, payload=parsed.payload)]
+        if parsed.ptype == PTYPE_PUBLISHED_LINE:
+            return self._buffer_published_line(parsed.payload)
+        if parsed.ptype == PTYPE_EVENT:
+            # Reserved for a future ticket (protocol contract section 6.8:
+            # upload finished, play started, job ended, alarm/halt).
+            # Intercepted here, ahead of the unknown-type fallback below,
+            # purely so it's never mistaken for garbled console text.
+            return [ParsedMessage(MessageKind.EVENT, payload=parsed.payload)]
 
         if parsed.ptype == PTYPE_LOAD_FINISH:
             return [ParsedMessage(MessageKind.LOAD_EOF)]
@@ -237,6 +268,26 @@ class MakeraProtocol(CommunicationProtocol):
                 self._normal_info_line.append(byte)
         return messages
 
+    def _buffer_published_line(self, payload: bytes) -> list[ParsedMessage]:
+        """Accumulate PUBLISHED_LINE (0x69) fragments until one arrives with
+        more=False, then emit one PUBLISHED_LINE message for the whole
+        line. A malformed fragment (too short, name too long) is dropped
+        silently, the same tolerant style the rest of this dispatcher uses
+        for other wire messages.
+        """
+        fragment = decode_published_line(payload)
+        if fragment is None:
+            return []
+        self._published_line_source = (fragment.source_id, fragment.source_name)
+        self._published_line_text.extend(fragment.text)
+        if fragment.more:
+            return []
+        text = self._published_line_text.decode(errors="ignore")
+        self._published_line_text = bytearray()
+        source_id, source_name = self._published_line_source
+        self._published_line_source = None
+        return [ParsedMessage(MessageKind.PUBLISHED_LINE, text=text, source_id=source_id, source_name=source_name)]
+
     def reset(self) -> None:
         self._state = _RevPacketState.WAIT_HEADER
         self._packet_data.clear()
@@ -245,4 +296,6 @@ class MakeraProtocol(CommunicationProtocol):
         self._bytes_needed = 2
         self._expected_length = 0
         self._normal_info_line.clear()
+        self._published_line_text = bytearray()
+        self._published_line_source = None
         self.ready = False
