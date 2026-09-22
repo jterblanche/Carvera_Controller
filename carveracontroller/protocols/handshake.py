@@ -14,9 +14,11 @@ HELLO_ACCEPTED = 0
 HELLO_REJECTED_CAP = 1
 HELLO_REJECTED_OLD_CONTROLLER = 2
 
-# Event (`0x68`) `kind` byte this controller decodes. The machine defines four
-# more (upload finished, play started, job ended, alarm/halt) that this
-# controller does not act on yet -- see MessageKind.EVENT.
+# Event (`0x68`) `kind` bytes this controller decodes. The machine defines
+# two more (job ended, alarm/halt) that this controller does not act on yet
+# -- see MessageKind.EVENT.
+EVENT_KIND_UPLOAD_FINISHED = 1
+EVENT_KIND_PLAY_STARTED = 2
 EVENT_KIND_CONTROL_CHANGED = 5
 
 # hello / client-list-entry `link` values.
@@ -117,6 +119,71 @@ def decode_published_line(payload: bytes) -> PublishedLineFragment | None:
     offset += 1
     text = payload[offset:]
     return PublishedLineFragment(source_id=source_id, source_name=source_name, more=more, text=text)
+
+
+@dataclass(frozen=True)
+class UploadFinished:
+    """One `0x68` event, kind `EVENT_KIND_UPLOAD_FINISHED`: a file transfer
+    to the card just completed. ``size``/``checksum`` are decoded but not
+    used by this controller yet -- only ``path`` is, to trigger a passive
+    controller's own fetch of the same file."""
+
+    path: str
+    size: int
+    checksum: bytes
+
+
+def decode_upload_finished_event(payload: bytes) -> UploadFinished | None:
+    """Decode one event (`0x68`) payload as upload-finished: kind(1) +
+    path_len(1) + path + size(4, BE) + checksum_type(1: 0=none, 1=md5) +
+    checksum(0 or 16 B). Returns None if the first byte is not
+    ``EVENT_KIND_UPLOAD_FINISHED``, or the payload is too short for its own
+    fields -- the caller drops it silently, same as every other decoder
+    here."""
+    if len(payload) < 1 + 1:
+        return None
+    if payload[0] != EVENT_KIND_UPLOAD_FINISHED:
+        return None
+    path_len = payload[1]
+    offset = 2
+    if offset + path_len + 4 + 1 > len(payload):
+        return None
+    path = payload[offset : offset + path_len].decode("utf-8", errors="replace")
+    offset += path_len
+    size = int.from_bytes(payload[offset : offset + 4], "big")
+    offset += 4
+    checksum_type = payload[offset]
+    offset += 1
+    checksum_len = 16 if checksum_type == 1 else 0
+    if offset + checksum_len > len(payload):
+        return None
+    checksum = payload[offset : offset + checksum_len]
+    return UploadFinished(path=path, size=size, checksum=checksum)
+
+
+@dataclass(frozen=True)
+class PlayStarted:
+    """One `0x68` event, kind `EVENT_KIND_PLAY_STARTED`: the machine just
+    started playing ``path``, from whichever client commanded it."""
+
+    path: str
+
+
+def decode_play_started_event(payload: bytes) -> PlayStarted | None:
+    """Decode one event (`0x68`) payload as play-started: kind(1) +
+    path_len(1) + path. Returns None if the first byte is not
+    ``EVENT_KIND_PLAY_STARTED``, or the payload is too short for its own
+    path -- dropped silently, same as every other decoder here."""
+    if len(payload) < 1 + 1:
+        return None
+    if payload[0] != EVENT_KIND_PLAY_STARTED:
+        return None
+    path_len = payload[1]
+    offset = 2
+    if offset + path_len > len(payload):
+        return None
+    path = payload[offset : offset + path_len].decode("utf-8", errors="replace")
+    return PlayStarted(path=path)
 
 
 @dataclass(frozen=True)

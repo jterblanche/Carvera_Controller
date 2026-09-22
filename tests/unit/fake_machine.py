@@ -63,11 +63,17 @@ from carveracontroller.protocols.framing import (
     PTYPE_HELLO_ACK,
     PTYPE_NORMAL_INFO,
     PTYPE_PUBLISHED_LINE,
+    PTYPE_RELAY,
     PTYPE_STATUS_RES,
     build_frame,
     validate_packet_data,
 )
-from carveracontroller.protocols.handshake import EVENT_KIND_CONTROL_CHANGED, HELLO_ACCEPTED
+from carveracontroller.protocols.handshake import (
+    EVENT_KIND_CONTROL_CHANGED,
+    EVENT_KIND_PLAY_STARTED,
+    EVENT_KIND_UPLOAD_FINISHED,
+    HELLO_ACCEPTED,
+)
 
 _HEADER = bytes([0x86, 0x68])
 
@@ -323,6 +329,52 @@ class FakeMachine:
         payload = (
             bytes([EVENT_KIND_CONTROL_CHANGED]) + holder_id.to_bytes(8, "big") + bytes([len(holder_name)]) + holder_name
         )
+        self._send(conn, build_frame(PTYPE_EVENT, payload))
+        return True
+
+    def send_relay(self, source_id, payload):
+        """Test helper: publish one PTYPE_RELAY frame to the currently-
+        connected client, as the machine would repeat another identified
+        client's relay (firmware's ``build_relay_frame``): source_id(8, BE)
+        + payload verbatim. ``payload`` is bytes. Returns False if there is
+        no connected client to send to."""
+        with self._lock:
+            conn = self._active_conn
+        if conn is None:
+            return False
+        self._send(conn, build_frame(PTYPE_RELAY, source_id.to_bytes(8, "big") + payload))
+        return True
+
+    def send_upload_finished_event(self, path, size=0, checksum_type=0, checksum=b""):
+        """Test helper: publish one PTYPE_EVENT frame, kind
+        EVENT_KIND_UPLOAD_FINISHED (firmware's ``build_upload_finished_event``):
+        kind(1) + path_len(1) + path + size(4, BE) + checksum_type(1) +
+        checksum. ``path``/``checksum`` are bytes. Returns False if there is
+        no connected client to send to."""
+        with self._lock:
+            conn = self._active_conn
+        if conn is None:
+            return False
+        payload = (
+            bytes([EVENT_KIND_UPLOAD_FINISHED, len(path)])
+            + path
+            + size.to_bytes(4, "big")
+            + bytes([checksum_type])
+            + checksum
+        )
+        self._send(conn, build_frame(PTYPE_EVENT, payload))
+        return True
+
+    def send_play_started_event(self, path):
+        """Test helper: publish one PTYPE_EVENT frame, kind
+        EVENT_KIND_PLAY_STARTED (firmware's ``build_play_started_event``):
+        kind(1) + path_len(1) + path. ``path`` is bytes. Returns False if
+        there is no connected client to send to."""
+        with self._lock:
+            conn = self._active_conn
+        if conn is None:
+            return False
+        payload = bytes([EVENT_KIND_PLAY_STARTED, len(path)]) + path
         self._send(conn, build_frame(PTYPE_EVENT, payload))
         return True
 
