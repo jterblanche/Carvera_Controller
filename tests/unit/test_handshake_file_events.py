@@ -1,7 +1,6 @@
 """Pure decode tests for the upload-finished and play-started `0x68` event
 kinds (protocols/handshake.py) -- the two events a passive controller acts
-on to auto-fetch and draw the job file (ticket: tool-change prompt
-everywhere, tool table relayed, toolpath on passive controllers)."""
+on to auto-fetch and draw the job file it did not start itself."""
 
 from __future__ import annotations
 

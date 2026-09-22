@@ -6,10 +6,9 @@ the job's path from the machine's own upload-finished/play-started events,
 not from anything it did locally. Fetching and drawing a G-code file is not
 free (a card read plus parsing thousands of lines), so this waits for the
 machine to be idle before doing it -- exactly like the connect-time config
-download already does, and named directly by the design this ticket
-implements: "if play starts before the machine goes idle, it shows
-progress, time and position only [from the published status, which needs
-no file] and fetches when the machine is idle again."
+download already does. If play starts before the machine goes idle, the
+controller shows progress, time and position only (from the published
+status, which needs no file) and fetches once the machine is idle again.
 
 Pure decision logic, no I/O: the caller (main.py) owns actually fetching
 the file, drawing it, and reading the machine's current Idle-ness from its
