@@ -14,6 +14,13 @@ HELLO_ACCEPTED = 0
 HELLO_REJECTED_CAP = 1
 HELLO_REJECTED_OLD_CONTROLLER = 2
 
+# hello ack `mode` values: whether the machine hands control to whoever last
+# acted (single-user) or keeps it with the holder until they release it or
+# disconnect (multi-user). Every machine reports single-user until it is
+# configured otherwise.
+HELLO_MODE_SINGLE_USER = 0
+HELLO_MODE_MULTI_USER = 1
+
 # Event (`0x68`) `kind` bytes this controller decodes. The machine defines
 # two more (job ended, alarm/halt) that this controller does not act on yet
 # -- see MessageKind.EVENT.

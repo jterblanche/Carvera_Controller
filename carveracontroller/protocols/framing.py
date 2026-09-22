@@ -34,6 +34,7 @@ PTYPE_HELLO_ACK = 0x61
 PTYPE_HEARTBEAT = 0x62
 PTYPE_CLIENT_LIST_REQ = 0x63
 PTYPE_CLIENT_LIST_REPLY = 0x64
+PTYPE_CTRL_RELEASE = 0x66
 # One identified client's message, repeated verbatim (with an 8-byte source
 # id prefixed) to every *other* identified client. The machine never reads
 # the payload, so what it carries is entirely up to whichever controllers

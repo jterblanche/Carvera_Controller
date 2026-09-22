@@ -86,6 +86,7 @@ class FakeMachine:
         mode="new",
         ack_delay=0.0,
         ack_result=HELLO_ACCEPTED,
+        hello_ack_mode=0,
         close_after=None,
         close_after_ack=None,
         publish_status=False,
@@ -94,6 +95,9 @@ class FakeMachine:
         self.mode = mode
         self.ack_delay = ack_delay
         self.ack_result = ack_result
+        # The hello ack's own `mode` byte: single-user (0, the default) or
+        # multi-user (1) -- see HELLO_MODE_SINGLE_USER/HELLO_MODE_MULTI_USER.
+        self.hello_ack_mode = hello_ack_mode
         self.close_after = close_after
         self.close_after_ack = close_after_ack
         self.publish_status_enabled = publish_status
@@ -251,7 +255,7 @@ class FakeMachine:
         if ptype == PTYPE_HELLO:
             if self.ack_delay:
                 time.sleep(self.ack_delay)
-            self._send(conn, build_frame(PTYPE_HELLO_ACK, bytes([1, self.ack_result, 0])))
+            self._send(conn, build_frame(PTYPE_HELLO_ACK, bytes([1, self.ack_result, self.hello_ack_mode])))
             if self.close_after_ack is not None:
                 threading.Thread(target=self._close_after_ack, args=(conn,), daemon=True).start()
             if self.publish_status_enabled and self.ack_result == HELLO_ACCEPTED:

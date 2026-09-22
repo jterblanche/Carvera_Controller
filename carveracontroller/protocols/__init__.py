@@ -7,6 +7,8 @@ from .handshake import (
     EVENT_KIND_PLAY_STARTED,
     EVENT_KIND_UPLOAD_FINISHED,
     HELLO_ACCEPTED,
+    HELLO_MODE_MULTI_USER,
+    HELLO_MODE_SINGLE_USER,
     HELLO_REJECTED_CAP,
     HELLO_REJECTED_OLD_CONTROLLER,
     LINK_USB,
@@ -24,7 +26,14 @@ from .handshake import (
     decode_published_line,
     decode_upload_finished_event,
 )
-from .makera import encode_automatic_command, encode_client_list_request, encode_heartbeat, encode_hello, encode_relay
+from .makera import (
+    encode_automatic_command,
+    encode_client_list_request,
+    encode_control_release,
+    encode_heartbeat,
+    encode_hello,
+    encode_relay,
+)
 from .messages import MessageKind, ParsedMessage
 from .registry import (
     DEFAULT_PROTOCOL,
@@ -42,6 +51,8 @@ __all__ = [
     "EVENT_KIND_PLAY_STARTED",
     "EVENT_KIND_UPLOAD_FINISHED",
     "HELLO_ACCEPTED",
+    "HELLO_MODE_MULTI_USER",
+    "HELLO_MODE_SINGLE_USER",
     "HELLO_REJECTED_CAP",
     "HELLO_REJECTED_OLD_CONTROLLER",
     "LINK_USB",
@@ -68,6 +79,7 @@ __all__ = [
     "detect_protocol_name",
     "encode_automatic_command",
     "encode_client_list_request",
+    "encode_control_release",
     "encode_heartbeat",
     "encode_hello",
     "encode_relay",

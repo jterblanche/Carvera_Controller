@@ -93,6 +93,36 @@
     },
     {
         "type": "title",
+        "title": "Multi-user",
+        "section": "Basic"
+    },
+    {
+        "type": "options",
+        "title": "Mode",
+        "desc": "Single user: the machine follows whoever sent its last command -- connecting, jogging or sending G-code takes control automatically. Multi user: control stays with whoever holds it until they release it or disconnect; others can watch, and act within the passive rights level below, without taking it.",
+        "section": "Basic",
+        "key": "multi_client.mode",
+        "options": [
+            "single_user",
+            "multi_user"
+        ],
+        "default": "single_user"
+    },
+    {
+        "type": "options",
+        "title": "Passive rights",
+        "desc": "Multi-user mode only: what a controller that does not hold control may still do. Watch only: view status. Watch, pause, stop: also pause or stop a running job. Watch, pause, stop, upload: also upload a file while the machine is idle.",
+        "section": "Basic",
+        "key": "multi_client.passive_rights",
+        "options": [
+            "watch_only",
+            "watch_pause_stop",
+            "watch_pause_stop_upload"
+        ],
+        "default": "watch_pause_stop_upload"
+    },
+    {
+        "type": "title",
         "title": "Power management",
         "section": "Basic"
     },
