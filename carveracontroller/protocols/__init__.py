@@ -5,6 +5,8 @@ from .detector import detect_protocol_name
 from .handshake import (
     EVENT_KIND_CONTROL_CHANGED,
     HELLO_ACCEPTED,
+    HELLO_MODE_MULTI_USER,
+    HELLO_MODE_SINGLE_USER,
     HELLO_REJECTED_CAP,
     HELLO_REJECTED_OLD_CONTROLLER,
     LINK_USB,
@@ -18,7 +20,13 @@ from .handshake import (
     decode_hello_ack,
     decode_published_line,
 )
-from .makera import encode_automatic_command, encode_client_list_request, encode_heartbeat, encode_hello
+from .makera import (
+    encode_automatic_command,
+    encode_client_list_request,
+    encode_control_release,
+    encode_heartbeat,
+    encode_hello,
+)
 from .messages import MessageKind, ParsedMessage
 from .registry import (
     DEFAULT_PROTOCOL,
@@ -33,6 +41,8 @@ __all__ = [
     "DEFAULT_PROTOCOL",
     "EVENT_KIND_CONTROL_CHANGED",
     "HELLO_ACCEPTED",
+    "HELLO_MODE_MULTI_USER",
+    "HELLO_MODE_SINGLE_USER",
     "HELLO_REJECTED_CAP",
     "HELLO_REJECTED_OLD_CONTROLLER",
     "LINK_USB",
@@ -53,6 +63,7 @@ __all__ = [
     "detect_protocol_name",
     "encode_automatic_command",
     "encode_client_list_request",
+    "encode_control_release",
     "encode_heartbeat",
     "encode_hello",
     "protocol_name_from_announcement",

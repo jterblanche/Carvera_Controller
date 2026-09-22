@@ -13,6 +13,7 @@ from .framing import (
     PTYPE_CLIENT_LIST_REPLY,
     PTYPE_CLIENT_LIST_REQ,
     PTYPE_CTRL_MULTI,
+    PTYPE_CTRL_RELEASE,
     PTYPE_CTRL_SINGLE,
     PTYPE_EVENT,
     PTYPE_FILE_CAN,
@@ -67,6 +68,14 @@ def encode_heartbeat() -> bytes:
     the machine (and the WiFi module's own idle timer) keeps seeing this
     link as live. See ``machine/heartbeat.py`` for the timing decision."""
     return build_frame(PTYPE_HEARTBEAT, b"")
+
+
+def encode_control_release() -> bytes:
+    """Build a control-release (0x66) frame. Empty payload — a deliberate
+    "give up control" sent only by whoever currently holds it. The machine
+    only honours this from the current holder and only once multi-user mode
+    is on; sent from anyone else, or in single-user mode, it does nothing."""
+    return build_frame(PTYPE_CTRL_RELEASE, b"")
 
 
 def encode_automatic_command(kind: int, data: bytes) -> bytes:

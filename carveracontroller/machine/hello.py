@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
-from ..protocols.handshake import HELLO_ACCEPTED, HelloAck
+from ..protocols.handshake import HELLO_ACCEPTED, HELLO_MODE_SINGLE_USER, HelloAck
 from ..protocols.makera import HELLO_PROTOCOL_VERSION, encode_hello
 from .identity import ControllerIdentity
 
@@ -139,6 +139,12 @@ class HelloNegotiator:
     _last_hello_sent_at: float | None = field(default=None, init=False, repr=False)
     _resolution: Resolution | None = field(default=None, init=False)
     _identified: bool = field(default=False, init=False)
+    # Whether the machine reports single-user or multi-user control, set
+    # from an accepted ack's own `mode` byte (see on_hello_ack below).
+    # Stays HELLO_MODE_SINGLE_USER until an ack says otherwise -- the same
+    # starting point as `identified`, and the only value old firmware (which
+    # never sends an ack at all) ever has.
+    _mode: int = field(default=HELLO_MODE_SINGLE_USER, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.open_timeout_s is None:
@@ -157,6 +163,10 @@ class HelloNegotiator:
     @property
     def identified(self) -> bool:
         return self._identified
+
+    @property
+    def mode(self) -> int:
+        return self._mode
 
     @property
     def frame_seen(self) -> bool:
@@ -245,6 +255,7 @@ class HelloNegotiator:
         if ack.result == HELLO_ACCEPTED:
             was_identified = self._identified
             self._identified = True
+            self._mode = ack.mode
             if self._resolution is None:
                 self._resolution = Resolution.IDENTIFIED
             return not was_identified
