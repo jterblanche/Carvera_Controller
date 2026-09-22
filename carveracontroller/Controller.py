@@ -614,7 +614,14 @@ class Controller:
 
     def syncTime(self, *args):
         # A write (sets the machine's clock), not a read — always the
-        # ordinary channel, never automatic.
+        # ordinary channel, never automatic. A connect-time write, so it is
+        # held back while this controller is passive (subscribed but not
+        # holding control): the design calls this out by name ("clock set,
+        # lights ... suppressed while passive"). Not subscribed at all (old
+        # firmware, or the handshake still unresolved) applies it exactly
+        # as before — that firmware has no notion of passive to suppress.
+        if self._status_subscribed() and not self.has_control:
+            return
         self.executeCommand("time " + str(Utils.local_unix_time()))
 
     def queryTime(self, *args):
@@ -772,7 +779,19 @@ class Controller:
             return False
 
     def apply_session_lights(self, turn_on, *, enabled=None):
-        """Turn enclosure light on at connect or off before disconnect."""
+        """Turn enclosure light on at connect or off before disconnect.
+
+        Both directions are connect-time writes, named by the design itself
+        ("lights on connect and disconnect ... suppressed while passive"),
+        so both are held back while this controller is subscribed but not
+        holding control. Not subscribed at all (old firmware, or the
+        handshake still unresolved) applies them exactly as before. Held
+        back here rather than at each of this method's four call sites
+        (connect, and three separate close paths) — one choke point instead
+        of four places that could each forget the check.
+        """
+        if self._status_subscribed() and not self.has_control:
+            return
         if turn_on and self._session_lights_applied:
             return
         if enabled is None:
