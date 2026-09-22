@@ -2902,6 +2902,12 @@ class Makera(RelativeLayout):
     cam_metadata = None
     document_unit = "mm"
 
+    # Who has control right now, from the controller's own control_holder_id/
+    # control_holder_name (last control-changed event) — see
+    # update_control_holder. Empty when not connected; every identified
+    # connection shows something, even "no one" before the first event.
+    control_holder_text = StringProperty("")
+
     # Path visibility filters for the G-code viewer color-scheme panel.
     path_show_rapid = True
     path_show_feed = True
@@ -6196,6 +6202,21 @@ class Makera(RelativeLayout):
         rows = rows_for_display(entries, own_id) if own_id is not None else ()
         self.status_drop_down.set_connected_controllers(rows)
 
+    def update_control_holder(self, holder_id, holder_name):
+        """Refresh the "who has control" indicator from a control-changed
+        event (Controller._on_control_changed). Passive and in-control look
+        identical apart from this text: nothing here disables or greys out
+        any control, and nothing prompts — control simply follows whoever
+        the machine says last acted."""
+        own_id = self.identity.id if getattr(self, "identity", None) is not None else None
+        if holder_id == 0:
+            text = tr._("No one has control")
+        elif own_id is not None and holder_id == own_id:
+            text = tr._("You have control")
+        else:
+            text = tr._("{name} has control").format(name=holder_name or tr._("Another controller"))
+        self.control_holder_text = text
+
     def show_usb_reset_blocked_popup(self, *args):
         content = BoxLayout(orientation="vertical", padding=dp(15))
         lbl = Label(
@@ -7146,6 +7167,11 @@ class Makera(RelativeLayout):
                     self.controller.is_community_firmware = False
                     self.controller._session_lights_applied = False
                     self.machine_metadata_query_time = 0
+                    # Reconnect returns to passive: no event has arrived yet
+                    # on the new connection, so the indicator goes blank
+                    # rather than keep showing the last holder from a link
+                    # that is no longer open.
+                    self.control_holder_text = ""
 
                     # Clean up light toggle binding when disconnected
                     if hasattr(self, "_light_toggle_bound"):
