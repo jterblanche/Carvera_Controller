@@ -345,6 +345,7 @@ from .GcodeViewer import (
 )
 from .machine.clients import rows_for_display
 from .machine.identity import load_or_create_identity, set_name
+from .machine.passive_fetch import PassiveFetchTracker
 from .ui import widget_helpers
 from .ui.PlayProgressBar import (
     next_tool_change_after_line,
@@ -2899,6 +2900,11 @@ class Makera(RelativeLayout):
     file_has_ocodes = False
     tool_change_markers = []
     tool_table = {}
+    # tool_number -> a short display text, from another identified
+    # controller's relayed tool table (protocols/relay.py). Consulted only
+    # when tool_table itself has nothing for that number: the actual loaded
+    # file, once fetched, is always the richer source.
+    relayed_tool_table = {}
     cam_metadata = None
     document_unit = "mm"
 
@@ -3029,6 +3035,11 @@ class Makera(RelativeLayout):
         self.controller.set_reconnection_callbacks(
             self.attempt_reconnect, self.on_reconnect_failed, self.on_reconnect_success
         )
+        # Tracks which file a passive (not-in-control) controller is owed a
+        # fetch for, from the machine's own upload-finished/play-started
+        # events -- see on_passive_file_published() and updateStatus().
+        self._passive_fetch = PassiveFetchTracker()
+        self._auto_fetch_in_progress = False
         # Fill basic global variables
         CNC.vars["state"] = NOT_CONNECTED
         CNC.vars["color"] = STATECOLOR[NOT_CONNECTED]
@@ -3816,6 +3827,11 @@ class Makera(RelativeLayout):
             self.open_resume_playback_confirm_popup(file_name, start_line)
         else:
             self.controller.playCommand(file_name, has_ocodes=self.file_has_ocodes)
+            # Share the loaded tool table with every other identified
+            # controller at play start (protocols/relay.py), so a passive
+            # one can show a sensible tool name at the first tool-change
+            # wait even before it has fetched the file itself.
+            self._send_tool_table_relay_if_any()
 
     # -----------------------------------------------------------------------
     def apply(self, buffer=False):
@@ -4902,8 +4918,18 @@ class Makera(RelativeLayout):
             return "Custom Probe"
 
         tool_def = self.tool_table.get(tool_number)
-        tooltip = format_tool_tooltip(tool_def, markup=False, unit=self.document_unit) if tool_def else ""
-        return tooltip if tooltip else str(tool_number)
+        if tool_def is not None:
+            tooltip = format_tool_tooltip(tool_def, markup=False, unit=self.document_unit)
+            if tooltip:
+                return tooltip
+        # No local copy of the file (a passive controller before its own
+        # fetch completes, or a fetch that is still in flight): fall back
+        # to whatever the controlling controller last relayed for this
+        # tool number (protocols/relay.py), if anything.
+        relayed = self.relayed_tool_table.get(tool_number)
+        if relayed:
+            return relayed
+        return str(tool_number)
 
     # -----------------------------------------------------------------------
     def open_tool_confirm_popup(self):
@@ -6217,6 +6243,95 @@ class Makera(RelativeLayout):
             text = tr._("{name} has control").format(name=holder_name or tr._("Another controller"))
         self.control_holder_text = text
 
+    def update_relayed_tool_table(self, entries):
+        """Another identified controller just relayed its tool table
+        (Controller._on_relay -> protocols/relay.py): tool_number -> a
+        short display text. Replaces this connection's whole relayed copy
+        -- the sender always relays its complete table, never a diff, so
+        there is nothing to merge. See _format_target_tool_text(), which
+        only falls back to this when tool_table itself (this controller's
+        own loaded file, if any) has nothing for that number."""
+        self.relayed_tool_table = entries
+
+    def _tool_table_relay_entries(self):
+        """This controller's own loaded tool table, reduced to the short
+        plain-text summary a relay (0x67) frame can afford to carry --
+        see protocols/relay.py's per-entry size budget. Empty if no file
+        with tool comments is loaded."""
+        return {
+            number: format_tool_tooltip(tool_def, markup=False, unit=self.document_unit)
+            for number, tool_def in self.tool_table.items()
+        }
+
+    def _send_tool_table_relay_if_any(self):
+        """Share this controller's own loaded tool table with every other
+        identified controller, so a passive one can show a sensible tool
+        name before it has fetched the file itself. Only meaningful when
+        this controller actually has a table to share -- a passive
+        controller's own tool_table stays empty until it fetches the file
+        (see on_passive_file_published()), so this is naturally a no-op for
+        it rather than needing an explicit has_control check (relay itself
+        is never control-gated -- see Controller.send_tool_table_relay)."""
+        if self.tool_table:
+            self.controller.send_tool_table_relay(self._tool_table_relay_entries())
+
+    def on_passive_file_published(self, path):
+        """The machine published an upload-finished or play-started event
+        naming `path` (Controller._on_file_published). Only a passive
+        controller acts on this: the controller that is actually driving
+        the job already has the file open locally, from which the event
+        it just received is itself an echo (events go to every identified
+        client, including the sender -- see the protocol's event
+        catalogue). Queues the path and checks immediately in case the
+        machine is already idle (the common upload-finished case); if not,
+        updateStatus()'s own idle check catches it once the job finishes.
+        """
+        app = App.get_running_app()
+        if app is None or self.controller.has_control:
+            return
+        self._passive_fetch.note_published_file(path)
+        self._check_passive_fetch(app.state == "Idle")
+
+    def _check_passive_fetch(self, is_idle):
+        """Ask the tracker whether a fetch is now due and, if so, start it.
+        Called both right after a publish (on_passive_file_published) and
+        on every status update (updateStatus) -- the machine going idle is
+        what actually releases a fetch that arrived while a job was still
+        playing (see machine/passive_fetch.py)."""
+        if self._auto_fetch_in_progress:
+            return
+        path = self._passive_fetch.due_fetch(is_idle)
+        if path is None:
+            return
+        self._auto_fetch_in_progress = True
+        threading.Thread(target=self._auto_fetch_played_file, args=(path,), daemon=True).start()
+
+    def _auto_fetch_played_file(self, remote_path):
+        """Background download of a passively-observed job file, reusing
+        the same doDownload() the file browser and connect-time config
+        fetch already use. automatic=True routes the download command
+        through the automatic-command wrapper (0x6B) so it is never
+        mistaken for a user action and never takes control on this
+        controller's behalf; open_after=True parses and draws it exactly
+        like opening a file locally. Runs on its own thread: doDownload
+        blocks until the transfer finishes, and this must not stall the
+        Kivy clock or the status-polling loop that called it.
+        """
+        try:
+            local_path = os.path.join(self.temp_dir, os.path.basename(remote_path))
+            app = App.get_running_app()
+            if app is not None:
+                # Matches what a manual download/play sets (see
+                # check_and_download()) so the rest of the UI -- the
+                # progress bar's filename, "recent files" -- reflects this
+                # file the same way it would if the operator had opened it.
+                app.selected_remote_filename = remote_path
+                app.selected_local_filename = local_path
+            self.doDownload(remote_path, local_path, show_progress=False, open_after=True, automatic=True)
+        finally:
+            self._passive_fetch.mark_loaded(remote_path)
+            self._auto_fetch_in_progress = False
+
     def show_usb_reset_blocked_popup(self, *args):
         content = BoxLayout(orientation="vertical", padding=dp(15))
         lbl = Label(
@@ -7172,6 +7287,11 @@ class Makera(RelativeLayout):
                     # rather than keep showing the last holder from a link
                     # that is no longer open.
                     self.control_holder_text = ""
+                    # A relayed tool table and a pending passive fetch both
+                    # belong to the connection that produced them; a fresh
+                    # connection starts with neither, same as control state.
+                    self.relayed_tool_table = {}
+                    self._passive_fetch = PassiveFetchTracker()
 
                     # Clean up light toggle binding when disconnected
                     if hasattr(self, "_light_toggle_bound"):
@@ -7273,6 +7393,12 @@ class Makera(RelativeLayout):
                 if not self.tool_triggered:
                     self.tool_triggered = True
                     self.open_tool_confirm_popup()
+                    # Share the loaded tool table at this tool-change wait
+                    # (protocols/relay.py), same as at play start (see
+                    # play()) -- a passive controller that connected after
+                    # play started, or missed the play-started event
+                    # (publishing is lossy), still gets it here.
+                    self._send_tool_table_relay_if_any()
             else:
                 if (self.alarm_triggered or self.tool_triggered) and (
                     self.confirm_popup.showing or self.unlock_popup.showing
@@ -7283,6 +7409,12 @@ class Makera(RelativeLayout):
                         self.unlock_popup.dismiss()
                 self.tool_triggered = False
                 self.alarm_triggered = False
+
+            # A passive controller may be owed a fetch of the job file it
+            # did not select itself (on_passive_file_published) -- release
+            # it the moment the machine is next observed idle. Cheap and a
+            # no-op when nothing is pending (machine/passive_fetch.py).
+            self._check_passive_fetch(app.state == "Idle")
 
             # update x data
             self.x_data_view.main_text = "{:.3f}".format(CNC.vars["wx"])
