@@ -25,6 +25,9 @@ from .machine.hello import HelloNegotiator, Resolution
 from .machine.identity import ControllerIdentity, default_name, generate_id
 from .machine.peer_closed import PeerClosedError
 from .protocols import (
+    HELLO_ACCEPTED,
+    HELLO_MODE_MULTI_USER,
+    HELLO_MODE_SINGLE_USER,
     HELLO_REJECTED_CAP,
     LINK_USB,
     LINK_WIFI,
@@ -36,6 +39,7 @@ from .protocols import (
     decode_hello_ack,
     encode_automatic_command,
     encode_client_list_request,
+    encode_control_release,
     encode_heartbeat,
 )
 from .USBBulkStream import USBBulkStream, is_usb_bulk_address
@@ -209,6 +213,12 @@ class Controller:
         # has_control below and _on_control_changed.
         self.control_holder_id: int = 0
         self.control_holder_name: str = ""
+        # Whether the machine hands control to whoever last acted
+        # (single-user) or keeps it with the holder until released
+        # (multi-user), from the last accepted hello ack's own `mode` byte.
+        # Single-user until an ack says otherwise -- the same starting point
+        # as control_holder_id/control_holder_name above.
+        self.control_mode: int = HELLO_MODE_SINGLE_USER
 
         # Reconnection properties
         self.reconnect_enabled = True
@@ -1895,6 +1905,7 @@ class Controller:
         self.connected_clients = ()
         self.control_holder_id = 0
         self.control_holder_name = ""
+        self.control_mode = HELLO_MODE_SINGLE_USER
         self.clearRun()
 
     def _join_stream_io(self):
@@ -2007,6 +2018,7 @@ class Controller:
             self.connected_clients = ()
             self.control_holder_id = 0
             self.control_holder_name = ""
+            self.control_mode = HELLO_MODE_SINGLE_USER
             self.stream = transport
             self.thread = threading.Thread(target=self.streamIO)
             self.thread.start()
@@ -2041,6 +2053,7 @@ class Controller:
         self.connected_clients = ()
         self.control_holder_id = 0
         self.control_holder_name = ""
+        self.control_mode = HELLO_MODE_SINGLE_USER
         CNC.vars["state"] = NOT_CONNECTED
         CNC.vars["color"] = STATECOLOR[CNC.vars["state"]]
 
@@ -2074,6 +2087,7 @@ class Controller:
         self.connected_clients = ()
         self.control_holder_id = 0
         self.control_holder_name = ""
+        self.control_mode = HELLO_MODE_SINGLE_USER
         # Set a flag to indicate this was a manual disconnection
         self._manual_disconnect = True
         CNC.vars["state"] = NOT_CONNECTED
@@ -2737,6 +2751,35 @@ class Controller:
         _on_control_changed."""
         return self._status_subscribed() and self.control_holder_id != 0 and self.control_holder_id == self.identity.id
 
+    @property
+    def multi_user_mode(self):
+        """True once an accepted hello ack has reported multi-user mode.
+        False for single-user mode, and always false while not subscribed
+        (old firmware, or the handshake still unresolved) — that firmware
+        has no notion of a mode at all. See control_mode/_on_hello_ack."""
+        return self._status_subscribed() and self.control_mode == HELLO_MODE_MULTI_USER
+
+    @property
+    def can_release_control(self):
+        """True while releasing control would actually do something: this
+        controller currently holds it, on a machine configured for
+        multi-user mode. Single-user mode has nothing to release -- the
+        next user-caused command from anywhere already takes control there,
+        same as always."""
+        return self.multi_user_mode and self.has_control
+
+    def release_control(self):
+        """Send a deliberate control release (0x66), if there is anything
+        to release. A no-op otherwise: in single-user mode, or when this
+        controller does not currently hold control, there is nothing this
+        can do -- the machine only honours a release from the current
+        holder, in multi-user mode. Returns True if the frame was actually
+        sent."""
+        if not self.can_release_control or self.stream is None:
+            return False
+        self._send_raw(encode_control_release())
+        return True
+
     def _advance_heartbeat(self, now):
         """Called every streamIO tick. Sends an automatic heartbeat (0x62)
         once this connection is subscribed and nothing else has gone out on
@@ -2760,6 +2803,8 @@ class Controller:
             return
         was_resolved = negotiator.resolved
         newly_identified = negotiator.on_hello_ack(ack)
+        if ack.result == HELLO_ACCEPTED:
+            self.control_mode = negotiator.mode
         if not was_resolved and negotiator.resolved:
             self._flush_pending_sends()
         if newly_identified:
@@ -2852,6 +2897,7 @@ class Controller:
         self.connected_clients = ()
         self.control_holder_id = 0
         self.control_holder_name = ""
+        self.control_mode = HELLO_MODE_SINGLE_USER
         if self.stream is not None:
             try:
                 self.stream.close()
