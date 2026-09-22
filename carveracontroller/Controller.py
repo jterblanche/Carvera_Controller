@@ -2715,12 +2715,12 @@ class Controller:
     def _status_subscribed(self):
         """True once this connection is subscribed: identified by firmware
         that understands the identify handshake, so it publishes status on
-        its own, proactively at the configured rate (5 Hz by default),
-        instead of only answering polls. False for old firmware (never
-        identifies — see HelloNegotiator.identified) and while the
-        handshake is still unresolved, both of which keep the
-        pre-subscribe polling behaviour exactly as it was before this
-        feature existed (ADR-0001's hard compatibility constraint)."""
+        its own, proactively at the configured rate (5 Hz by default), instead of only answering
+        polls. False for old firmware (never identifies — see
+        HelloNegotiator.identified) and while the handshake is still
+        unresolved, both of which keep the pre-subscribe polling behaviour
+        exactly as it was before this feature existed (ADR-0001's hard
+        compatibility constraint)."""
         negotiator = self._hello
         return negotiator is not None and negotiator.identified
 
