@@ -14,6 +14,11 @@ HELLO_ACCEPTED = 0
 HELLO_REJECTED_CAP = 1
 HELLO_REJECTED_OLD_CONTROLLER = 2
 
+# Event (`0x68`) `kind` byte this controller decodes. The machine defines four
+# more (upload finished, play started, job ended, alarm/halt) that this
+# controller does not act on yet -- see MessageKind.EVENT.
+EVENT_KIND_CONTROL_CHANGED = 5
+
 # hello / client-list-entry `link` values.
 LINK_WIFI = 0
 LINK_USB = 1
@@ -112,3 +117,39 @@ def decode_published_line(payload: bytes) -> PublishedLineFragment | None:
     offset += 1
     text = payload[offset:]
     return PublishedLineFragment(source_id=source_id, source_name=source_name, more=more, text=text)
+
+
+@dataclass(frozen=True)
+class ControlChanged:
+    """One `0x68` event, kind `EVENT_KIND_CONTROL_CHANGED`: who holds control
+    now. ``holder_id == 0`` (with an empty ``holder_name``) means nobody
+    does -- the same "nobody" encoding the machine's own
+    ``build_control_changed_event`` uses, not a value this controller
+    invents.
+    """
+
+    holder_id: int
+    holder_name: str
+
+
+def decode_control_changed_event(payload: bytes) -> ControlChanged | None:
+    """Decode one event (`0x68`) payload as a control-changed event:
+    kind(1) + holder_id(8, big-endian) + holder_name_len(1) + holder_name.
+
+    Returns None if the payload is too short, its first byte is not
+    ``EVENT_KIND_CONTROL_CHANGED``, or the declared name is longer than fits
+    -- the caller then drops it silently, the same tolerant style every
+    other decoder in this module uses for a malformed message.
+    """
+    if len(payload) < 1 + 8 + 1:
+        return None
+    if payload[0] != EVENT_KIND_CONTROL_CHANGED:
+        return None
+    holder_id = int.from_bytes(payload[1:9], "big")
+    offset = 9
+    name_len = payload[offset]
+    offset += 1
+    if name_len > _MAX_NAME_BYTES or offset + name_len > len(payload):
+        return None
+    holder_name = payload[offset : offset + name_len].decode("utf-8", errors="replace")
+    return ControlChanged(holder_id=holder_id, holder_name=holder_name)
