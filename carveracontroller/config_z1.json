@@ -103,10 +103,10 @@
         "section": "Basic",
         "key": "multi_client.mode",
         "options": [
-            "SingleUser",
-            "MultiUser"
+            "single_user",
+            "multi_user"
         ],
-        "default": "SingleUser"
+        "default": "single_user"
     },
     {
         "type": "options",
@@ -115,11 +115,11 @@
         "section": "Basic",
         "key": "multi_client.passive_rights",
         "options": [
-            "WatchOnly",
-            "WatchPauseStop",
-            "WatchPauseStopUpload"
+            "watch_only",
+            "watch_pause_stop",
+            "watch_pause_stop_upload"
         ],
-        "default": "WatchPauseStopUpload"
+        "default": "watch_pause_stop_upload"
     },
     {
         "type": "title",
