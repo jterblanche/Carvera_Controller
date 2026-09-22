@@ -30,6 +30,7 @@ from .framing import (
     PTYPE_LOAD_INFO,
     PTYPE_NORMAL_INFO,
     PTYPE_PUBLISHED_LINE,
+    PTYPE_RELAY,
     build_frame,
     validate_packet_data,
 )
@@ -67,6 +68,14 @@ def encode_heartbeat() -> bytes:
     the machine (and the WiFi module's own idle timer) keeps seeing this
     link as live. See ``machine/heartbeat.py`` for the timing decision."""
     return build_frame(PTYPE_HEARTBEAT, b"")
+
+
+def encode_relay(payload: bytes) -> bytes:
+    """Build a relay (0x67) frame carrying `payload` verbatim -- the machine
+    never inspects it, only repeats it to every other identified client
+    with an 8-byte source id prefixed. See protocols/relay.py for what this
+    controller actually puts inside one."""
+    return build_frame(PTYPE_RELAY, payload)
 
 
 def encode_automatic_command(kind: int, data: bytes) -> bytes:
@@ -233,11 +242,13 @@ class MakeraProtocol(CommunicationProtocol):
             return self._buffer_published_line(parsed.payload)
         if parsed.ptype == PTYPE_EVENT:
             # This `0x68` event type also carries kinds this controller
-            # doesn't decode yet (upload finished, play started, job
-            # ended, alarm/halt) — reserved for a future ticket.
-            # Intercepted here, ahead of the unknown-type fallback below,
-            # purely so it's never mistaken for garbled console text.
+            # doesn't decode yet (job ended, alarm/halt) — reserved for a
+            # future ticket. Intercepted here, ahead of the unknown-type
+            # fallback below, purely so it's never mistaken for garbled
+            # console text.
             return [ParsedMessage(MessageKind.EVENT, payload=parsed.payload)]
+        if parsed.ptype == PTYPE_RELAY:
+            return self._decode_relay(parsed.payload)
 
         if parsed.ptype == PTYPE_LOAD_FINISH:
             return [ParsedMessage(MessageKind.LOAD_EOF)]
@@ -255,6 +266,17 @@ class MakeraProtocol(CommunicationProtocol):
         if parsed.ptype == PTYPE_LOAD_INFO:
             return [ParsedMessage(MessageKind.LOAD_CHUNK, text)]
         return [ParsedMessage(MessageKind.LINE, text)]
+
+    def _decode_relay(self, payload: bytes) -> list[ParsedMessage]:
+        """Split a relay (0x67) payload into source_id(8, BE) + the opaque
+        bytes another identified client sent, as the machine repeats it
+        (protocols/relay.py decodes those bytes further). Too short to hold
+        even the source id is dropped silently -- malformed input from the
+        wire, not something a real machine sends."""
+        if len(payload) < 8:
+            return []
+        source_id = int.from_bytes(payload[:8], "big")
+        return [ParsedMessage(MessageKind.RELAY, payload=payload[8:], source_id=source_id)]
 
     def _buffer_normal_info(self, payload: bytes) -> list[ParsedMessage]:
         """Accumulate NORMAL_INFO fragments until a newline completes a line."""

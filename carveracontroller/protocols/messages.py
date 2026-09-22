@@ -19,10 +19,16 @@ class MessageKind(Enum):
     # the fully-joined line.
     PUBLISHED_LINE = auto()
     # A published system event (0x68: upload finished, play started, job
-    # ended, alarm/halt). Not yet acted on by this controller — see
-    # protocols/makera.py — but intercepted here so it can never fall
-    # through to the unknown-type-becomes-console-LINE path.
+    # ended, alarm/halt). Only upload-finished, play-started and
+    # control-changed are decoded by this controller so far — see
+    # protocols/handshake.py — but every kind is intercepted here so none
+    # can fall through to the unknown-type-becomes-console-LINE path.
     EVENT = auto()
+    # An identified client's relay (0x67), repeated to every *other*
+    # identified client with an 8-byte source id prefixed — see
+    # protocols/relay.py for what this controller puts inside one.
+    # source_id carries who sent it; payload is the opaque relay bytes.
+    RELAY = auto()
 
 
 @dataclass(frozen=True)

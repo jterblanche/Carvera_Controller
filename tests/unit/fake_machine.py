@@ -63,6 +63,7 @@ from carveracontroller.protocols.framing import (
     PTYPE_HELLO_ACK,
     PTYPE_NORMAL_INFO,
     PTYPE_PUBLISHED_LINE,
+    PTYPE_RELAY,
     PTYPE_STATUS_RES,
     build_frame,
     validate_packet_data,
@@ -329,6 +330,19 @@ class FakeMachine:
             bytes([EVENT_KIND_CONTROL_CHANGED]) + holder_id.to_bytes(8, "big") + bytes([len(holder_name)]) + holder_name
         )
         self._send(conn, build_frame(PTYPE_EVENT, payload))
+        return True
+
+    def send_relay(self, source_id, payload):
+        """Test helper: publish one PTYPE_RELAY frame to the currently-
+        connected client, as the machine would repeat another identified
+        client's relay (firmware's ``build_relay_frame``): source_id(8, BE)
+        + payload verbatim. ``payload`` is bytes. Returns False if there is
+        no connected client to send to."""
+        with self._lock:
+            conn = self._active_conn
+        if conn is None:
+            return False
+        self._send(conn, build_frame(PTYPE_RELAY, source_id.to_bytes(8, "big") + payload))
         return True
 
     def send_upload_finished_event(self, path, size=0, checksum_type=0, checksum=b""):
