@@ -32,6 +32,7 @@ from .protocols import (
     MessageKind,
     ProtocolSession,
     decode_client_list,
+    decode_control_changed_event,
     decode_hello_ack,
     encode_automatic_command,
     encode_client_list_request,
@@ -199,6 +200,15 @@ class Controller:
         self._reset_pending_sends()
         # The other controllers currently connected, from the last client-list reply.
         self.connected_clients: tuple[ClientEntry, ...] = ()
+        # Who holds control right now, from the last control-changed event
+        # (protocol contract section 6.8, event kind 5) — the only source of
+        # truth for this: the client-list reply's own has_control field is
+        # not populated by firmware yet. 0 / "" is the machine's own
+        # "nobody" encoding, and also this controller's starting state
+        # before any event arrives: passive, same as after a reconnect. See
+        # has_control below and _on_control_changed.
+        self.control_holder_id: int = 0
+        self.control_holder_name: str = ""
 
         # Reconnection properties
         self.reconnect_enabled = True
@@ -604,7 +614,14 @@ class Controller:
 
     def syncTime(self, *args):
         # A write (sets the machine's clock), not a read — always the
-        # ordinary channel, never automatic.
+        # ordinary channel, never automatic. A connect-time write, so it is
+        # held back while this controller is passive (subscribed but not
+        # holding control): the design calls this out by name ("clock set,
+        # lights ... suppressed while passive"). Not subscribed at all (old
+        # firmware, or the handshake still unresolved) applies it exactly
+        # as before — that firmware has no notion of passive to suppress.
+        if self._status_subscribed() and not self.has_control:
+            return
         self.executeCommand("time " + str(Utils.local_unix_time()))
 
     def queryTime(self, *args):
@@ -762,7 +779,19 @@ class Controller:
             return False
 
     def apply_session_lights(self, turn_on, *, enabled=None):
-        """Turn enclosure light on at connect or off before disconnect."""
+        """Turn enclosure light on at connect or off before disconnect.
+
+        Both directions are connect-time writes, named by the design itself
+        ("lights on connect and disconnect ... suppressed while passive"),
+        so both are held back while this controller is subscribed but not
+        holding control. Not subscribed at all (old firmware, or the
+        handshake still unresolved) applies them exactly as before. Held
+        back here rather than at each of this method's four call sites
+        (connect, and three separate close paths) — one choke point instead
+        of four places that could each forget the check.
+        """
+        if self._status_subscribed() and not self.has_control:
+            return
         if turn_on and self._session_lights_applied:
             return
         if enabled is None:
@@ -1864,6 +1893,8 @@ class Controller:
         self._last_send_monotonic = None
         self._reset_pending_sends()
         self.connected_clients = ()
+        self.control_holder_id = 0
+        self.control_holder_name = ""
         self.clearRun()
 
     def _join_stream_io(self):
@@ -1974,6 +2005,8 @@ class Controller:
             )
             self._reset_pending_sends()
             self.connected_clients = ()
+            self.control_holder_id = 0
+            self.control_holder_name = ""
             self.stream = transport
             self.thread = threading.Thread(target=self.streamIO)
             self.thread.start()
@@ -2006,6 +2039,8 @@ class Controller:
         self._last_send_monotonic = None
         self._reset_pending_sends()
         self.connected_clients = ()
+        self.control_holder_id = 0
+        self.control_holder_name = ""
         CNC.vars["state"] = NOT_CONNECTED
         CNC.vars["color"] = STATECOLOR[CNC.vars["state"]]
 
@@ -2037,6 +2072,8 @@ class Controller:
         self._last_send_monotonic = None
         self._reset_pending_sends()
         self.connected_clients = ()
+        self.control_holder_id = 0
+        self.control_holder_name = ""
         # Set a flag to indicate this was a manual disconnection
         self._manual_disconnect = True
         CNC.vars["state"] = NOT_CONNECTED
@@ -2601,11 +2638,14 @@ class Controller:
             self._on_published_line(message.source_id, message.source_name, message.text)
             return
         if message.kind == MessageKind.EVENT:
-            # Reserved for a future ticket (protocol contract section 6.8:
-            # upload finished, play started, job ended, alarm/halt).
-            # Intercepted here only so it can never fall through to the
-            # unknown-type-becomes-console-LINE path below and show up as
-            # garbled text.
+            # Only kind 5 (control-changed) is decoded so far; the other
+            # four (upload finished, play started, job ended, alarm/halt)
+            # are reserved for a future ticket. Intercepted here either way
+            # so an event can never fall through to the unknown-type-
+            # becomes-console-LINE path below and show up as garbled text.
+            changed = decode_control_changed_event(message.payload)
+            if changed is not None:
+                self._on_control_changed(changed.holder_id, changed.holder_name)
             return
 
         text = message.text or ""
@@ -2684,6 +2724,18 @@ class Controller:
         negotiator = self._hello
         return negotiator is not None and negotiator.identified
 
+    @property
+    def has_control(self):
+        """True once a control-changed event has named this controller's
+        own identity as the holder. False before any event arrives (the
+        starting state, same as right after a reconnect: passive until
+        proven otherwise), while someone else holds it, and always while
+        not subscribed (old firmware, or the handshake still unresolved) —
+        that firmware has no notion of control at all, so nothing here
+        claims it does. See control_holder_id/control_holder_name and
+        _on_control_changed."""
+        return self._status_subscribed() and self.control_holder_id != 0 and self.control_holder_id == self.identity.id
+
     def _advance_heartbeat(self, now):
         """Called every streamIO tick. Sends an automatic heartbeat (0x62)
         once this connection is subscribed and nothing else has gone out on
@@ -2728,6 +2780,19 @@ class Controller:
     def _on_client_list(self, payload):
         self.connected_clients = decode_client_list(payload)
         self._notify_client_list_updated(self.connected_clients)
+
+    def _on_control_changed(self, holder_id, holder_name):
+        """A control-changed event (protocol contract section 6.8, kind 5):
+        the machine's control token moved, silently and at once, to
+        `holder_id`/`holder_name` — or to nobody (`holder_id == 0`), on a
+        disconnect or a silent drop. This is the only place
+        control_holder_id/control_holder_name are set, and the only trigger
+        for updating the "who has control" indicator: this controller never
+        guesses who holds control from its own sends, only from what the
+        machine actually publishes back."""
+        self.control_holder_id = holder_id
+        self.control_holder_name = holder_name
+        self._notify_control_changed(holder_id, holder_name)
 
     def _on_published_line(self, source_id, source_name, text):
         """A command's own text or its reply, published by the machine to
@@ -2785,6 +2850,8 @@ class Controller:
         self._last_send_monotonic = None
         self._reset_pending_sends()
         self.connected_clients = ()
+        self.control_holder_id = 0
+        self.control_holder_name = ""
         if self.stream is not None:
             try:
                 self.stream.close()
@@ -2873,6 +2940,16 @@ class Controller:
         root = app.root
         if hasattr(root, "update_connected_controllers"):
             Clock.schedule_once(lambda dt, e=entries: root.update_connected_controllers(e), 0)
+
+    def _notify_control_changed(self, holder_id, holder_name):
+        if App is None or Clock is None:
+            return
+        app = App.get_running_app()
+        if app is None or getattr(app, "root", None) is None:
+            return
+        root = app.root
+        if hasattr(root, "update_control_holder"):
+            Clock.schedule_once(lambda dt, i=holder_id, n=holder_name: root.update_control_holder(i, n), 0)
 
     # ----------------------------------------------------------------------
     # thread performing I/O on serial line

@@ -3219,6 +3219,22 @@
                     if root.func_drop_down.parent: root.func_drop_down.parent.remove_widget(root.func_drop_down)
                     root.func_drop_down.open(self)
 
+        Label:
+            # Who has control right now (root.control_holder_text, updated
+            # from control-changed events — see Makera.update_control_holder).
+            # Hidden until connected and identified: nothing to say before
+            # then. A passive controller looks exactly like this too — the
+            # rest of the screen never greys out or prompts, only this text
+            # changes.
+            id: lbl_control_holder
+            text: root.control_holder_text
+            size_hint_y: None
+            height: dp(18) if root.control_holder_text else 0
+            opacity: 1 if root.control_holder_text else 0
+            color: 170/255, 170/255, 170/255, 1
+            font_size: '12sp'
+            halign: 'center'
+            text_size: self.width, None
 
         Content:
             id: content

@@ -58,14 +58,16 @@ from carveracontroller.protocols.framing import (
     PTYPE_CLIENT_LIST_REPLY,
     PTYPE_CLIENT_LIST_REQ,
     PTYPE_CTRL_SINGLE,
+    PTYPE_EVENT,
     PTYPE_HELLO,
     PTYPE_HELLO_ACK,
+    PTYPE_NORMAL_INFO,
     PTYPE_PUBLISHED_LINE,
     PTYPE_STATUS_RES,
     build_frame,
     validate_packet_data,
 )
-from carveracontroller.protocols.handshake import HELLO_ACCEPTED
+from carveracontroller.protocols.handshake import EVENT_KIND_CONTROL_CHANGED, HELLO_ACCEPTED
 
 _HEADER = bytes([0x86, 0x68])
 
@@ -307,6 +309,41 @@ class FakeMachine:
             source_id.to_bytes(8, "big") + bytes([len(source_name)]) + source_name + bytes([1 if more else 0]) + text
         )
         self._send(conn, build_frame(PTYPE_PUBLISHED_LINE, payload))
+        return True
+
+    def send_control_changed_event(self, holder_id, holder_name=b""):
+        """Test helper: publish one PTYPE_EVENT frame, kind
+        EVENT_KIND_CONTROL_CHANGED, as the machine's own control gate would
+        (protocol contract section 6.8; firmware's
+        ``build_control_changed_event``): kind(1) + holder_id(8, BE) +
+        holder_name_len(1) + holder_name. ``holder_id == 0`` with an empty
+        ``holder_name`` is the machine's own "nobody has control" encoding.
+        ``holder_name`` is bytes. Returns False if there is no connected
+        client to send to."""
+        with self._lock:
+            conn = self._active_conn
+        if conn is None:
+            return False
+        payload = (
+            bytes([EVENT_KIND_CONTROL_CHANGED]) + holder_id.to_bytes(8, "big") + bytes([len(holder_name)]) + holder_name
+        )
+        self._send(conn, build_frame(PTYPE_EVENT, payload))
+        return True
+
+    def send_normal_info(self, text):
+        """Test helper: send ``text`` (bytes, normally ending in ``\\r\\n``)
+        as a PTYPE_NORMAL_INFO frame — the type every ordinary command
+        reply (an "ok", an error such as the control gate's refusal, ls/cat
+        output, ...) is actually sent as on real firmware (see
+        WifiProvider::printf()/PacketMessage()), as opposed to
+        PTYPE_STATUS_RES, which only ``?``/diagnose replies and the
+        proactive status publish use. Returns False if there is no
+        connected client to send to."""
+        with self._lock:
+            conn = self._active_conn
+        if conn is None:
+            return False
+        self._send(conn, build_frame(PTYPE_NORMAL_INFO, text))
         return True
 
     def _send(self, conn, frame):
