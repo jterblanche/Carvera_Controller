@@ -201,7 +201,7 @@ class Controller:
         # The other controllers currently connected, from the last client-list reply.
         self.connected_clients: tuple[ClientEntry, ...] = ()
         # Who holds control right now, from the last control-changed event
-        # (protocol contract section 6.8, event kind 5) — the only source of
+        # (the machine's `0x68` event frame, kind 5) — the only source of
         # truth for this: the client-list reply's own has_control field is
         # not populated by firmware yet. 0 / "" is the machine's own
         # "nobody" encoding, and also this controller's starting state
@@ -2715,12 +2715,12 @@ class Controller:
     def _status_subscribed(self):
         """True once this connection is subscribed: identified by firmware
         that understands the identify handshake, so it publishes status on
-        its own (protocol contract section 6.9) instead of only answering
-        polls. False for old firmware (never identifies — see
-        HelloNegotiator.identified) and while the handshake is still
-        unresolved, both of which keep the pre-subscribe polling behaviour
-        exactly as it was before this feature existed (ADR-0001's hard
-        compatibility constraint)."""
+        its own, proactively at the configured rate (5 Hz by default),
+        instead of only answering polls. False for old firmware (never
+        identifies — see HelloNegotiator.identified) and while the
+        handshake is still unresolved, both of which keep the
+        pre-subscribe polling behaviour exactly as it was before this
+        feature existed (ADR-0001's hard compatibility constraint)."""
         negotiator = self._hello
         return negotiator is not None and negotiator.identified
 
@@ -2782,8 +2782,8 @@ class Controller:
         self._notify_client_list_updated(self.connected_clients)
 
     def _on_control_changed(self, holder_id, holder_name):
-        """A control-changed event (protocol contract section 6.8, kind 5):
-        the machine's control token moved, silently and at once, to
+        """A control-changed event (the machine's `0x68` event frame, kind
+        5): the machine's control token moved, silently and at once, to
         `holder_id`/`holder_name` — or to nobody (`holder_id == 0`), on a
         disconnect or a silent drop. This is the only place
         control_holder_id/control_holder_name are set, and the only trigger
@@ -2796,7 +2796,7 @@ class Controller:
 
     def _on_published_line(self, source_id, source_name, text):
         """A command's own text or its reply, published by the machine to
-        every identified client (protocol contract section 6.10) — from any
+        every identified client (the machine's `0x69` frame) — from any
         controller, including this one's own: the machine publishes
         symmetrically, with no "everyone but the sender" exclusion (see the
         firmware's own change explanation, feat-publish-to-clients.md). This

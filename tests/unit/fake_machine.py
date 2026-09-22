@@ -38,14 +38,14 @@ that already worked; the mechanism a real eviction uses to decide *when*
 to close isn't reproduced here, only the shape of the close itself).
 
 ``publish_status=True`` stands in for the firmware's own proactive status
-publish (protocol contract section 6.9): once "new" mode accepts a hello,
-a background thread sends an unsolicited PTYPE_STATUS_RES frame to that
-client every ``status_interval_s`` seconds, same as an identified client
+publish: once "new" mode accepts a hello, a background thread sends an
+unsolicited PTYPE_STATUS_RES frame to that client every
+``status_interval_s`` seconds, same as an identified client
 would receive without polling. ``publish_status()`` and
 ``send_published_line()`` let a test send one of either on demand, to the
 currently-connected client (there is only ever one in these tests) —
 standing in for the machine relaying another controller's command/reply as
-a PTYPE_PUBLISHED_LINE frame (protocol contract section 6.10).
+a PTYPE_PUBLISHED_LINE frame.
 """
 
 from __future__ import annotations
@@ -268,12 +268,11 @@ class FakeMachine:
             pass
 
     def _publish_status_loop(self, conn):
-        """Stands in for the firmware's own proactive status publish
-        (protocol contract section 6.9) once this client is identified:
-        sends an unsolicited PTYPE_STATUS_RES on a fixed interval, same
-        shape as the on-demand `?` reply, until the connection closes or
-        the machine stops. See publish_status() for a one-shot version a
-        test can call directly instead/as well.
+        """Stands in for the firmware's own proactive status publish once
+        this client is identified: sends an unsolicited PTYPE_STATUS_RES
+        on a fixed interval, same shape as the on-demand `?` reply, until
+        the connection closes or the machine stops. See publish_status()
+        for a one-shot version a test can call directly instead/as well.
         """
         while not self._stop.is_set():
             time.sleep(self.status_interval_s)
@@ -286,8 +285,7 @@ class FakeMachine:
     def publish_status(self, text=DEFAULT_STATUS):
         """Test helper: send one unsolicited PTYPE_STATUS_RES to the
         currently-connected client right now, as the machine's own publish
-        would (protocol contract section 6.9). Returns False if there is no
-        connected client to send to."""
+        would. Returns False if there is no connected client to send to."""
         with self._lock:
             conn = self._active_conn
         if conn is None:
@@ -298,9 +296,8 @@ class FakeMachine:
     def send_published_line(self, source_id, source_name, text, more=False):
         """Test helper: publish one PTYPE_PUBLISHED_LINE frame to the
         currently-connected client, as the machine would relay another
-        (or this) controller's command/reply (protocol contract section
-        6.10). ``source_name``/``text`` are bytes. Returns False if there
-        is no connected client to send to."""
+        (or this) controller's command/reply. ``source_name``/``text`` are
+        bytes. Returns False if there is no connected client to send to."""
         with self._lock:
             conn = self._active_conn
         if conn is None:
@@ -314,8 +311,7 @@ class FakeMachine:
     def send_control_changed_event(self, holder_id, holder_name=b""):
         """Test helper: publish one PTYPE_EVENT frame, kind
         EVENT_KIND_CONTROL_CHANGED, as the machine's own control gate would
-        (protocol contract section 6.8; firmware's
-        ``build_control_changed_event``): kind(1) + holder_id(8, BE) +
+        (firmware's ``build_control_changed_event``): kind(1) + holder_id(8, BE) +
         holder_name_len(1) + holder_name. ``holder_id == 0`` with an empty
         ``holder_name`` is the machine's own "nobody has control" encoding.
         ``holder_name`` is bytes. Returns False if there is no connected

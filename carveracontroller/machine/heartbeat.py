@@ -6,15 +6,14 @@ something was last sent. The heartbeat (`0x62`) is empty, automatic traffic
 a subscribed controller sends whenever nothing else has gone out on the
 link recently, so the machine — and the WiFi module's own idle timer, which
 counts traffic in either direction — keeps seeing this link as live even
-when the controller has nothing else to say. See the protocol contract,
-sections 4.4, 6.3 and 9.
+when the controller has nothing else to say.
 """
 
 from __future__ import annotations
 
-# Matches the protocol contract's own figure (sections 4.4, 9): comfortably
-# inside the 10 s wifi.tcp_timeout_s default (measured drop ~11.5 s), so a
-# fully idle, subscribed controller is never mistaken for a dead one.
+# 3 s, chosen to sit comfortably inside the 10 s wifi.tcp_timeout_s default
+# (measured drop ~11.5 s), so a fully idle, subscribed controller is never
+# mistaken for a dead one.
 HEARTBEAT_INTERVAL_S = 3.0
 
 

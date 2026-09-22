@@ -4546,8 +4546,8 @@ class Makera(RelativeLayout):
 
                     if msg == Controller.MSG_PUBLISHED:
                         # A published line from another identified
-                        # controller (protocol contract section 6.10):
-                        # shown on the shared console, but deliberately
+                        # controller (the machine's `0x69` frame): shown
+                        # on the shared console, but deliberately
                         # `continue`s here, before dispatch_serial_line()
                         # and every regex side effect below (clock sync,
                         # model/version detection, ...) -- those must only
