@@ -2112,6 +2112,13 @@ class StatusDropDown(ToolTipDropDown):
     # (not connected, or no reply received yet).
     connected_controllers_text = StringProperty("")
 
+    # Whether releasing control right now would do anything -- pushed from
+    # Makera.update_control_holder, the same way connected_controllers_text
+    # is pushed from set_connected_controllers below, rather than bound live
+    # to app.root: this widget is built before app.root is assigned, so a
+    # live `app.root.can_release_control` binding fails at kv-parse time.
+    can_release_control = BooleanProperty(False)
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
@@ -6216,6 +6223,23 @@ class Makera(RelativeLayout):
         else:
             text = tr._("{name} has control").format(name=holder_name or tr._("Another controller"))
         self.control_holder_text = text
+        self.status_drop_down.can_release_control = self.controller.can_release_control
+
+    def open_release_control_confirm_popup(self):
+        """Ask before releasing control: a deliberate action, not something
+        a stray tap should be able to do. Confirming sends the release
+        (Controller.release_control); declining leaves control exactly
+        where it was."""
+        self.confirm_popup.lb_title.text = tr._("Release Control")
+        self.confirm_popup.lb_content.text = tr._(
+            "Give up control of the machine? Another controller will be able to take it."
+        )
+        self.confirm_popup.confirm = self._do_release_control
+        self.confirm_popup.cancel = None
+        self.confirm_popup.open()
+
+    def _do_release_control(self, *args):
+        self.controller.release_control()
 
     def show_usb_reset_blocked_popup(self, *args):
         content = BoxLayout(orientation="vertical", padding=dp(15))
@@ -7172,6 +7196,7 @@ class Makera(RelativeLayout):
                     # rather than keep showing the last holder from a link
                     # that is no longer open.
                     self.control_holder_text = ""
+                    self.status_drop_down.can_release_control = False
 
                     # Clean up light toggle binding when disconnected
                     if hasattr(self, "_light_toggle_bound"):
