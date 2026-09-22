@@ -219,10 +219,9 @@ def test_old_firmware_keeps_polling_and_never_subscribes(machine, controller):
 
 
 def test_old_firmware_never_receives_a_heartbeat(machine, controller):
-    """The hard ADR-0001 compatibility constraint: old firmware, which
-    publishes nothing and never acks hello, must see no new traffic shape
-    at all, including no heartbeat — there is no subscription for a
-    heartbeat to keep alive against it."""
+    """Old firmware, which publishes nothing and never acks hello, must see
+    no new traffic shape at all, including no heartbeat — there is no
+    subscription for a heartbeat to keep alive against it."""
     m = machine(mode="old")
     controller.open(CONN_WIFI, m.address())
 
