@@ -37,10 +37,15 @@ from .protocols import (
     decode_client_list,
     decode_control_changed_event,
     decode_hello_ack,
+    decode_play_started_event,
+    decode_tool_table_relay,
+    decode_upload_finished_event,
     encode_automatic_command,
     encode_client_list_request,
     encode_control_release,
     encode_heartbeat,
+    encode_relay,
+    encode_tool_table_relay,
 )
 from .USBBulkStream import USBBulkStream, is_usb_bulk_address
 from .USBStream import USBStream
@@ -219,6 +224,18 @@ class Controller:
         # Single-user until an ack says otherwise -- the same starting point
         # as control_holder_id/control_holder_name above.
         self.control_mode: int = HELLO_MODE_SINGLE_USER
+        # The most recent tool-table summary relayed by another identified
+        # client (protocols/relay.py) — tool_number -> a short display
+        # text. Lets a passive controller show a sensible tool name at a
+        # tool-change prompt before it has fetched the G-code file itself.
+        # Reset to empty on every (re)connect, same as connected_clients.
+        self.relayed_tool_table: dict[int, str] = {}
+        # The path from the most recent upload-finished or play-started
+        # event (protocols/handshake.py) -- main.py reads this via
+        # on_passive_file_published(path) (_notify_file_published below),
+        # but it is kept here too so it can be asserted directly in a test
+        # that has no Kivy app running. Reset to "" on every (re)connect.
+        self.last_published_file_path: str = ""
 
         # Reconnection properties
         self.reconnect_enabled = True
@@ -1906,6 +1923,8 @@ class Controller:
         self.control_holder_id = 0
         self.control_holder_name = ""
         self.control_mode = HELLO_MODE_SINGLE_USER
+        self.relayed_tool_table = {}
+        self.last_published_file_path = ""
         self.clearRun()
 
     def _join_stream_io(self):
@@ -2019,6 +2038,8 @@ class Controller:
             self.control_holder_id = 0
             self.control_holder_name = ""
             self.control_mode = HELLO_MODE_SINGLE_USER
+            self.relayed_tool_table = {}
+            self.last_published_file_path = ""
             self.stream = transport
             self.thread = threading.Thread(target=self.streamIO)
             self.thread.start()
@@ -2054,6 +2075,8 @@ class Controller:
         self.control_holder_id = 0
         self.control_holder_name = ""
         self.control_mode = HELLO_MODE_SINGLE_USER
+        self.relayed_tool_table = {}
+        self.last_published_file_path = ""
         CNC.vars["state"] = NOT_CONNECTED
         CNC.vars["color"] = STATECOLOR[CNC.vars["state"]]
 
@@ -2088,6 +2111,8 @@ class Controller:
         self.control_holder_id = 0
         self.control_holder_name = ""
         self.control_mode = HELLO_MODE_SINGLE_USER
+        self.relayed_tool_table = {}
+        self.last_published_file_path = ""
         # Set a flag to indicate this was a manual disconnection
         self._manual_disconnect = True
         CNC.vars["state"] = NOT_CONNECTED
@@ -2652,14 +2677,25 @@ class Controller:
             self._on_published_line(message.source_id, message.source_name, message.text)
             return
         if message.kind == MessageKind.EVENT:
-            # Only kind 5 (control-changed) is decoded so far; the other
-            # four (upload finished, play started, job ended, alarm/halt)
-            # are reserved for a future ticket. Intercepted here either way
-            # so an event can never fall through to the unknown-type-
-            # becomes-console-LINE path below and show up as garbled text.
+            # Kinds 3 (job ended) and 4 (alarm/halt) are not decoded yet --
+            # reserved for a future ticket. Intercepted here either way so
+            # an event can never fall through to the unknown-type-becomes-
+            # console-LINE path below and show up as garbled text.
             changed = decode_control_changed_event(message.payload)
             if changed is not None:
                 self._on_control_changed(changed.holder_id, changed.holder_name)
+                return
+            finished = decode_upload_finished_event(message.payload)
+            if finished is not None:
+                self._on_file_published(finished.path)
+                return
+            started = decode_play_started_event(message.payload)
+            if started is not None:
+                self._on_file_published(started.path)
+                return
+            return
+        if message.kind == MessageKind.RELAY:
+            self._on_relay(message.payload)
             return
 
         text = message.text or ""
@@ -2840,6 +2876,48 @@ class Controller:
         self.control_holder_name = holder_name
         self._notify_control_changed(holder_id, holder_name)
 
+    def send_tool_table_relay(self, entries):
+        """Publish a tool-table summary (protocols/relay.py) to every other
+        identified client, as a relay (0x67) frame. `entries` maps
+        tool_number -> a short display text. Returns False without sending
+        anything if this connection is not subscribed yet (old firmware, or
+        the handshake still unresolved) -- relay is meaningless to a
+        machine that has no notion of identified clients at all. Never
+        gated on has_control: any identified client may relay, and doing so
+        never moves control (see protocols/relay.py, ControlToken.h on the
+        firmware side)."""
+        if not self._status_subscribed() or self.stream is None:
+            return False
+        self._send_raw(encode_relay(encode_tool_table_relay(entries)))
+        return True
+
+    def _on_relay(self, payload):
+        """Another identified client's relay (0x67), repeated by the
+        machine. Only a tool-table summary (protocols/relay.py) is
+        understood today; anything else decodes to None and is dropped
+        silently -- a relay is inherently opaque to everyone but the
+        controllers that agree on what is inside it, so an unrecognised
+        payload (a future kind, or a foreign client's own convention) is
+        expected, not an error."""
+        table = decode_tool_table_relay(payload)
+        if table is None:
+            return
+        self.relayed_tool_table = table
+        self._notify_relayed_tool_table(table)
+
+    def _on_file_published(self, path):
+        """An upload-finished or play-started event named `path`. Neither
+        kind is distinguished further here -- both mean the same thing to a
+        listener: a file a passive controller may not have itself is now on
+        the card, worth fetching once the machine is idle (see
+        machine/passive_fetch.py, wired up in main.py). This controller
+        does not decide here whether to actually fetch anything: it does
+        not track holder-ness relative to itself for this purpose, nor the
+        machine's own idle-ness beyond CNC.vars already being the source of
+        truth main.py reads elsewhere."""
+        self.last_published_file_path = path
+        self._notify_file_published(path)
+
     def _on_published_line(self, source_id, source_name, text):
         """A command's own text or its reply, published by the machine to
         every identified client (the machine's `0x69` frame) — from any
@@ -2898,6 +2976,8 @@ class Controller:
         self.control_holder_id = 0
         self.control_holder_name = ""
         self.control_mode = HELLO_MODE_SINGLE_USER
+        self.relayed_tool_table = {}
+        self.last_published_file_path = ""
         if self.stream is not None:
             try:
                 self.stream.close()
@@ -2996,6 +3076,26 @@ class Controller:
         root = app.root
         if hasattr(root, "update_control_holder"):
             Clock.schedule_once(lambda dt, i=holder_id, n=holder_name: root.update_control_holder(i, n), 0)
+
+    def _notify_relayed_tool_table(self, table):
+        if App is None or Clock is None:
+            return
+        app = App.get_running_app()
+        if app is None or getattr(app, "root", None) is None:
+            return
+        root = app.root
+        if hasattr(root, "update_relayed_tool_table"):
+            Clock.schedule_once(lambda dt, t=table: root.update_relayed_tool_table(t), 0)
+
+    def _notify_file_published(self, path):
+        if App is None or Clock is None:
+            return
+        app = App.get_running_app()
+        if app is None or getattr(app, "root", None) is None:
+            return
+        root = app.root
+        if hasattr(root, "on_passive_file_published"):
+            Clock.schedule_once(lambda dt, p=path: root.on_passive_file_published(p), 0)
 
     # ----------------------------------------------------------------------
     # thread performing I/O on serial line
