@@ -82,9 +82,9 @@ def decode_client_list(payload: bytes) -> tuple[ClientEntry, ...]:
 @dataclass(frozen=True)
 class PublishedLineFragment:
     """One `0x69` frame: a slice of a command's text or its reply, as
-    published by the machine to every identified client (protocol contract
-    section 6.10). ``source_id``/``source_name`` are on every fragment, not
-    just the first, so a fragment never needs to be paired with an earlier
+    published by the machine to every identified client.
+    ``source_id``/``source_name`` are on every fragment, not just the
+    first, so a fragment never needs to be paired with an earlier
     one to know who it's from.
     """
 

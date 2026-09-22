@@ -65,8 +65,7 @@ def encode_heartbeat() -> bytes:
     """Build a heartbeat (0x62) frame. Empty payload — automatic traffic a
     subscribed controller sends whenever nothing else went out recently, so
     the machine (and the WiFi module's own idle timer) keeps seeing this
-    link as live. See the protocol contract, sections 4.4 and 6.3, and
-    ``machine/heartbeat.py`` for the timing decision."""
+    link as live. See ``machine/heartbeat.py`` for the timing decision."""
     return build_frame(PTYPE_HEARTBEAT, b"")
 
 
@@ -233,8 +232,9 @@ class MakeraProtocol(CommunicationProtocol):
         if parsed.ptype == PTYPE_PUBLISHED_LINE:
             return self._buffer_published_line(parsed.payload)
         if parsed.ptype == PTYPE_EVENT:
-            # Reserved for a future ticket (protocol contract section 6.8:
-            # upload finished, play started, job ended, alarm/halt).
+            # This `0x68` event type also carries kinds this controller
+            # doesn't decode yet (upload finished, play started, job
+            # ended, alarm/halt) — reserved for a future ticket.
             # Intercepted here, ahead of the unknown-type fallback below,
             # purely so it's never mistaken for garbled console text.
             return [ParsedMessage(MessageKind.EVENT, payload=parsed.payload)]

@@ -5,7 +5,7 @@ test_subscribe_and_shared_console.py.
 Covers the first four acceptance criteria of "Controller: passive state":
 
   1. An indicator naming who has control, driven by control-changed events
-     (protocol contract section 6.8, event kind 5) — never guessed from this
+     (the machine's `0x68` event frame, kind 5) — never guessed from this
      controller's own sends.
   2. Connect-time writes (clock set, lights on connect and disconnect) are
      held back while this controller is passive; reads are unaffected.
