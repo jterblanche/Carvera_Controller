@@ -2715,12 +2715,13 @@ class Controller:
     def _status_subscribed(self):
         """True once this connection is subscribed: identified by firmware
         that understands the identify handshake, so it publishes status on
-        its own, proactively at the configured rate (5 Hz by default), instead of only answering
-        polls. False for old firmware (never identifies — see
-        HelloNegotiator.identified) and while the handshake is still
-        unresolved, both of which keep the pre-subscribe polling behaviour
-        exactly as it was before this feature existed (ADR-0001's hard
-        compatibility constraint)."""
+        its own, proactively at the configured rate (5 Hz by default),
+        instead of only answering polls. False for old firmware (never
+        identifies — see HelloNegotiator.identified) and while the handshake
+        is still unresolved, both of which keep the pre-subscribe polling
+        behaviour exactly as it was before this feature existed: firmware
+        that does not identify and publish must behave exactly as it always
+        has."""
         negotiator = self._hello
         return negotiator is not None and negotiator.identified
 
@@ -2743,7 +2744,7 @@ class Controller:
         decision. Never sent to an old-firmware fallback session or while
         the handshake is unresolved: that firmware never asked for it, and
         sending anything it doesn't understand would be a behaviour change
-        for a case ADR-0001 requires to stay exactly as it is today.
+        for a case that must stay exactly as it is today.
         """
         if not self._status_subscribed() or self.stream is None:
             return
@@ -2798,8 +2799,7 @@ class Controller:
         """A command's own text or its reply, published by the machine to
         every identified client (the machine's `0x69` frame) — from any
         controller, including this one's own: the machine publishes
-        symmetrically, with no "everyone but the sender" exclusion (see the
-        firmware's own change explanation, feat-publish-to-clients.md). This
+        symmetrically, with no "everyone but the sender" exclusion. This
         controller's own traffic is already shown through the ordinary
         reply path (parseLine/execCallback), so its self-published echo is
         dropped here to avoid displaying it twice.
