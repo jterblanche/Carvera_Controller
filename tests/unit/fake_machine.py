@@ -69,6 +69,8 @@ from carveracontroller.protocols.framing import (
     validate_packet_data,
 )
 from carveracontroller.protocols.handshake import (
+    EVENT_KIND_CLIENT_JOINED,
+    EVENT_KIND_CLIENT_LEFT,
     EVENT_KIND_CONTROL_CHANGED,
     EVENT_KIND_PLAY_STARTED,
     EVENT_KIND_UPLOAD_FINISHED,
@@ -333,6 +335,22 @@ class FakeMachine:
         payload = (
             bytes([EVENT_KIND_CONTROL_CHANGED]) + holder_id.to_bytes(8, "big") + bytes([len(holder_name)]) + holder_name
         )
+        self._send(conn, build_frame(PTYPE_EVENT, payload))
+        return True
+
+    def send_client_presence_event(self, client_id, name, joined):
+        """Test helper: publish one PTYPE_EVENT frame, kind
+        EVENT_KIND_CLIENT_JOINED or EVENT_KIND_CLIENT_LEFT, as the machine
+        does when an identified controller arrives or goes (firmware's
+        ``build_client_joined_event``/``build_client_left_event``): kind(1) +
+        client_id(8, BE) + name_len(1) + name. ``name`` is bytes. Returns
+        False if there is no connected client to send to."""
+        with self._lock:
+            conn = self._active_conn
+        if conn is None:
+            return False
+        kind = EVENT_KIND_CLIENT_JOINED if joined else EVENT_KIND_CLIENT_LEFT
+        payload = bytes([kind]) + client_id.to_bytes(8, "big") + bytes([len(name)]) + name
         self._send(conn, build_frame(PTYPE_EVENT, payload))
         return True
 
