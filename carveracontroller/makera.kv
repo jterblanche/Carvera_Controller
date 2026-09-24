@@ -3057,6 +3057,17 @@
                 halign: "left"
                 valign: "middle"
                 text_size: self.size
+            Label:
+                # Why machine settings can't be applied right now (another
+                # controller has control) -- see
+                # Makera.refresh_settings_apply_button. Empty otherwise.
+                text: root.apply_blocked_text
+                halign: "right"
+                valign: "middle"
+                text_size: self.size
+                shorten: True
+                shorten_from: "right"
+                padding: dp(10), 0
             Button:
                 id: btn_apply
                 size_hint_x: None

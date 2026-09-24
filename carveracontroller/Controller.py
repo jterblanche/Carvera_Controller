@@ -2810,6 +2810,20 @@ class Controller:
         return self._status_subscribed() and self.control_mode == HELLO_MODE_MULTI_USER
 
     @property
+    def can_write_machine_settings(self):
+        """False only while a config write from here would be refused: on a
+        machine in multi-user mode, while another controller holds control.
+        True in single-user mode (the write itself takes control there, same
+        as any other user-caused command), in multi-user mode while nobody
+        holds control (likewise), while holding it, and always against old
+        firmware, which has no notion of control. The settings page uses this
+        to disable its Apply button rather than send a write the machine
+        will only refuse."""
+        if not self.multi_user_mode:
+            return True
+        return self.control_holder_id == 0 or self.has_control
+
+    @property
     def can_release_control(self):
         """True while releasing control would actually do something: this
         controller currently holds it, on a machine configured for

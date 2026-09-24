@@ -1626,7 +1626,24 @@ class DeferredSettingsPanel(SettingsPanel):
             self.settings.dispatch("on_config_change", self.config, section, key, value)
 
 
+def settings_apply_disabled(has_controller_changes, has_machine_changes, machine_writable):
+    """Whether the settings page's Apply button is disabled: when there is
+    nothing to apply, or when machine setting changes are pending that the
+    machine would refuse (another controller holds control in multi-user
+    mode -- see Controller.can_write_machine_settings). Changes to this
+    controller's own settings never touch the machine, so on their own they
+    can always be applied."""
+    if has_machine_changes and not machine_writable:
+        return True
+    return not (has_controller_changes or has_machine_changes)
+
+
 class ConfigPopup(ModalView):
+    # Why machine settings can't be applied from here right now, shown beside
+    # the Apply button; empty while they can. See
+    # Makera.refresh_settings_apply_button.
+    apply_blocked_text = StringProperty("")
+
     def __init__(self, **kwargs):
         self._widget_snapshot = {}
         super().__init__(**kwargs)
@@ -1642,6 +1659,7 @@ class ConfigPopup(ModalView):
         self._widget_snapshot = {}
         for widget in self._all_setting_items():
             self._widget_snapshot[(widget.section, widget.key)] = widget.value
+        App.get_running_app().root.refresh_settings_apply_button()
 
     def get_original(self, section, key):
         return self._widget_snapshot.get((section, key))
@@ -1649,6 +1667,16 @@ class ConfigPopup(ModalView):
     def on_dismiss(self):
         app = App.get_running_app()
         makera = app.root
+        if makera.setting_change_list and not makera.controller.can_write_machine_settings:
+            makera.confirm_popup.lb_title.text = tr._("Unapplied Changes")
+            makera.confirm_popup.lb_content.text = tr._(
+                "{name} has control, so your machine setting changes can't be applied. "
+                "Discard them and close? Changes to this controller's own settings are still applied."
+            ).format(name=makera.controller.control_holder_name or tr._("Another controller"))
+            makera.confirm_popup.confirm = self._discard_machine_changes_and_close
+            makera.confirm_popup.cancel = None
+            makera.confirm_popup.open()
+            return True  # cancel the dismiss
         has_pending = bool(makera.controller_setting_change_list or makera.setting_change_list)
         if has_pending:
             makera.confirm_popup.lb_title.text = tr._("Unapplied Changes")
@@ -1660,6 +1688,12 @@ class ConfigPopup(ModalView):
 
     def _apply_changes(self):
         app = App.get_running_app()
+        if app.root.setting_change_list and not app.root.controller.can_write_machine_settings:
+            # Control moved to another controller after Apply was enabled.
+            # The machine would refuse every write, so apply nothing and
+            # leave the changes pending.
+            app.root.refresh_settings_apply_button()
+            return
         # Write pending widget values to their Config instances
         for widget in self._all_setting_items():
             original = self._widget_snapshot.get((widget.section, widget.key))
@@ -1674,6 +1708,27 @@ class ConfigPopup(ModalView):
 
     def _apply_and_close(self):
         self._apply_changes()
+        self.dismiss(force=True)
+
+    def _discard_machine_changes_and_close(self):
+        """Close with machine setting changes that can't be applied (another
+        controller holds control): put those widgets back to their values
+        from when the page opened, then apply whatever is left, which is only
+        this controller's own settings."""
+        app = App.get_running_app()
+        makera = app.root
+        makera.config_loading = True
+        for widget in self._all_setting_items():
+            if widget.section in ["carvera", "graphics", "kivy"] or widget.key not in makera.setting_change_list:
+                continue
+            original = self._widget_snapshot.get((widget.section, widget.key))
+            if original is not None and str(widget.value) != str(original):
+                widget.value = original
+        makera.config_loading = False
+        makera.setting_change_list.clear()
+        if makera.controller_setting_change_list:
+            self._apply_changes()
+        self.btn_apply.disabled = True
         self.dismiss(force=True)
 
     def _discard_and_close(self):
@@ -2021,8 +2076,7 @@ class MakeraConfigPanel(SettingsWithSidebar):
                     app.root.controller_setting_change_list.pop(key, None)
                 else:
                     app.root.controller_setting_change_list[key] = value
-                has_changes = bool(app.root.controller_setting_change_list or app.root.setting_change_list)
-                config_popup.btn_apply.disabled = not has_changes
+                app.root.refresh_settings_apply_button()
             elif section == "Backup":
                 app.root.start_back_up_config()
                 app.root.config_popup.btn_apply.disabled = True
@@ -2032,12 +2086,13 @@ class MakeraConfigPanel(SettingsWithSidebar):
                 else:
                     new_value = Utils.to_config(app.root.setting_type_list[key], value).strip()
                     app.root.setting_change_list[key] = new_value
-                has_changes = bool(app.root.controller_setting_change_list or app.root.setting_change_list)
-                config_popup.btn_apply.disabled = not has_changes
+                app.root.refresh_settings_apply_button()
             elif key == "restore" and value == "RESTORE":
-                app.root.open_setting_restore_confirm_popup()
+                if not app.root.refuse_machine_settings_write():
+                    app.root.open_setting_restore_confirm_popup()
             elif key == "default" and value == "DEFAULT":
-                app.root.open_setting_default_confirm_popup()
+                if not app.root.refuse_machine_settings_write():
+                    app.root.open_setting_default_confirm_popup()
 
 
 class JogSpeedDropDown(ToolTipDropDown):
@@ -6247,9 +6302,11 @@ class Makera(RelativeLayout):
     def update_control_holder(self, holder_id, holder_name):
         """Refresh the "who has control" indicator from a control-changed
         event (Controller._on_control_changed). Passive and in-control look
-        identical apart from this text: nothing here disables or greys out
-        any control, and nothing prompts — control simply follows whoever
-        the machine says last acted."""
+        identical apart from this text and the settings page, whose Apply
+        button is disabled while another controller holds control in
+        multi-user mode (see refresh_settings_apply_button). Nothing else is
+        disabled or greyed out, and nothing prompts — control simply follows
+        whoever the machine says last acted."""
         own_id = self.identity.id if getattr(self, "identity", None) is not None else None
         if holder_id == 0:
             text = tr._("No one has control")
@@ -6259,6 +6316,36 @@ class Makera(RelativeLayout):
             text = tr._("{name} has control").format(name=holder_name or tr._("Another controller"))
         self.control_holder_text = text
         self.status_drop_down.can_release_control = self.controller.can_release_control
+        self.refresh_settings_apply_button()
+
+    def refresh_settings_apply_button(self):
+        """Enable or disable the settings page's Apply button, and say why
+        beside it when machine settings can't be applied from here: another
+        controller holds control on a machine in multi-user mode, so the
+        machine would refuse the write. Called whenever a setting changes,
+        when the page opens, and on every control-changed event."""
+        popup = self.config_popup
+        if popup is None:
+            return
+        writable = self.controller.can_write_machine_settings
+        popup.btn_apply.disabled = settings_apply_disabled(
+            bool(self.controller_setting_change_list), bool(self.setting_change_list), writable
+        )
+        popup.apply_blocked_text = "" if writable else self._machine_settings_blocked_text()
+
+    def _machine_settings_blocked_text(self):
+        name = self.controller.control_holder_name or tr._("Another controller")
+        return tr._("{name} has control: machine settings can't be changed here").format(name=name)
+
+    def refuse_machine_settings_write(self):
+        """For a settings-page action that writes machine settings straight
+        away (Restore, Save As Default): if the machine would refuse it
+        because another controller holds control, say so and return True so
+        the caller does nothing. Returns False when the write may go ahead."""
+        if self.controller.can_write_machine_settings:
+            return False
+        self.show_message_popup(self._machine_settings_blocked_text(), False)
+        return True
 
     def announce_client_presence(self, announcement):
         """Show that another controller joined or left the machine
