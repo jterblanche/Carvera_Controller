@@ -24,6 +24,7 @@ from .machine.heartbeat import heartbeat_due
 from .machine.hello import HelloNegotiator, Resolution
 from .machine.identity import ControllerIdentity, default_name, generate_id
 from .machine.peer_closed import PeerClosedError
+from .machine.presence import PresenceAnnouncement, presence_announcement
 from .protocols import (
     HELLO_ACCEPTED,
     HELLO_MODE_MULTI_USER,
@@ -35,6 +36,7 @@ from .protocols import (
     MessageKind,
     ProtocolSession,
     decode_client_list,
+    decode_client_presence_event,
     decode_control_changed_event,
     decode_hello_ack,
     decode_play_started_event,
@@ -236,6 +238,14 @@ class Controller:
         # but it is kept here too so it can be asserted directly in a test
         # that has no Kivy app running. Reset to "" on every (re)connect.
         self.last_published_file_path: str = ""
+        # Whether another controller joining or leaving the machine is
+        # announced to the user. A user setting, pushed in by the UI; on by
+        # default, so the user learns the behaviour exists. See
+        # _on_client_presence.
+        self.announce_other_controllers: bool = True
+        # The last announcement handed to the UI, kept so it can be asserted
+        # directly in a test that has no Kivy app running.
+        self.last_presence_announcement: PresenceAnnouncement | None = None
 
         # Reconnection properties
         self.reconnect_enabled = True
@@ -2685,6 +2695,10 @@ class Controller:
             if changed is not None:
                 self._on_control_changed(changed.holder_id, changed.holder_name)
                 return
+            presence = decode_client_presence_event(message.payload)
+            if presence is not None:
+                self._on_client_presence(presence)
+                return
             finished = decode_upload_finished_event(message.payload)
             if finished is not None:
                 self._on_file_published(finished.path)
@@ -2875,6 +2889,23 @@ class Controller:
         self.control_holder_id = holder_id
         self.control_holder_name = holder_name
         self._notify_control_changed(holder_id, holder_name)
+
+    def _on_client_presence(self, event):
+        """A client-joined or client-left event (the machine's `0x68` event
+        frame, kind 6 or 7): an identified controller arrived or went.
+
+        Asks the machine for a fresh client list, so the connected-
+        controllers view stays current without polling. That request is
+        automatic traffic and never moves control. Then announces the
+        change, unless the user has turned announcements off or the event
+        is about this controller itself."""
+        if self.stream is not None:
+            self._send_raw(encode_client_list_request())
+        announcement = presence_announcement(event, self.identity.id, self.announce_other_controllers)
+        if announcement is None:
+            return
+        self.last_presence_announcement = announcement
+        self._notify_client_presence(announcement)
 
     def send_tool_table_relay(self, entries):
         """Publish a tool-table summary (protocols/relay.py) to every other
@@ -3076,6 +3107,16 @@ class Controller:
         root = app.root
         if hasattr(root, "update_control_holder"):
             Clock.schedule_once(lambda dt, i=holder_id, n=holder_name: root.update_control_holder(i, n), 0)
+
+    def _notify_client_presence(self, announcement):
+        if App is None or Clock is None:
+            return
+        app = App.get_running_app()
+        if app is None or getattr(app, "root", None) is None:
+            return
+        root = app.root
+        if hasattr(root, "announce_client_presence"):
+            Clock.schedule_once(lambda dt, a=announcement: root.announce_client_presence(a), 0)
 
     def _notify_relayed_tool_table(self, table):
         if App is None or Clock is None:

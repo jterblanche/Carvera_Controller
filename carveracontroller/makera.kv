@@ -3255,6 +3255,20 @@
             halign: 'center'
             text_size: self.width, None
 
+        Label:
+            # Another controller joined or left the machine
+            # (root.presence_notice_text, see Makera.announce_client_presence).
+            # Shown for a few seconds, then collapsed to nothing again.
+            id: lbl_presence_notice
+            text: root.presence_notice_text
+            size_hint_y: None
+            height: dp(18) if root.presence_notice_text else 0
+            opacity: 1 if root.presence_notice_text else 0
+            color: 170/255, 170/255, 170/255, 1
+            font_size: '12sp'
+            halign: 'center'
+            text_size: self.width, None
+
         Content:
             id: content
             ControlPage:

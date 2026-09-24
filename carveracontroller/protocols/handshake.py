@@ -22,11 +22,13 @@ HELLO_MODE_SINGLE_USER = 0
 HELLO_MODE_MULTI_USER = 1
 
 # Event (`0x68`) `kind` bytes this controller decodes. The machine defines
-# two more (job ended, alarm/halt) that this controller does not act on yet
-# -- see MessageKind.EVENT.
+# two more (3, job ended; 4, alarm/halt) that this controller does not act
+# on yet -- see MessageKind.EVENT.
 EVENT_KIND_UPLOAD_FINISHED = 1
 EVENT_KIND_PLAY_STARTED = 2
 EVENT_KIND_CONTROL_CHANGED = 5
+EVENT_KIND_CLIENT_JOINED = 6
+EVENT_KIND_CLIENT_LEFT = 7
 
 # hello / client-list-entry `link` values.
 LINK_WIFI = 0
@@ -215,15 +217,57 @@ def decode_control_changed_event(payload: bytes) -> ControlChanged | None:
     -- the caller then drops it silently, the same tolerant style every
     other decoder in this module uses for a malformed message.
     """
+    if not payload or payload[0] != EVENT_KIND_CONTROL_CHANGED:
+        return None
+    decoded = _decode_id_and_name(payload)
+    if decoded is None:
+        return None
+    holder_id, holder_name = decoded
+    return ControlChanged(holder_id=holder_id, holder_name=holder_name)
+
+
+@dataclass(frozen=True)
+class ClientPresenceChanged:
+    """One `0x68` event, kind `EVENT_KIND_CLIENT_JOINED` or
+    `EVENT_KIND_CLIENT_LEFT`: an identified controller has just joined the
+    machine, or left it. The machine publishes these to every identified
+    client, the one that joined included, and never for a controller that
+    has not identified itself, nor for one reconnecting under an id it
+    already holds.
+    """
+
+    client_id: int
+    name: str
+    joined: bool
+
+
+def decode_client_presence_event(payload: bytes) -> ClientPresenceChanged | None:
+    """Decode one event (`0x68`) payload as a client-joined or client-left
+    event: kind(1) + client_id(8, big-endian) + name_len(1) + name, the
+    same layout as a control-changed event.
+
+    Returns None if the payload is too short, its first byte is neither
+    kind, or the declared name is longer than fits.
+    """
+    if not payload or payload[0] not in (EVENT_KIND_CLIENT_JOINED, EVENT_KIND_CLIENT_LEFT):
+        return None
+    decoded = _decode_id_and_name(payload)
+    if decoded is None:
+        return None
+    client_id, name = decoded
+    return ClientPresenceChanged(client_id=client_id, name=name, joined=payload[0] == EVENT_KIND_CLIENT_JOINED)
+
+
+def _decode_id_and_name(payload: bytes) -> tuple[int, str] | None:
+    """The id(8, big-endian) + name_len(1) + name that follows the kind byte
+    in every event naming a controller. None if the payload is too short or
+    the declared name is longer than fits."""
     if len(payload) < 1 + 8 + 1:
         return None
-    if payload[0] != EVENT_KIND_CONTROL_CHANGED:
-        return None
-    holder_id = int.from_bytes(payload[1:9], "big")
+    client_id = int.from_bytes(payload[1:9], "big")
     offset = 9
     name_len = payload[offset]
     offset += 1
     if name_len > _MAX_NAME_BYTES or offset + name_len > len(payload):
         return None
-    holder_name = payload[offset : offset + name_len].decode("utf-8", errors="replace")
-    return ControlChanged(holder_id=holder_id, holder_name=holder_name)
+    return client_id, payload[offset : offset + name_len].decode("utf-8", errors="replace")

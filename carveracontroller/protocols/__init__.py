@@ -3,6 +3,8 @@
 from .base import CommunicationProtocol
 from .detector import detect_protocol_name
 from .handshake import (
+    EVENT_KIND_CLIENT_JOINED,
+    EVENT_KIND_CLIENT_LEFT,
     EVENT_KIND_CONTROL_CHANGED,
     EVENT_KIND_PLAY_STARTED,
     EVENT_KIND_UPLOAD_FINISHED,
@@ -14,12 +16,14 @@ from .handshake import (
     LINK_USB,
     LINK_WIFI,
     ClientEntry,
+    ClientPresenceChanged,
     ControlChanged,
     HelloAck,
     PlayStarted,
     PublishedLineFragment,
     UploadFinished,
     decode_client_list,
+    decode_client_presence_event,
     decode_control_changed_event,
     decode_hello_ack,
     decode_play_started_event,
@@ -47,6 +51,8 @@ from .session import ProtocolSession, protocol_name_from_announcement
 __all__ = [
     "CommunicationProtocol",
     "DEFAULT_PROTOCOL",
+    "EVENT_KIND_CLIENT_JOINED",
+    "EVENT_KIND_CLIENT_LEFT",
     "EVENT_KIND_CONTROL_CHANGED",
     "EVENT_KIND_PLAY_STARTED",
     "EVENT_KIND_UPLOAD_FINISHED",
@@ -59,6 +65,7 @@ __all__ = [
     "LINK_WIFI",
     "RELAY_KIND_TOOL_TABLE",
     "ClientEntry",
+    "ClientPresenceChanged",
     "ControlChanged",
     "HelloAck",
     "MessageKind",
@@ -70,6 +77,7 @@ __all__ = [
     "available_protocols",
     "create_protocol",
     "decode_client_list",
+    "decode_client_presence_event",
     "decode_control_changed_event",
     "decode_hello_ack",
     "decode_play_started_event",
