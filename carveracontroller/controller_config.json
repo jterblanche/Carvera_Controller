@@ -338,5 +338,13 @@
         "section": "carvera",
         "key": "controller_name",
         "default": ""
+    },
+    {
+        "type": "bool",
+        "title": "Announce other controllers",
+        "desc": "Briefly show when another controller connects to or disconnects from the machine.",
+        "section": "carvera",
+        "key": "announce_other_controllers",
+        "default": "1"
     }
 ]

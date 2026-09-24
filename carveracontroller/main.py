@@ -2921,6 +2921,12 @@ class Makera(RelativeLayout):
     # connection shows something, even "no one" before the first event.
     control_holder_text = StringProperty("")
 
+    # A short-lived line saying another controller joined or left the
+    # machine -- see announce_client_presence. Empty, and collapsed to
+    # nothing, the rest of the time.
+    presence_notice_text = StringProperty("")
+    _presence_notice_clear = None
+
     # Path visibility filters for the G-code viewer color-scheme panel.
     path_show_rapid = True
     path_show_feed = True
@@ -3037,6 +3043,9 @@ class Makera(RelativeLayout):
             self.execCallback,
             Config.getboolean("carvera", "log_sent_receive", fallback=False),
             identity=self.identity,
+        )
+        self.controller.announce_other_controllers = Config.getboolean(
+            "carvera", "announce_other_controllers", fallback=True
         )
         # Set up reconnection callbacks
         self.controller.set_reconnection_callbacks(
@@ -6251,6 +6260,26 @@ class Makera(RelativeLayout):
         self.control_holder_text = text
         self.status_drop_down.can_release_control = self.controller.can_release_control
 
+    def announce_client_presence(self, announcement):
+        """Show that another controller joined or left the machine
+        (Controller._on_client_presence), by name, for a few seconds under
+        the top bar. It is news about the machine, not a reply to anything
+        this controller sent, so it stays out of the MDI console, and it
+        clears itself so nobody has to dismiss it."""
+        name = announcement.name or tr._("Another controller")
+        if announcement.joined:
+            text = tr._("{name} connected to the machine").format(name=name)
+        else:
+            text = tr._("{name} disconnected from the machine").format(name=name)
+        self.presence_notice_text = text
+        if self._presence_notice_clear is not None:
+            self._presence_notice_clear.cancel()
+        self._presence_notice_clear = Clock.schedule_once(self._clear_presence_notice, 5)
+
+    def _clear_presence_notice(self, *args):
+        self.presence_notice_text = ""
+        self._presence_notice_clear = None
+
     def open_release_control_confirm_popup(self):
         """Ask before releasing control: a deliberate action, not something
         a stray tap should be able to do. Confirming sends the release
@@ -8688,6 +8717,13 @@ class Makera(RelativeLayout):
             if log_level in ["DEBUG", "INFO", "WARNING", "ERROR"]:
                 logging.getLogger().setLevel(getattr(logging, log_level))
                 logger.info(f"Log level set to {log_level}")
+
+        if "announce_other_controllers" in self.controller_setting_change_list:
+            raw_enabled = self.controller_setting_change_list["announce_other_controllers"]
+            enabled = raw_enabled not in ("0", "false", "False")
+            self.controller.announce_other_controllers = enabled
+            if not enabled:
+                self._clear_presence_notice()
 
         if "log_sent_receive" in self.controller_setting_change_list:
             self.controller.log_sent_receive = self.controller_setting_change_list.get("log_sent_receive")
