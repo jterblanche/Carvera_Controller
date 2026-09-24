@@ -66,15 +66,15 @@
     {
         "type": "options",
         "title": "Passive rights",
-        "desc": "Multi-user mode only: what a controller that does not hold control may still do. Watch only: view status. Watch, pause, stop: also pause or stop a running job. Watch, pause, stop, upload: also upload a file while the machine is idle.",
+        "desc": "Multi-user mode only: what a controller that does not hold control may still do. watch_only: view status. watch_stop: also pause or stop a running job. watch_stop_upload: also upload a file while the machine is idle. The machine treats any other value as watch_only.",
         "section": "Basic",
         "key": "multi_client.passive_rights",
         "options": [
             "watch_only",
-            "watch_pause_stop",
-            "watch_pause_stop_upload"
+            "watch_stop",
+            "watch_stop_upload"
         ],
-        "default": "watch_pause_stop_upload"
+        "default": "watch_stop_upload"
     },
     {
         "type": "title",
