@@ -226,3 +226,56 @@ def test_upload_is_sent_regardless_of_holding_control(machine, controller):
     assert controller.uploadCommand("job.nc") is True
 
     assert m.wait_until(lambda: any(b"upload job.nc" in p for p in _command_payloads(m, PTYPE_FILE_START)))
+
+
+# -- Machine settings: writable unless another controller holds control ----
+
+
+def test_machine_settings_are_not_writable_while_another_holds_control_in_multi_user_mode(machine, controller):
+    m = machine(mode="new", hello_ack_mode=HELLO_MODE_MULTI_USER)
+    controller.open(CONN_WIFI, m.address())
+    assert _wait_identified(m, controller)
+    assert m.send_control_changed_event(OTHER_ID, b"Office PC")
+    assert m.wait_until(lambda: controller.control_holder_id == OTHER_ID)
+
+    assert controller.can_write_machine_settings is False
+
+
+def test_machine_settings_are_writable_once_holding_control_in_multi_user_mode(machine, controller):
+    m = machine(mode="new", hello_ack_mode=HELLO_MODE_MULTI_USER)
+    controller.open(CONN_WIFI, m.address())
+    assert _wait_identified(m, controller)
+    assert m.send_control_changed_event(OTHER_ID, b"Office PC")
+    assert m.wait_until(lambda: controller.can_write_machine_settings is False)
+    assert m.send_control_changed_event(IDENTITY.id, IDENTITY.name.encode())
+
+    assert m.wait_until(lambda: controller.can_write_machine_settings is True)
+
+
+def test_machine_settings_are_writable_in_multi_user_mode_while_nobody_holds_control(machine, controller):
+    """With control free, the write itself takes control, so it isn't refused."""
+    m = machine(mode="new", hello_ack_mode=HELLO_MODE_MULTI_USER)
+    controller.open(CONN_WIFI, m.address())
+    assert _wait_identified(m, controller)
+    assert controller.control_holder_id == 0
+
+    assert controller.can_write_machine_settings is True
+
+
+def test_machine_settings_are_writable_in_single_user_mode_while_another_controller_holds_control(machine, controller):
+    """Single-user mode: acting takes control, so nothing is disabled."""
+    m = machine(mode="new", hello_ack_mode=HELLO_MODE_SINGLE_USER)
+    controller.open(CONN_WIFI, m.address())
+    assert _wait_identified(m, controller)
+    assert m.send_control_changed_event(OTHER_ID, b"Office PC")
+    assert m.wait_until(lambda: controller.control_holder_id == OTHER_ID)
+
+    assert controller.can_write_machine_settings is True
+
+
+def test_machine_settings_are_writable_against_old_firmware(machine, controller):
+    m = machine(mode="old")
+    controller.open(CONN_WIFI, m.address())
+    assert m.wait_until(lambda: controller._hello is not None and controller._hello.resolved)
+
+    assert controller.can_write_machine_settings is True
