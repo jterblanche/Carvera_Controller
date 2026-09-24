@@ -1,9 +1,13 @@
 from carveracontroller.protocols.handshake import (
+    EVENT_KIND_CLIENT_JOINED,
+    EVENT_KIND_CLIENT_LEFT,
     EVENT_KIND_CONTROL_CHANGED,
     ClientEntry,
+    ClientPresenceChanged,
     ControlChanged,
     PublishedLineFragment,
     decode_client_list,
+    decode_client_presence_event,
     decode_control_changed_event,
     decode_hello_ack,
     decode_published_line,
@@ -139,3 +143,43 @@ def test_decode_control_changed_event_truncated_name_returns_none():
     # name_len says 5 but only 2 bytes of name follow.
     payload = bytes([EVENT_KIND_CONTROL_CHANGED]) + (1).to_bytes(8, "big") + bytes([5]) + b"ab"
     assert decode_control_changed_event(payload) is None
+
+
+def test_decode_client_joined_event():
+    payload = bytes([EVENT_KIND_CLIENT_JOINED]) + (0x0102030405060708).to_bytes(8, "big") + bytes([9]) + b"Office PC"
+
+    event = decode_client_presence_event(payload)
+
+    assert event == ClientPresenceChanged(client_id=0x0102030405060708, name="Office PC", joined=True)
+
+
+def test_decode_client_left_event():
+    payload = bytes([EVENT_KIND_CLIENT_LEFT]) + (0x0102030405060708).to_bytes(8, "big") + bytes([8]) + b"Workshop"
+
+    event = decode_client_presence_event(payload)
+
+    assert event == ClientPresenceChanged(client_id=0x0102030405060708, name="Workshop", joined=False)
+
+
+def test_decode_client_presence_event_wrong_kind_returns_none():
+    # Same layout, but a control-changed event is not a presence event.
+    payload = bytes([EVENT_KIND_CONTROL_CHANGED]) + (1).to_bytes(8, "big") + bytes([0])
+    assert decode_client_presence_event(payload) is None
+
+
+def test_decode_control_changed_event_ignores_presence_kinds():
+    # And the other way round: the shared layout must not let a joined or
+    # left event pass for a control change.
+    for kind in (EVENT_KIND_CLIENT_JOINED, EVENT_KIND_CLIENT_LEFT):
+        payload = bytes([kind]) + (1).to_bytes(8, "big") + bytes([0])
+        assert decode_control_changed_event(payload) is None
+
+
+def test_decode_client_presence_event_too_short_returns_none():
+    assert decode_client_presence_event(b"") is None
+    assert decode_client_presence_event(bytes([EVENT_KIND_CLIENT_JOINED]) + (1).to_bytes(8, "big")) is None
+
+
+def test_decode_client_presence_event_oversized_name_returns_none():
+    payload = bytes([EVENT_KIND_CLIENT_LEFT]) + (1).to_bytes(8, "big") + bytes([32]) + b"x" * 32
+    assert decode_client_presence_event(payload) is None
