@@ -6277,6 +6277,7 @@ class Makera(RelativeLayout):
         # Same wording as the pre-connect busy check (reconnect_last_connection):
         # this is the same "someone else is already connected" outcome, just
         # discovered after the TCP connection was accepted rather than before it.
+        self._refresh_after_inline_close()
         self.show_message_popup(tr._("Cannot connect, machine is busy or not available."), False)
 
     def show_hello_rejected_popup(self, reason, *args):
@@ -6286,13 +6287,26 @@ class Makera(RelativeLayout):
             message = tr._(
                 "An older controller is connected to this machine. Multiple controllers aren't available until it disconnects."
             )
+        self._refresh_after_inline_close()
         self.show_message_popup(message, False)
 
     def show_peer_closed_popup(self, *args):
         # Shown for a link that was working and then wasn't (see
         # Controller._handle_peer_closed): unlike the busy/rejected
         # messages above, there's no more precise reason to give here.
+        self._refresh_after_inline_close()
         self.show_message_popup(tr._("Disconnected: the connection to the machine was lost."), False)
+
+    def _refresh_after_inline_close(self):
+        # The three popups above follow Controller._close_inline, which has
+        # already closed the link and set the state to NOT_CONNECTED from
+        # the streamIO thread. The screen only follows that state inside
+        # updateStatus, which otherwise runs when a status report arrives,
+        # and none will on a closed link. Refresh it the way close() does.
+        # _close_inline also sets _manual_disconnect, so this does not open
+        # the reconnect popup.
+        self.status_drop_down.set_connected_controllers(())
+        self.updateStatus()
 
     def update_connected_controllers(self, entries):
         own_id = self.identity.id if getattr(self, "identity", None) is not None else None
