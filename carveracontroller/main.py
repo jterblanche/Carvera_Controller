@@ -39,6 +39,19 @@ MAX_CONFIG_DOWNLOAD_ATTEMPTS = 3
 # only when the earliest ones actually reach the wire.
 MACHINE_METADATA_QUERY_MAX_ATTEMPTS = 3
 
+# How long to wait for the next decompress progress reply from the firmware
+# (Player::decompress, Player.cpp) before giving up instead of waiting
+# forever. That loop sends "#Info: decompart = N" every 11 blocks, plus one
+# more, unconditional, once the whole file is unpacked, so once any progress
+# has arrived this only has to cover a stall between two of those replies,
+# not the whole transfer. DECOMPRESS_TIMEOUT_PER_BLOCK_SEC is a conservative
+# per-block allowance (decompress plus an SD-card write, well above the
+# well-under-a-second each normally takes); DECOMPRESS_TIMEOUT_FLOOR_SEC
+# covers link latency before the first -- or, for a file under 11 blocks,
+# the only -- reply arrives.
+DECOMPRESS_TIMEOUT_FLOOR_SEC = 15
+DECOMPRESS_TIMEOUT_PER_BLOCK_SEC = 1.0
+
 
 def is_android():
     return "ANDROID_ARGUMENT" in os.environ or "ANDROID_PRIVATE" in os.environ or "ANDROID_APP_PATH" in os.environ
@@ -4712,14 +4725,7 @@ class Makera(RelativeLayout):
                     break
             # Update Decompress status bar
             if self.decompstatus == True:
-                if self.decompercent != self.decompercentlast:
-                    self.updateCompressProgress(self.decompercent)
-                    self.decompercentlast = self.decompercent
-                    self.decomptime = time.time()
-                else:
-                    t = time.time()
-                    if t - self.decomptime > 8:
-                        self.updateCompressProgress(self.fileCompressionBlocks)
+                self._update_decompress_progress(t)
 
             # Update position if needed
             if self.controller.posUpdate:
@@ -7353,8 +7359,65 @@ class Makera(RelativeLayout):
         self.progress_info = self._format_file_progress_info(playing=True, remaining_sec=self._current_remaining_sec())
 
     # --------------------------------------------------------------`---------
+    def _update_decompress_progress(self, now):
+        """Advance the "Decompressing" progress bar once per monitorSerial
+        tick while an uploaded .lz file is being unpacked on the machine's
+        card (doUpload sets self.decompstatus after a successful upload).
+
+        Progress comes entirely from the firmware's own replies
+        (Player::decompress, Player.cpp): a "#Info: decompart = N" line
+        every 11 blocks, plus one more, unconditional, once the whole file
+        is done (main.py's remote_decompercent regex turns that into
+        self.decompercent). If none of that ever arrives -- the reply is
+        lost, or the decompress itself hangs or errors out on the machine --
+        this must still end the upload instead of waiting forever, so a
+        watchdog (DECOMPRESS_TIMEOUT_FLOOR_SEC and
+        DECOMPRESS_TIMEOUT_PER_BLOCK_SEC) gives up with a clear message
+        instead.
+        """
+        if self.fileCompressionBlocks <= 0:
+            # Nothing to decompress (the source compressed to zero blocks,
+            # e.g. an empty file): there is no firmware reply to wait for,
+            # and nothing to divide by in updateCompressProgress below, so
+            # finish at once instead of waiting on a reply that may never
+            # add new information.
+            self.updateCompressProgress(self.fileCompressionBlocks)
+            return
+        if self.decompercent != self.decompercentlast:
+            self.updateCompressProgress(self.decompercent)
+            self.decompercentlast = self.decompercent
+            self.decomptime = now
+            return
+        timeout = max(
+            DECOMPRESS_TIMEOUT_FLOOR_SEC,
+            DECOMPRESS_TIMEOUT_PER_BLOCK_SEC * self.fileCompressionBlocks,
+        )
+        if now - self.decomptime > timeout:
+            self._decompress_timed_out()
+
+    # --------------------------------------------------------------`---------
+    def _decompress_timed_out(self):
+        """No decompress progress arrived within the watchdog's time (see
+        _update_decompress_progress): end the upload state honestly -- a
+        clear error, the progress popup dismissed, the UI left usable --
+        instead of the old fallback of silently treating the wait's end as
+        a finished transfer either way.
+        """
+        self.decompstatus = False
+        self.pending_decompress_callback = None
+        message = tr._("Decompressing on the machine timed out; the file may not be usable.")
+        self.controller.log.put((Controller.MSG_ERROR, message))
+        Clock.schedule_once(self.progressFinish, 0)
+        Clock.schedule_once(partial(self.show_message_popup, message, False), 0)
+
+    # --------------------------------------------------------------`---------
     def updateCompressProgress(self, value):
-        Clock.schedule_once(partial(self.progressUpdate, value * 100.0 / self.fileCompressionBlocks, "", True), 0)
+        # self.fileCompressionBlocks is 0 only when there was nothing to
+        # decompress (an empty source file); treat that as 100% rather than
+        # dividing by zero.
+        total_blocks = self.fileCompressionBlocks
+        percent = 100.0 if total_blocks <= 0 else value * 100.0 / total_blocks
+        Clock.schedule_once(partial(self.progressUpdate, percent, "", True), 0)
         if value == self.fileCompressionBlocks:
             Clock.schedule_once(self.progressFinish, 0)
             # Refresh the remote dir since upload finished
