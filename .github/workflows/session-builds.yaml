@@ -1,0 +1,124 @@
+name: Session Builds
+# Desktop builds of this branch for testing on a real machine. Builds only:
+# no signing, no release, no images. The jobs follow release.yaml.
+on:
+  push:
+    branches:
+      - chore/session-builds
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: 3.12
+        architecture: x64
+
+    - name: Install poetry and dependencies
+      uses: ./.github/actions/bootstrap-poetry
+      with:
+        os: windows
+
+    - uses: git-for-windows/setup-git-for-windows-sdk@v1
+      with:
+        flavor: minimal
+
+    - name: "Install Windows-Mesa OpenGL DLL"
+      run: |
+        curl -L --output mesa.7z --url https://github.com/pal1000/mesa-dist-win/releases/download/24.2.5/mesa3d-24.2.5-release-msvc.7z
+        7z x mesa.7z -o*
+        powershell.exe mesa\\systemwidedeploy.cmd 1
+
+    - name: Build
+      shell: pwsh
+      run: |
+        $version = Get-Date -Format "yyyy.M.d"
+        poetry run python scripts/build.py --os windows --version $version
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows-x64
+        path: ${{ github.workspace }}/dist/carveracontroller-community-*-windows-x64.exe
+        retention-days: 14
+
+  build-macos:
+    runs-on: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ Intel, AppleSilicon ]
+        include:
+          - platform: Intel
+            image: macos-15-intel
+          - platform: AppleSilicon
+            image: macos-14
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: 3.12
+
+    - name: Install poetry and dependencies
+      uses: ./.github/actions/bootstrap-poetry
+      with:
+        os: macos
+
+    - name: Install create-dmg
+      run: brew install create-dmg
+
+    - name: Build
+      run: poetry run python scripts/build.py --os macos --version "$(date +'%Y.%m.%d')"
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: macos-${{ matrix.platform }}
+        path: ${{ github.workspace }}/dist/carveracontroller-community-*.dmg
+        retention-days: 14
+
+  build-linux:
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.12
+
+      - name: Install poetry and dependencies
+        uses: ./.github/actions/bootstrap-poetry
+        with:
+          os: linux
+
+      - name: Install Linux prerequisites
+        run: poetry run ./scripts/install_linux_prereqs.sh
+
+      - name: Build
+        run: xvfb-run poetry run python scripts/build.py --os linux --version "$(date +'%Y.%m.%d')"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: ${{ github.workspace }}/dist/carveracontroller-community-*.appimage
+          retention-days: 14
