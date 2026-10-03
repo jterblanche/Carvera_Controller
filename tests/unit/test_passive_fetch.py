@@ -4,7 +4,11 @@ select itself, versus just showing progress until the machine goes idle."""
 
 from __future__ import annotations
 
-from carveracontroller.machine.passive_fetch import PassiveFetchTracker
+from carveracontroller.machine.passive_fetch import (
+    MAX_FETCH_ATTEMPTS,
+    RETRY_BACKOFF_S,
+    PassiveFetchTracker,
+)
 
 
 def test_nothing_pending_initially():
@@ -78,3 +82,65 @@ def test_a_newer_event_replaces_a_still_pending_older_one():
     t.note_published_file("/sd/first.nc")
     t.note_published_file("/sd/second.nc")
     assert t.due_fetch(is_idle=True) == "/sd/second.nc"
+
+
+def test_a_failed_fetch_is_not_retried_before_the_backoff_elapses():
+    t = PassiveFetchTracker()
+    t.note_published_file("/sd/job.nc")
+    assert t.due_fetch(is_idle=True, now=0.0) == "/sd/job.nc"
+    t.note_fetch_failed("/sd/job.nc", now=0.0)
+    # Still owed, but not yet -- too soon after the failure.
+    assert t.pending_path == "/sd/job.nc"
+    assert t.due_fetch(is_idle=True, now=1.0) is None
+    assert t.pending_path == "/sd/job.nc"  # not consumed by the refused check
+
+
+def test_a_failed_fetch_retries_once_the_backoff_elapses():
+    t = PassiveFetchTracker()
+    t.note_published_file("/sd/job.nc")
+    t.due_fetch(is_idle=True, now=0.0)
+    t.note_fetch_failed("/sd/job.nc", now=0.0)
+    assert t.due_fetch(is_idle=True, now=RETRY_BACKOFF_S) == "/sd/job.nc"
+
+
+def test_repeated_failures_of_the_same_path_eventually_give_up():
+    t = PassiveFetchTracker()
+    t.note_published_file("/sd/job.nc")
+    now = 0.0
+    for _ in range(MAX_FETCH_ATTEMPTS):
+        path = t.due_fetch(is_idle=True, now=now)
+        assert path == "/sd/job.nc"
+        t.note_fetch_failed("/sd/job.nc", now=now)
+        now += RETRY_BACKOFF_S
+    # Exhausted: no longer queued, and a further idle tick asks for nothing.
+    assert t.pending_path is None
+    assert t.due_fetch(is_idle=True, now=now) is None
+
+
+def test_a_fresh_publish_resets_the_attempt_count_after_giving_up():
+    t = PassiveFetchTracker()
+    t.note_published_file("/sd/job.nc")
+    now = 0.0
+    for _ in range(MAX_FETCH_ATTEMPTS):
+        t.due_fetch(is_idle=True, now=now)
+        t.note_fetch_failed("/sd/job.nc", now=now)
+        now += RETRY_BACKOFF_S
+    assert t.pending_path is None
+
+    # The machine announces it again (e.g. the job was restarted) -- this
+    # is a fresh ask and gets a fresh attempt budget, not an immediate
+    # second give-up.
+    t.note_published_file("/sd/job.nc")
+    assert t.due_fetch(is_idle=True, now=now) == "/sd/job.nc"
+
+
+def test_a_fetch_failure_does_not_mark_the_path_loaded():
+    """note_fetch_failed must never let a later note_published_file for the
+    same path be dropped as already-loaded -- that was the actual bug: the
+    old code called mark_loaded() even when the fetch failed."""
+    t = PassiveFetchTracker()
+    t.note_published_file("/sd/job.nc")
+    t.due_fetch(is_idle=True, now=0.0)
+    t.note_fetch_failed("/sd/job.nc", now=0.0)
+    t.note_published_file("/sd/job.nc")  # a later event re-announces it
+    assert t.due_fetch(is_idle=True, now=0.0) == "/sd/job.nc"
