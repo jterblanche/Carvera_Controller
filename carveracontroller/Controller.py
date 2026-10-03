@@ -20,6 +20,7 @@ from functools import partial
 
 from . import Utils
 from .CNC import CMDPAT, CNC, LASER_TOOL_NUMBER, PARENPAT, SEMIPAT, ZPROBE_TOOL_NUMBER
+from .machine.control_refusal import is_control_refusal
 from .machine.heartbeat import heartbeat_due
 from .machine.hello import HelloNegotiator, Resolution
 from .machine.identity import ControllerIdentity, default_name, generate_id
@@ -277,6 +278,12 @@ class Controller:
         self.loadERR = False
         self.loadCANCEL = False
         self.loadCANCELSENT = False
+        # Set instead of queuing into load_buffer when the firmware refused
+        # the in-flight ls/rm/mv/mkdir outright (see
+        # machine/control_refusal.py) -- the exact text parseLine already
+        # put on the console, kept here too so the UI can show it instead of
+        # a generic "Error loading ..." once loadERR ends the wait.
+        self.load_refused_reason = None
 
         self.sendNUM = 0
         self.sendEOF = False
@@ -2738,9 +2745,24 @@ class Controller:
         cleaned_line = re.sub(r"<.*?>", "", text).strip()
         if cleaned_line:
             for line2 in cleaned_line.replace("\r\n", "\n").split("\n"):
-                if line2:
-                    self.load_buffer.put(line2)
-                    self.load_buffer_size += len(line2) + 1
+                if not line2:
+                    continue
+                if is_control_refusal(line2):
+                    # The firmware refused this ls/rm/mv/mkdir outright
+                    # (ControlToken.cpp -- someone else has control, or
+                    # motion is in progress) and will send no listing data
+                    # at all. Show it the same way a refused "suspend" is
+                    # shown (parseLine's own "error" branch) instead of
+                    # queuing it into load_buffer as if it were directory
+                    # data, and end the wait now via loadERR rather than
+                    # waiting out SHORT_LOAD_TIMEOUT/WIFI_LOAD_TIMEOUT only
+                    # to show a generic "Error loading ..." with no reason.
+                    self.parseLine(line2)
+                    self.load_refused_reason = line2
+                    self.loadERR = True
+                    continue
+                self.load_buffer.put(line2)
+                self.load_buffer_size += len(line2) + 1
 
     def _advance_hello(self, now):
         """Called every streamIO tick. Sends hello the first time a frame is
