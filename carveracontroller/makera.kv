@@ -1256,10 +1256,9 @@
         text: tr._('Release Control')
         size_hint_y: None
         # Wraps within the button's own width instead of overflowing past
-        # the menu's edges (Jaun, step 26 of the 3 Oct motion session, on
-        # both the laptop and the demo): text_size caps the layout width
-        # Kivy wraps against, and the height formula grows to fit however
-        # many lines that produces, one line or two.
+        # the menu's edges: text_size caps the layout width Kivy wraps
+        # against, and the height formula grows to fit however many lines
+        # that produces, one line or two.
         text_size: self.width - dp(16), None
         halign: 'center'
         valign: 'middle'

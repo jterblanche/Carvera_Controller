@@ -2185,11 +2185,10 @@ class StatusDropDown(ToolTipDropDown):
 
     def set_connected_controllers(self, rows):
         """Rebuild the connected-controllers list as one row per
-        controller (see ConnectedControllerRow), rather than one shared,
-        wrapping multi-line label -- the previous layout let a long name's
-        wrapped second line be mistaken for another controller. Empty
-        `rows` leaves the container with no children, so nothing is shown,
-        same as before."""
+        controller (see ConnectedControllerRow): a wrapped second line on a
+        single shared label could be mistaken for another controller, so
+        each controller gets its own single-line row instead. Empty `rows`
+        leaves the container with no children, so nothing is shown."""
         container = self.connected_controllers_container
         container.clear_widgets()
         for row in rows:
