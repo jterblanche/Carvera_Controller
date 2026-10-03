@@ -114,7 +114,9 @@ class FakeMachine:
         # controller joining while someone already holds control passes
         # its own entries with has_control=True set.
         self.client_list_entries = (
-            client_list_entries if client_list_entries is not None else [(0xAAAABBBBCCCCDDDD, "Fake Machine Self", 0, False)]
+            client_list_entries
+            if client_list_entries is not None
+            else [(0xAAAABBBBCCCCDDDD, "Fake Machine Self", 0, False)]
         )
 
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -283,8 +285,11 @@ class FakeMachine:
             payload = bytes([len(entries)])
             for client_id, name, link, has_control in entries:
                 name_bytes = name if isinstance(name, bytes) else name.encode("utf-8")
-                payload += client_id.to_bytes(8, "big") + bytes([len(name_bytes)]) + name_bytes + bytes(
-                    [link, 1 if has_control else 0]
+                payload += (
+                    client_id.to_bytes(8, "big")
+                    + bytes([len(name_bytes)])
+                    + name_bytes
+                    + bytes([link, 1 if has_control else 0])
                 )
             self._send(conn, build_frame(PTYPE_CLIENT_LIST_REPLY, payload))
             return
