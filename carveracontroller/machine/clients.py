@@ -27,3 +27,39 @@ def rows_for_display(entries: tuple[ClientEntry, ...], own_id: int) -> tuple[Cli
     return tuple(
         ClientRow(name=entry.name, has_control=entry.has_control, is_self=entry.id == own_id) for entry in ordered
     )
+
+
+# A name this long, plus a status suffix, still fits one line of the status
+# drop-down's connected-controllers list without wrapping. A wrapped line
+# reads as a second controller (ticket #173), so a name over the limit is
+# ellipsised instead of left to wrap. Wire names can be up to 31 bytes
+# (protocols.handshake._MAX_NAME_BYTES); this is shorter than that on
+# purpose, to leave room for " (you)" / " — in control".
+MAX_DISPLAY_NAME_LEN = 20
+
+
+def truncate_name(name: str, max_len: int = MAX_DISPLAY_NAME_LEN) -> str:
+    """Shorten `name` to `max_len` characters, ellipsis instead of wrapping.
+    Names at or under the limit are returned unchanged."""
+    if len(name) <= max_len:
+        return name
+    return name[: max_len - 1] + "…"
+
+
+def row_display_text(
+    row: ClientRow,
+    *,
+    you_suffix: str,
+    control_suffix: str,
+    max_name_len: int = MAX_DISPLAY_NAME_LEN,
+) -> str:
+    """The single-line label for one connected-controllers row: the
+    (possibly truncated) name, then who is you and who has control. Kept
+    translation-agnostic -- callers pass already-translated suffixes -- so
+    this stays Kivy- and locale-free and testable on its own."""
+    text = truncate_name(row.name, max_name_len)
+    if row.is_self:
+        text += you_suffix
+    if row.has_control:
+        text += control_suffix
+    return text
