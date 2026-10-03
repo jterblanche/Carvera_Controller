@@ -1653,15 +1653,17 @@ def with_controller_name(text, name):
     return tr._("{text} — {name}").format(text=text, name=name)
 
 
-def tool_confirm_button_text(*, multi_user_mode, has_control, control_holder_id, control_holder_name):
+def tool_confirm_button_text(*, has_control, control_holder_id, control_holder_name):
     """The tool-change popup's Confirm button label. Unchanged ("Confirm")
-    while this controller holds control, in single-user mode, or in
-    multi-user mode while nobody holds control yet -- confirming there has
-    nothing to take. Otherwise (multi-user mode, another controller holds
-    control) pressing Confirm moves control here just like any other
-    user-caused command (Controller.update_control_holder), so the button
-    names the controller it would take control from."""
-    if has_control or not multi_user_mode or control_holder_id == 0:
+    while this controller holds control, or while nobody holds it --
+    confirming there has nothing to take. Otherwise, in either mode,
+    pressing Confirm moves control here just like any other user-caused
+    command (Controller.update_control_holder): acting on a controller
+    without control takes it in single-user mode too, and a single-user
+    controller is told who holds it the same as a multi-user one, so the
+    button names the controller it would take control from regardless of
+    mode."""
+    if has_control or control_holder_id == 0:
         return tr._("Confirm")
     name = control_holder_name or tr._("Another controller")
     return tr._("Confirm and take control from {name}").format(name=name)
@@ -5092,13 +5094,14 @@ class Makera(RelativeLayout):
                 + tr._("Then press ' Confirm' or main button to proceed")
             )
 
-        # Name this controller, and -- in multi-user mode, without control --
-        # say that confirming takes control from whoever holds it (found 3
-        # Oct 2026: two windows with the same popup and no way to tell which
-        # was which, or that confirming from the wrong one moves control).
+        # Name this controller, so two windows showing the same popup can be
+        # told apart, and -- without control, while someone else holds it --
+        # say that confirming takes control from them, since confirming
+        # from the wrong window would otherwise move control silently. This
+        # applies in single-user mode too: acting without control takes it
+        # there as well, and the holder is known there too.
         self.confirm_popup.lb_title.text = with_controller_name(self.confirm_popup.lb_title.text, self.identity.name)
         self.confirm_popup.confirm_text = tool_confirm_button_text(
-            multi_user_mode=self.controller.multi_user_mode,
             has_control=self.controller.has_control,
             control_holder_id=self.controller.control_holder_id,
             control_holder_name=self.controller.control_holder_name,
@@ -9864,7 +9867,7 @@ class MakeraApp(App):
         root = Makera(ctl_version=__version__)
         # Identity (and its name) is created in Makera.__init__, above, so
         # the title can show it from the first frame -- two windows on the
-        # same screen are otherwise identical (found 3 Oct 2026).
+        # same screen are otherwise identical.
         self.title = with_controller_name(tr._("Carvera Controller Community") + " v" + __version__, root.identity.name)
         return root
 

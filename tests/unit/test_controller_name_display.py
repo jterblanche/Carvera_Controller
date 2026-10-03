@@ -1,12 +1,16 @@
 """Two windows on the same screen -- this controller's own and a browser
 demo view, say -- can show the same tool-change popup with nothing to say
 which is which, or that confirming on the one without control takes it
-from the other (found 3 Oct 2026, the motion session). Covers the two
-places that now show this controller's own identity name:
+from the other. Covers the two places that now show this controller's own
+identity name:
 
   1. The window title.
   2. The tool-change popup's Confirm button, which names the controller
-     control would move from when pressing it would move control here.
+     control would move from when pressing it would move control here --
+     in single-user mode as well as multi-user mode: acting without
+     control takes it in single-user mode too, and a single-user
+     controller is told who holds it the same as a multi-user one, so the
+     relabel does not depend on the mode.
 """
 
 from unittest.mock import patch
@@ -50,7 +54,6 @@ def test_unchanged_when_name_is_none():
 
 def test_unchanged_while_this_controller_holds_control():
     text = tool_confirm_button_text(
-        multi_user_mode=True,
         has_control=True,
         control_holder_id=1,
         control_holder_name="Workshop Laptop",
@@ -58,21 +61,8 @@ def test_unchanged_while_this_controller_holds_control():
     assert text == "Confirm"
 
 
-def test_unchanged_in_single_user_mode_even_with_a_holder_named():
-    # Single-user mode has no notion of control to take; can_write_machine_settings
-    # treats it the same way.
+def test_unchanged_when_nobody_holds_control():
     text = tool_confirm_button_text(
-        multi_user_mode=False,
-        has_control=False,
-        control_holder_id=7,
-        control_holder_name="Workshop Laptop",
-    )
-    assert text == "Confirm"
-
-
-def test_unchanged_in_multi_user_mode_with_nobody_in_control():
-    text = tool_confirm_button_text(
-        multi_user_mode=True,
         has_control=False,
         control_holder_id=0,
         control_holder_name="",
@@ -82,7 +72,18 @@ def test_unchanged_in_multi_user_mode_with_nobody_in_control():
 
 def test_names_the_holder_in_multi_user_mode_without_control():
     text = tool_confirm_button_text(
-        multi_user_mode=True,
+        has_control=False,
+        control_holder_id=7,
+        control_holder_name="Workshop Laptop",
+    )
+    assert text == "Confirm and take control from Workshop Laptop"
+
+
+def test_names_the_holder_in_single_user_mode_without_control():
+    # Single-user mode has a holder too ("PC has control" shows there as
+    # well), and acting without control takes it there just the same --
+    # the relabel must not depend on multi_user_mode.
+    text = tool_confirm_button_text(
         has_control=False,
         control_holder_id=7,
         control_holder_name="Workshop Laptop",
@@ -92,7 +93,6 @@ def test_names_the_holder_in_multi_user_mode_without_control():
 
 def test_falls_back_to_another_controller_when_the_holder_has_no_name():
     text = tool_confirm_button_text(
-        multi_user_mode=True,
         has_control=False,
         control_holder_id=7,
         control_holder_name="",
