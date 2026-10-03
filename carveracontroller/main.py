@@ -14,6 +14,11 @@ MACHINE_CONFIG_FILES = {
 
 MAX_CONFIG_DOWNLOAD_ATTEMPTS = 3
 
+# How long apply_machine_setting_changes() waits for each config-set's
+# reply (Controller.set_config_value_and_wait) before treating it as a
+# failed write.
+CONFIG_SET_REPLY_TIMEOUT_S = 3.0
+
 # How many times check_model_metadata() will send "version" or "model" while
 # waiting for a first reply, before it gives up and stops asking. Two
 # callers share this same counter: the 10-second status timer
@@ -8734,13 +8739,72 @@ class Makera(RelativeLayout):
             self.apply_controller_setting_changes()
 
     def apply_machine_setting_changes(self):
-        for key in self.setting_change_list:
-            self.controller.setConfigValue(key, self.setting_change_list[key])
-            time.sleep(0.1)
+        """Send every pending machine setting as its own config-set and
+        confirm it actually reached the card before telling the user it
+        was applied: a refusal because another controller holds control,
+        or a dropped link, must not look like success.
+
+        Runs the sends on a worker thread (_apply_machine_setting_changes_worker)
+        since confirming a write can take up to CONFIG_SET_REPLY_TIMEOUT_S per
+        key -- this is called directly from the Apply button's UI handler, so
+        doing that on the calling (Kivy main) thread would freeze the window
+        for the whole wait.
+        """
+        pending = dict(self.setting_change_list)
         self.setting_change_list.clear()
         self.config_popup.btn_apply.disabled = True
-        self.message_popup.lb_content.text = tr._("Settings applied, need machine reset to take effect !")
+        threading.Thread(
+            target=self._apply_machine_setting_changes_worker,
+            args=(pending,),
+            daemon=True,
+        ).start()
+
+    def _apply_machine_setting_changes_worker(self, pending):
+        """Off the Kivy main thread (see apply_machine_setting_changes):
+        send each key and wait for its own reply before sending the next,
+        then hand the result back to the main thread via Clock.schedule_once
+        -- nothing here touches a widget or a popup directly."""
+        failures = []
+        for key, value in pending.items():
+            success, message = self.controller.set_config_value_and_wait(key, value, timeout=CONFIG_SET_REPLY_TIMEOUT_S)
+            if not success:
+                failures.append((key, message))
+        Clock.schedule_once(partial(self._finish_apply_machine_setting_changes, pending, failures), 0)
+
+    def _finish_apply_machine_setting_changes(self, pending, failures, *_args):
+        """Runs on the Kivy main thread, scheduled by the worker above.
+        Reports success only when every key was acknowledged. On any
+        failure: name the failed settings and the firmware's reason (or
+        the timeout), revert just those widgets to their pre-Apply value --
+        the card's own value, since that write never landed -- and leave
+        the snapshot for keys that did succeed pointing at their new,
+        now-applied value, so a later Apply does not treat them as still
+        pending. Either way, re-read config.txt afterwards
+        (download_config_file, the same path the settings page uses to
+        load it) so the page reflects whatever is actually on the card
+        rather than what this attempt assumed."""
+        failed_keys = {key for key, _reason in failures}
+        for widget in self.config_popup._all_setting_items():
+            if widget.key not in pending:
+                continue
+            if widget.key in failed_keys:
+                original = self.config_popup.get_original(widget.section, widget.key)
+                if original is not None:
+                    widget.value = original
+            else:
+                # Succeeded: the card now holds this value, so the
+                # snapshot must too, or the next Apply would see a change
+                # that was already applied and resend it.
+                self.config_popup._widget_snapshot[(widget.section, widget.key)] = widget.value
+        if failures:
+            reasons = "\n".join(f"{key}: {reason}" for key, reason in failures)
+            self.message_popup.lb_content.text = tr._(
+                "Could not apply the following settings; reverted to the current value:\n{reasons}"
+            ).format(reasons=reasons)
+        else:
+            self.message_popup.lb_content.text = tr._("Settings applied, need machine reset to take effect !")
         self.message_popup.open()
+        self.download_config_file()
 
     def apply_controller_setting_changes(self):
         if self.controller_setting_change_list.get("ui_density_override") or self.controller_setting_change_list.get(

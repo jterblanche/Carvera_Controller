@@ -76,6 +76,10 @@ TLOPAT = re.compile(r"^\[(...):([+\-]?\d*\.\d*)\]$")
 DOLLARPAT = re.compile(r"^\[G\d* .*\]$")
 SPLITPAT = re.compile(r"[:,]")
 VARPAT = re.compile(r"^\$(\d+)=(\d*\.?\d*) *\(?.*")
+# Configurator::config_set_command's success line ("%s: %s has been set to
+# %s", e.g. "sd: multi_client.mode has been set to single_user"). See
+# set_config_value_and_wait/_check_config_reply.
+CONFIG_SET_OK_PAT = re.compile(r"^(\S+): (\S+) has been set to (.*)$")
 
 
 WIKI = "https://github.com/vlachoudis/bCNC/wiki"
@@ -296,6 +300,16 @@ class Controller:
         self._stop = False  # Raise to stop current run
         self._pause = False  # machine is on Hold
         self._alarm = True  # Display alarm message if true
+
+        # Set by set_config_value_and_wait() while it is waiting for one
+        # config-set reply; cleared again once that wait ends either way.
+        # parseLine checks this on every incoming line (_check_config_reply)
+        # to resolve the wait -- config-set replies carry no request id, so
+        # the next matching line while one is outstanding is taken to be
+        # this one's.
+        self._awaiting_config_key = None
+        self._config_reply_event = threading.Event()
+        self._config_reply_result = None  # (success, message) once resolved
 
         self._baud_upgrade_attempted = False
         self._baud_switch_in_progress = False
@@ -915,6 +929,54 @@ class Controller:
     def setConfigValue(self, key, value):
         if key and value:
             self.executeCommand("config-set sd %s %s\n" % (key, value))
+
+    def set_config_value_and_wait(self, key, value, timeout=3.0):
+        """Send config-set for key/value and block the calling thread for
+        up to timeout seconds until the firmware's reply is seen -- never
+        call this from the Kivy main thread, since a refusal or a slow
+        link can make it wait the whole timeout.
+
+        Returns (success, message). success is True only for the
+        firmware's own "<key> has been set to <value>" line (Configurator::
+        config_set_command); False for any error: line -- including the
+        control refusal "error:Refused -- <holder> has control" -- any
+        other config-set outcome line (not enough space, bad source), or a
+        timeout with no reply at all. See _check_config_reply, which
+        resolves this from parseLine on the reading thread.
+        """
+        if not key or not value:
+            return False, "missing key or value"
+        self._config_reply_event.clear()
+        self._config_reply_result = None
+        self._awaiting_config_key = key
+        try:
+            self.setConfigValue(key, value)
+            if not self._config_reply_event.wait(timeout):
+                return False, "no reply from the machine within %gs" % timeout
+            return self._config_reply_result
+        finally:
+            self._awaiting_config_key = None
+
+    def _check_config_reply(self, line):
+        """Resolve a set_config_value_and_wait() in progress, if any, from
+        a line just received on the reading thread. A config-set reply
+        matches no special prefix parseLine otherwise looks for, so this
+        runs ahead of that dispatch and only has a side effect (waking the
+        waiting thread) -- the line still flows through parseLine
+        afterwards exactly as before."""
+        key = self._awaiting_config_key
+        if key is None:
+            return
+        text = line.rstrip("\r\n")
+        match = CONFIG_SET_OK_PAT.match(text)
+        if match:
+            if match.group(2) == key:
+                self._config_reply_result = (True, text)
+                self._config_reply_event.set()
+            return
+        if text.lower().startswith("error") or text.startswith("sd"):
+            self._config_reply_result = (False, text)
+            self._config_reply_event.set()
 
     def dropToolCommand(self):
         self.executeCommand("M6T-1\n")
@@ -2601,6 +2663,7 @@ class Controller:
         if not line:
             return True
         try:
+            self._check_config_reply(line)
             if line[0] == "<":
                 self.parseBracketAngle(line)
                 self.sio_status = False
