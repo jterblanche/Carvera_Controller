@@ -251,7 +251,9 @@ def test_client_list_requested_and_stored_after_identify(machine, controller):
     assert m.wait_until(lambda: len(controller.connected_clients) == 1, timeout=2.0)
     entry = controller.connected_clients[0]
     assert entry.name == "Fake Machine Self"
-    assert entry.has_control is True
+    # FakeMachine's default roster holds no control -- the usual starting
+    # point every other test here assumes (see FakeMachine.client_list_entries).
+    assert entry.has_control is False
 
 
 def test_smoothie_link_never_sends_hello_and_never_gates_sends(machine, controller):

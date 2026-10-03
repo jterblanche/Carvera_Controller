@@ -27,3 +27,15 @@ def rows_for_display(entries: tuple[ClientEntry, ...], own_id: int) -> tuple[Cli
     return tuple(
         ClientRow(name=entry.name, has_control=entry.has_control, is_self=entry.id == own_id) for entry in ordered
     )
+
+
+def holder_from_client_list(entries: tuple[ClientEntry, ...]) -> tuple[int, str]:
+    """Who the client list says holds control right now: the id and name of
+    the one entry whose ``has_control`` is true, or ``(0, "")`` -- the
+    machine's own "nobody holds control" encoding -- when no entry has it
+    true, including an empty list and old firmware's client-list reply,
+    which never sets the field at all."""
+    for entry in entries:
+        if entry.has_control:
+            return entry.id, entry.name
+    return 0, ""

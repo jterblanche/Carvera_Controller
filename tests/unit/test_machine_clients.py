@@ -1,4 +1,4 @@
-from carveracontroller.machine.clients import ClientRow, rows_for_display
+from carveracontroller.machine.clients import ClientRow, holder_from_client_list, rows_for_display
 from carveracontroller.protocols.handshake import ClientEntry
 
 SELF_ID = 1
@@ -30,3 +30,30 @@ def test_rows_for_display_marks_self():
 
 def test_rows_for_display_empty():
     assert rows_for_display((), own_id=SELF_ID) == ()
+
+
+def test_holder_from_client_list_names_the_entry_that_has_control():
+    assert holder_from_client_list(_entries()) == (SELF_ID, "Office PC")
+
+
+def test_holder_from_client_list_names_someone_else():
+    entries = (
+        ClientEntry(id=OTHER_ID, name="Workshop Laptop", link=0, has_control=True),
+        ClientEntry(id=SELF_ID, name="Office PC", link=0, has_control=False),
+    )
+    assert holder_from_client_list(entries) == (OTHER_ID, "Workshop Laptop")
+
+
+def test_holder_from_client_list_is_nobody_when_no_entry_has_control():
+    entries = (
+        ClientEntry(id=OTHER_ID, name="Workshop Laptop", link=0, has_control=False),
+        ClientEntry(id=SELF_ID, name="Office PC", link=0, has_control=False),
+    )
+    assert holder_from_client_list(entries) == (0, "")
+
+
+def test_holder_from_client_list_is_nobody_for_an_empty_list():
+    # Also covers old firmware's client-list reply, which never sets
+    # has_control true for anyone -- indistinguishable from "nobody holds
+    # it" and from an empty list.
+    assert holder_from_client_list(()) == (0, "")
