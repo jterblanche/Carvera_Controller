@@ -6083,8 +6083,23 @@ class Makera(RelativeLayout):
         self.controller.loadNUM = LOAD_DIR
         self.controller.loadEOF = False
         self.controller.loadERR = False
+        # A refusal left over from a previous, different load command (e.g.
+        # a refused delete) must never be read as this ls's own outcome.
+        self.controller.load_refused_reason = None
         self.short_load_time = time.time()
         self.controller.lsCommand(os.path.normpath(ls_dir))
+
+    def _consume_load_refusal(self):
+        """True, and clears the flag, when the load command that just ended
+        was refused by the firmware's control token (ControlToken.cpp)
+        rather than failing or timing out. The refusal's own text -- naming
+        whoever has control -- already reached the console through
+        Controller.parseLine, the same way a refused "suspend" is shown, so
+        showing it again here as a generic "Error loading ..." popup would
+        just be a second, less specific message for the same event."""
+        refused = self.controller.load_refused_reason is not None
+        self.controller.load_refused_reason = None
+        return refused
 
     def _finish_machine_ls(self, now):
         with self._machine_ls_lock:
@@ -6094,7 +6109,10 @@ class Makera(RelativeLayout):
             superseded = machine_ls_is_superseded(sent_path, wanted_path)
             if not superseded:
                 if self.controller.loadERR:
-                    Clock.schedule_once(partial(self.loadError, tr._("Error loading dir") + " '%s'!" % (sent_path,)), 0)
+                    if not self._consume_load_refusal():
+                        Clock.schedule_once(
+                            partial(self.loadError, tr._("Error loading dir") + " '%s'!" % (sent_path,)), 0
+                        )
                 elif timed_out:
                     Clock.schedule_once(
                         partial(self.loadError, tr._("Timeout loading dir") + " '%s'!" % (sent_path,)), 0

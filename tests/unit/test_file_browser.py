@@ -343,6 +343,50 @@ def test_extra_worker_does_not_override_ui_wanted_path(monkeypatch):
     assert root._machine_ls_sent_path == "/sd/gcodes/jobs"
 
 
+def test_finish_machine_ls_skips_the_generic_popup_for_a_refusal(monkeypatch):
+    """A refusal (Controller._handle_protocol_message, control_refusal.py)
+    already showed the firmware's own reason on the console (the same way
+    a refused "suspend" is shown) before loadERR ever became True here, so
+    the generic "Error loading dir" popup would just be a second, less
+    specific message for the same event."""
+    root = _machine_ls_host()
+    scheduled = []
+    processed = []
+    monkeypatch.setattr("carveracontroller.main.SHORT_LOAD_TIMEOUT", 3, raising=False)
+    monkeypatch.setattr("carveracontroller.main.Clock.schedule_once", lambda cb, t: scheduled.append(cb))
+    monkeypatch.setattr("carveracontroller.main.threading.Thread", _ImmediateThread)
+    root.process_loaded_dir = lambda path=None: processed.append(path)
+    Makera.request_machine_ls(root, "/sd/gcodes")
+    assert root.controller.load_refused_reason is None  # reset by _start_machine_ls
+
+    root.controller.loadERR = True
+    root.controller.load_refused_reason = "error:Refused -- PC has control"
+    Makera._finish_machine_ls(root, root.short_load_time + 0.1)
+
+    assert scheduled == []
+    assert root.controller.load_refused_reason is None  # consumed
+    assert root.controller.loadNUM == 0
+    assert processed == ["/sd/gcodes"]
+
+
+def test_finish_machine_ls_still_shows_the_generic_popup_for_a_real_error(monkeypatch):
+    """loadERR without a captured refusal reason (a different kind of
+    failure) must still show the existing generic message -- only a known
+    refusal suppresses it."""
+    root = _machine_ls_host()
+    scheduled = []
+    monkeypatch.setattr("carveracontroller.main.SHORT_LOAD_TIMEOUT", 3, raising=False)
+    monkeypatch.setattr("carveracontroller.main.Clock.schedule_once", lambda cb, t: scheduled.append(cb))
+    monkeypatch.setattr("carveracontroller.main.threading.Thread", _ImmediateThread)
+    root.process_loaded_dir = lambda path=None: None
+    Makera.request_machine_ls(root, "/sd/gcodes")
+
+    root.controller.loadERR = True
+    Makera._finish_machine_ls(root, root.short_load_time + 0.1)
+
+    assert len(scheduled) == 1
+
+
 def test_fill_remote_dir_callback_only_runs_for_scoped_path(monkeypatch):
     root = _machine_ls_host()
     called = []
