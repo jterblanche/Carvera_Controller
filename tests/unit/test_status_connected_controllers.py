@@ -1,6 +1,6 @@
 """The status drop-down's connected-controllers rows and the Release
-Control wrap (ticket #173: the list was hard to read, and "Release
-Control" overflowed the menu on both the laptop and the demo).
+Control wrap: the list was hard to read, and "Release Control"
+overflowed the menu on both the laptop and the demo.
 
 Most of this file tests pure logic (StatusDropDown.set_connected_controllers
 building one widget per controller, with the right text and colour) on a

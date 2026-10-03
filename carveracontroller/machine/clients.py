@@ -31,7 +31,7 @@ def rows_for_display(entries: tuple[ClientEntry, ...], own_id: int) -> tuple[Cli
 
 # A name this long, plus a status suffix, still fits one line of the status
 # drop-down's connected-controllers list without wrapping. A wrapped line
-# reads as a second controller (ticket #173), so a name over the limit is
+# reads as a second controller, so a name over the limit is
 # ellipsised instead of left to wrap. Wire names can be up to 31 bytes
 # (protocols.handshake._MAX_NAME_BYTES); this is shorter than that on
 # purpose, to leave room for " (you)" / " — in control".

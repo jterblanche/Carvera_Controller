@@ -2165,7 +2165,7 @@ class FuncDropDown(ToolTipDropDown):
 class ConnectedControllerRow(Label):
     """One row in the status drop-down's connected-controllers list: a
     single, legible line that never wraps -- a wrapped line reads as a
-    second controller (ticket #173). The name is already truncated with an
+    second controller. The name is already truncated with an
     ellipsis by machine.clients.row_display_text before it gets here, and
     `has_control` only changes this row's colour, so "you" and "in control"
     stay readable at a glance without the row growing a second line."""

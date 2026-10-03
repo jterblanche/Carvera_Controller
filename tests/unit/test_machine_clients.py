@@ -32,9 +32,9 @@ def test_rows_for_display_empty():
     assert rows_for_display((), own_id=SELF_ID) == ()
 
 
-# -- truncate_name / row_display_text: the status drop-down's rows (ticket
-# #173) -- a wrapped second line reads as a separate controller, so a long
-# name is ellipsised to one line instead.
+# -- truncate_name / row_display_text: the status drop-down's rows -- a
+# wrapped second line reads as a separate controller, so a long name is
+# ellipsised to one line instead.
 
 
 def test_truncate_name_leaves_short_names_untouched():
