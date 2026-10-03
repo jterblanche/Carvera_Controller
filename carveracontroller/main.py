@@ -343,7 +343,7 @@ from .GcodeViewer import (
     VISIBILITY_MAX_TOOLS,
     GCodeViewer,
 )
-from .machine.clients import rows_for_display
+from .machine.clients import row_display_text, rows_for_display
 from .machine.identity import load_or_create_identity, set_name
 from .machine.passive_fetch import PassiveFetchTracker
 from .ui import widget_helpers
@@ -2162,32 +2162,43 @@ class FuncDropDown(ToolTipDropDown):
     pass
 
 
-class StatusDropDown(ToolTipDropDown):
-    # A simple "who else is connected" list, one line per row, newest data
-    # from the last client-list reply. Empty when there is nothing to show
-    # (not connected, or no reply received yet).
-    connected_controllers_text = StringProperty("")
+class ConnectedControllerRow(Label):
+    """One row in the status drop-down's connected-controllers list: a
+    single, legible line that never wraps -- a wrapped line reads as a
+    second controller (ticket #173). The name is already truncated with an
+    ellipsis by machine.clients.row_display_text before it gets here, and
+    `has_control` only changes this row's colour, so "you" and "in control"
+    stay readable at a glance without the row growing a second line."""
 
+    has_control = BooleanProperty(False)
+
+
+class StatusDropDown(ToolTipDropDown):
     # Whether releasing control right now would do anything -- pushed from
-    # Makera.update_control_holder, the same way connected_controllers_text
-    # is pushed from set_connected_controllers below, rather than bound live
-    # to app.root: this widget is built before app.root is assigned, so a
-    # live `app.root.can_release_control` binding fails at kv-parse time.
+    # Makera.update_control_holder, rather than bound live to app.root: this
+    # widget is built before app.root is assigned, so a live
+    # `app.root.can_release_control` binding fails at kv-parse time.
     can_release_control = BooleanProperty(False)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
     def set_connected_controllers(self, rows):
-        lines = []
+        """Rebuild the connected-controllers list as one row per
+        controller (see ConnectedControllerRow), rather than one shared,
+        wrapping multi-line label -- the previous layout let a long name's
+        wrapped second line be mistaken for another controller. Empty
+        `rows` leaves the container with no children, so nothing is shown,
+        same as before."""
+        container = self.connected_controllers_container
+        container.clear_widgets()
         for row in rows:
-            label = row.name
-            if row.is_self:
-                label += tr._(" (you)")
-            if row.has_control:
-                label += tr._(" — in control")
-            lines.append(label)
-        self.connected_controllers_text = "\n".join(lines)
+            text = row_display_text(
+                row,
+                you_suffix=tr._(" (you)"),
+                control_suffix=tr._(" — in control"),
+            )
+            container.add_widget(ConnectedControllerRow(text=text, has_control=row.has_control))
 
 
 class ComPortsDropDown(ToolTipDropDown):
