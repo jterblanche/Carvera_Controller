@@ -293,6 +293,23 @@ def test_published_line_reassembled_across_more_fragments():
     assert msgs[0].text == "hello world"
 
 
+def test_session_normalizes_published_reply_without_losing_source():
+    """A reply (unlike a command echo) always ends in CRLF, so
+    ProtocolSession's trailing CR/LF trim is the common case for a
+    PUBLISHED_LINE, not an edge case -- it must not drop source_id/
+    source_name along with the line ending."""
+    session = ProtocolSession()
+    session.select("makera")
+    payload = _published_line_payload(0x0102030405060708, b"Shop PC", b"ok C: X:0\r\n")
+    msgs = session.feed(build_frame(PTYPE_PUBLISHED_LINE, payload))
+
+    assert len(msgs) == 1
+    assert msgs[0].kind == MessageKind.PUBLISHED_LINE
+    assert msgs[0].text == "ok C: X:0"
+    assert msgs[0].source_id == 0x0102030405060708
+    assert msgs[0].source_name == "Shop PC"
+
+
 def test_published_line_reset_discards_a_partial_fragment():
     proto = MakeraProtocol()
     first = _published_line_payload(1, b"Shop PC", b"partial", more=True)
