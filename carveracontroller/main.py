@@ -5648,7 +5648,7 @@ class Makera(RelativeLayout):
         thread, so it -- and the thumbnail ingest alongside it -- are
         scheduled here rather than called inline from doDownload."""
         # Decompress QuickLZ in place first; ingesting the compressed
-        # payload would cache a false "no preview" hit.
+        # payload would wrongly cache this file as having no thumbnail.
         self.load_gcode_file(local_path)
         self._ingest_machine_gcode_thumbnail(remote_path, local_path)
 
