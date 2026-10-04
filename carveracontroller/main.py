@@ -5167,6 +5167,12 @@ class Makera(RelativeLayout):
         app = App.get_running_app()
         app.selected_local_filename = local_cached_file_path
         app.selected_remote_filename = remote_path
+        # The operator just opened this by hand -- the passive-fetch tracker
+        # (machine/passive_fetch.py) must agree this file is the one on
+        # screen, or a later play-started event for it gets wrongly
+        # dropped as "already loaded" against whatever this controller
+        # last auto-fetched instead (see on_passive_file_published()).
+        self._passive_fetch.mark_loaded(remote_path)
 
         Clock.schedule_once(partial(self._select_file_ui_update, remote_path, local_cached_file_path), 0)
 
@@ -6457,10 +6463,24 @@ class Makera(RelativeLayout):
         catalogue). Queues the path and checks immediately in case the
         machine is already idle (the common upload-finished case); if not,
         updateStatus()'s own idle check catches it once the job finishes.
+
+        Dispatched via Clock.schedule_once by the caller (Controller.py's
+        _notify_file_published), so this already runs on the main thread --
+        safe to touch app.selected_* directly, unlike _auto_fetch_played_file.
+        If `path` is not what is currently on screen, that drawing cannot be
+        this job's: blank the selection (the same "nothing selected" state
+        cancelSelectFile() uses) so updateStatus()'s progress/position
+        plotting -- gated on selected_remote_filename/selected_local_filename
+        being non-blank -- stops drawing the old file's geometry under the
+        new job's line numbers. The fetch below redraws the right file once
+        it lands.
         """
         app = App.get_running_app()
         if app is None or self.controller.has_control:
             return
+        if path and path != app.selected_remote_filename:
+            app.selected_remote_filename = ""
+            app.selected_local_filename = ""
         self._passive_fetch.note_published_file(path)
         self._check_passive_fetch(app.state == "Idle")
 
@@ -6472,7 +6492,7 @@ class Makera(RelativeLayout):
         playing (see machine/passive_fetch.py)."""
         if self._auto_fetch_in_progress:
             return
-        path = self._passive_fetch.due_fetch(is_idle)
+        path = self._passive_fetch.due_fetch(is_idle, now=time.monotonic())
         if path is None:
             return
         self._auto_fetch_in_progress = True
@@ -6484,25 +6504,73 @@ class Makera(RelativeLayout):
         fetch already use. automatic=True routes the download command
         through the automatic-command wrapper (0x6B) so it is never
         mistaken for a user action and never takes control on this
-        controller's behalf; open_after=True parses and draws it exactly
-        like opening a file locally. Runs on its own thread: doDownload
-        blocks until the transfer finishes, and this must not stall the
-        Kivy clock or the status-polling loop that called it.
+        controller's behalf. open_after=False keeps the transfer itself
+        Kivy-free: doDownload's open_after=True branch calls
+        load_gcode_file() -- which draws the toolpath -- straight from
+        whatever thread called it, and the file browser (upstream
+        4cd0dcc/0d95a6a) redraws from selected_remote_filename's change,
+        so setting that property here used to crash off the main Kivy
+        thread ("Cannot change graphics instruction outside the main Kivy
+        thread"). Runs on its own thread (started by _check_passive_fetch):
+        doDownload blocks until the transfer finishes, and this must not
+        stall the Kivy clock or the status-polling loop that called it.
+
+        Everything that touches Kivy -- the selected-file properties and
+        loading the toolpath -- is handed to the main thread via
+        Clock.schedule_once in _finish_auto_fetch_played_file, and only
+        once the download has actually succeeded. mark_loaded is called
+        from there too: a failed download instead calls
+        note_fetch_failed(), which re-queues the path for a later idle
+        status tick -- backed off (machine/passive_fetch.py's
+        RETRY_BACKOFF_S) and capped (MAX_FETCH_ATTEMPTS) so a file that
+        keeps failing is not retried on every tick forever.
+        """
+        local_path = os.path.join(self.temp_dir, os.path.basename(remote_path))
+        try:
+            download_result = self.doDownload(
+                remote_path, local_path, show_progress=False, open_after=False, automatic=True
+            )
+        except Exception:
+            logger.exception("Passive auto-fetch of %s raised during download", remote_path)
+            download_result = None
+        if download_result is None or download_result < 0:
+            logger.warning(
+                "Passive auto-fetch of %s did not complete (doDownload returned %r); "
+                "retrying on a later idle status or file event",
+                remote_path,
+                download_result,
+            )
+            self._passive_fetch.note_fetch_failed(remote_path, time.monotonic())
+            self._auto_fetch_in_progress = False
+            return
+        Clock.schedule_once(partial(self._finish_auto_fetch_played_file, remote_path, local_path))
+
+    def _finish_auto_fetch_played_file(self, remote_path, local_path, *_args):
+        """Main-thread completion of _auto_fetch_played_file, scheduled
+        only after the download succeeded. Sets the selected file (matches
+        what a manual download/play sets, see check_and_download(), so the
+        rest of the UI -- the progress bar's filename, "recent files" --
+        reflects this file the same way it would if the operator had
+        opened it) and draws the toolpath via load_gcode_file() -- both
+        require the main Kivy thread, see _auto_fetch_played_file. Marks
+        the tracker loaded only once this has actually happened; an
+        exception here (e.g. a corrupt file) counts as a failed attempt
+        (note_fetch_failed) instead, the same recovery as a download
+        failure.
         """
         try:
-            local_path = os.path.join(self.temp_dir, os.path.basename(remote_path))
             app = App.get_running_app()
             if app is not None:
-                # Matches what a manual download/play sets (see
-                # check_and_download()) so the rest of the UI -- the
-                # progress bar's filename, "recent files" -- reflects this
-                # file the same way it would if the operator had opened it.
                 app.selected_remote_filename = remote_path
                 app.selected_local_filename = local_path
-            self.doDownload(remote_path, local_path, show_progress=False, open_after=True, automatic=True)
+            self.load_gcode_file(local_path)
+        except Exception:
+            logger.exception("Passive auto-fetch of %s failed to load after download", remote_path)
+            self._passive_fetch.note_fetch_failed(remote_path, time.monotonic())
+            return
         finally:
-            self._passive_fetch.mark_loaded(remote_path)
             self._auto_fetch_in_progress = False
+        self._passive_fetch.mark_loaded(remote_path)
 
     def show_usb_reset_blocked_popup(self, *args):
         content = BoxLayout(orientation="vertical", padding=dp(15))
