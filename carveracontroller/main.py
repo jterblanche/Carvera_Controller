@@ -5647,6 +5647,8 @@ class Makera(RelativeLayout):
         load_gcode_file() draws the toolpath and must run on the main Kivy
         thread, so it -- and the thumbnail ingest alongside it -- are
         scheduled here rather than called inline from doDownload."""
+        # Decompress QuickLZ in place first; ingesting the compressed
+        # payload would cache a false "no preview" hit.
         self.load_gcode_file(local_path)
         self._ingest_machine_gcode_thumbnail(remote_path, local_path)
 
@@ -5794,8 +5796,7 @@ class Makera(RelativeLayout):
                 # open_after=True (check_and_download) run it on a worker
                 # thread, so the load (and the thumbnail ingest alongside
                 # it) is deferred via Clock.schedule_once rather than run
-                # inline here -- the same fault #177 fixed for the passive
-                # auto-fetch.
+                # inline here.
                 Clock.schedule_once(partial(self._finish_downloaded_file_open, remote_path, local_path))
             else:
                 if self._decompress_downloaded_file_in_place(local_path):

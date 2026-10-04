@@ -524,9 +524,9 @@ def test_manual_download_defers_toolpath_load_to_main_thread(monkeypatch, tmp_pa
     """check_and_download() (the file browser's manual download-and-open)
     starts doDownload() on a worker thread with the default open_after=True.
     That branch used to call load_gcode_file() -- which draws the toolpath --
-    straight from that worker thread, the same fault #177 fixed for the
-    passive auto-fetch. load_gcode_file and the thumbnail ingest must
-    instead be deferred to the main thread via Clock.schedule_once."""
+    straight from that worker thread. load_gcode_file and the thumbnail
+    ingest must instead be deferred to the main thread via
+    Clock.schedule_once."""
     root = _download_host(tmp_path, downloading_config=False)
     root.controller.stream.download.side_effect = _complete_download
     monkeypatch.setattr("carveracontroller.main.App.get_running_app", lambda: None)
