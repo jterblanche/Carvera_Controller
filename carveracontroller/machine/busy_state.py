@@ -5,8 +5,8 @@ Status reports carry the machine's state as their leading word
 (``Controller.parseBracketAngle``: ``CNC.vars["state"] = l[0]``), mirrored
 onto the running app as ``MakeraApp.state`` (see ``main.py``'s
 ``update_jog_controls_enabled`` for another consumer of that same
-property). Firmware's config-write gate (``ConfigWriteGate``, fork PR #33)
-refuses ``config-set``/``-delete``/``-load``/``-restore``/``-default``
+property). Firmware's own config-write gate (``ConfigWriteGate``) refuses
+``config-set``/``-delete``/``-load``/``-restore``/``-default``
 whenever ``Kernel::get_state()`` is anything other than Idle, Alarm or
 Sleep -- Idle and Sleep because nothing is moving, Alarm too so a setting
 that caused the alarm can still be corrected. This module mirrors that

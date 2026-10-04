@@ -19,11 +19,11 @@ updates the button and reason without the page having been reopened --
 the same thing app.bind(state=...) does for a running app (see
 Makera._bind_settings_busy_gate).
 
-Firmware without the busy gate (#202 not merged, or a race) is unaffected:
-these paths depend only on app.state, never on a reply, and set_config_
-value_and_wait already treats any "error:" reply as failure regardless of
-its text -- test_failure_on_the_busy_refusal pins that for the exact text
-the gate sends.
+Firmware without a matching busy gate (not merged, or a race) is
+unaffected: these paths depend only on app.state, never on a reply, and
+set_config_value_and_wait already treats any "error:" reply as failure
+regardless of its text -- test_failure_on_the_busy_refusal pins that for
+the exact text the gate sends.
 """
 
 from types import SimpleNamespace
@@ -246,7 +246,7 @@ def _wait_identified(machine_, controller_, timeout=2.0):
 
 
 def test_failure_on_the_busy_refusal(machine, controller):
-    """ConfigWriteGate's exact reply text (fork PR #33) must not be
+    """ConfigWriteGate's exact reply text must not be
     mistaken for success -- set_config_value_and_wait already treats any
     "error:" line as a failure, regardless of its wording, so this pins
     that it also catches this specific message."""

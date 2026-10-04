@@ -32,7 +32,7 @@ def test_handles_empty_or_none_input():
 
 
 def test_recognises_the_busy_refusal():
-    # Firmware's config-write gate (fork PR #33) refuses config-set,
+    # Firmware's own config-write gate refuses config-set,
     # config-restore and config-default the same way: an "error:Refused"
     # line. Nothing here needs to be busy-specific -- the generic
     # "error:Refused" shape this module already matches covers it.
