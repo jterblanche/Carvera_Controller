@@ -1175,6 +1175,14 @@
     btn_connect_network: btn_connect_network
     btn_unlock: btn_unlock
     btn_disconnect: btn_disconnect
+    btn_release_control: btn_release_control
+    connected_controllers_container: connected_controllers_container
+    # Wide enough for a 20-character (truncated) controller name plus
+    # " (you) — in control", and for "Release Control" on one line at this
+    # width -- it still wraps (see btn_release_control below) if a
+    # translation or a future label makes it longer anyway.
+    auto_width: False
+    width: dp(260)
     canvas.before:
         Color:
             rgba: 60/255, 60/255, 60/255, 1
@@ -1247,23 +1255,38 @@
         id: btn_release_control
         text: tr._('Release Control')
         size_hint_y: None
-        height: '40dp' if root.can_release_control else 0
+        # Wraps within the button's own width instead of overflowing past
+        # the menu's edges: text_size caps the layout width Kivy wraps
+        # against, and the height formula grows to fit however many lines
+        # that produces, one line or two.
+        text_size: self.width - dp(16), None
+        halign: 'center'
+        valign: 'middle'
+        height: (self.texture_size[1] + dp(16)) if root.can_release_control else 0
         opacity: 1 if root.can_release_control else 0
         disabled: not root.can_release_control
         on_release:
             app.root.open_release_control_confirm_popup()
             root.select('')
-    Label:
-        id: lbl_connected_controllers
-        text: root.connected_controllers_text
+    BoxLayout:
+        id: connected_controllers_container
+        orientation: 'vertical'
         size_hint_y: None
-        height: self.texture_size[1] + dp(10) if root.connected_controllers_text else 0
-        opacity: 1 if root.connected_controllers_text else 0
-        color: 170/255, 170/255, 170/255, 1
-        font_size: '12sp'
-        text_size: self.width, None
-        halign: 'left'
-        padding: dp(6), dp(4)
+        height: self.minimum_height
+
+<ConnectedControllerRow>:
+    size_hint_y: None
+    height: dp(26)
+    font_size: '13sp'
+    halign: 'left'
+    valign: 'middle'
+    shorten: False
+    text_size: self.width - dp(12), None
+    padding: dp(6), 0
+    # In control reads brighter than a merely-connected row, on top of the
+    # " (you)" / " — in control" text itself, so who holds control and who
+    # is this controller are both easy to tell apart at a glance.
+    color: (1, 1, 1, 1) if root.has_control else (170/255, 170/255, 170/255, 1)
 
 <ComPortsDropDown>:
 
