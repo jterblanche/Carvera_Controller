@@ -245,6 +245,12 @@ class Controller:
         # but it is kept here too so it can be asserted directly in a test
         # that has no Kivy app running. Reset to "" on every (re)connect.
         self.last_published_file_path: str = ""
+        # The checksum carried by that same event (b"" for a play-started
+        # event, which never carries one, or for an upload-finished one
+        # from old firmware, which announces checksum_type 0). Same
+        # test-visibility reason as last_published_file_path above; reset
+        # alongside it.
+        self.last_published_checksum: bytes = b""
         # Whether another controller joining or leaving the machine is
         # announced to the user. A user setting, pushed in by the UI; on by
         # default, so the user learns the behaviour exists. See
@@ -2006,6 +2012,7 @@ class Controller:
         self.control_mode = HELLO_MODE_SINGLE_USER
         self.relayed_tool_table = {}
         self.last_published_file_path = ""
+        self.last_published_checksum = b""
         self.clearRun()
 
     def _join_stream_io(self):
@@ -2158,6 +2165,7 @@ class Controller:
         self.control_mode = HELLO_MODE_SINGLE_USER
         self.relayed_tool_table = {}
         self.last_published_file_path = ""
+        self.last_published_checksum = b""
         CNC.vars["state"] = NOT_CONNECTED
         CNC.vars["color"] = STATECOLOR[CNC.vars["state"]]
 
@@ -2194,6 +2202,7 @@ class Controller:
         self.control_mode = HELLO_MODE_SINGLE_USER
         self.relayed_tool_table = {}
         self.last_published_file_path = ""
+        self.last_published_checksum = b""
         # Set a flag to indicate this was a manual disconnection
         self._manual_disconnect = True
         CNC.vars["state"] = NOT_CONNECTED
@@ -2773,7 +2782,7 @@ class Controller:
                 return
             finished = decode_upload_finished_event(message.payload)
             if finished is not None:
-                self._on_file_published(finished.path)
+                self._on_file_published(finished.path, finished.checksum)
                 return
             started = decode_play_started_event(message.payload)
             if started is not None:
@@ -3050,7 +3059,7 @@ class Controller:
         self.relayed_tool_table = table
         self._notify_relayed_tool_table(table)
 
-    def _on_file_published(self, path):
+    def _on_file_published(self, path, checksum=b""):
         """An upload-finished or play-started event named `path`. Neither
         kind is distinguished further here -- both mean the same thing to a
         listener: a file a passive controller may not have itself is now on
@@ -3059,9 +3068,13 @@ class Controller:
         does not decide here whether to actually fetch anything: it does
         not track holder-ness relative to itself for this purpose, nor the
         machine's own idle-ness beyond CNC.vars already being the source of
-        truth main.py reads elsewhere."""
+        truth main.py reads elsewhere. `checksum` is the upload-finished
+        event's own digest, or b"" for a play-started event (which never
+        carries one) -- passed through so the listener can skip a fetch
+        whose local copy already matches, instead of deciding that here."""
         self.last_published_file_path = path
-        self._notify_file_published(path)
+        self.last_published_checksum = checksum
+        self._notify_file_published(path, checksum)
 
     def _on_published_line(self, source_id, source_name, text):
         """A command's own text or its reply, published by the machine to
@@ -3123,6 +3136,7 @@ class Controller:
         self.control_mode = HELLO_MODE_SINGLE_USER
         self.relayed_tool_table = {}
         self.last_published_file_path = ""
+        self.last_published_checksum = b""
         if self.stream is not None:
             try:
                 self.stream.close()
@@ -3242,7 +3256,7 @@ class Controller:
         if hasattr(root, "update_relayed_tool_table"):
             Clock.schedule_once(lambda dt, t=table: root.update_relayed_tool_table(t), 0)
 
-    def _notify_file_published(self, path):
+    def _notify_file_published(self, path, checksum=b""):
         if App is None or Clock is None:
             return
         app = App.get_running_app()
@@ -3250,7 +3264,7 @@ class Controller:
             return
         root = app.root
         if hasattr(root, "on_passive_file_published"):
-            Clock.schedule_once(lambda dt, p=path: root.on_passive_file_published(p), 0)
+            Clock.schedule_once(lambda dt, p=path, c=checksum: root.on_passive_file_published(p, c), 0)
 
     # ----------------------------------------------------------------------
     # thread performing I/O on serial line

@@ -133,9 +133,12 @@ def decode_published_line(payload: bytes) -> PublishedLineFragment | None:
 @dataclass(frozen=True)
 class UploadFinished:
     """One `0x68` event, kind `EVENT_KIND_UPLOAD_FINISHED`: a file transfer
-    to the card just completed. ``size``/``checksum`` are decoded but not
-    used by this controller yet -- only ``path`` is, to trigger a passive
-    controller's own fetch of the same file."""
+    to the card just completed. ``path`` triggers a passive controller's
+    own fetch of the same file; ``checksum`` (the raw digest, empty if the
+    firmware announced ``checksum_type`` 0, i.e. none) lets that controller
+    skip the fetch instead when its own local copy already matches (see
+    main.py's ``on_passive_file_published``). ``size`` is decoded but still
+    unused."""
 
     path: str
     size: int
