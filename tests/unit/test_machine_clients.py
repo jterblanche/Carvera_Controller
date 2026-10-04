@@ -1,4 +1,10 @@
-from carveracontroller.machine.clients import ClientRow, row_display_text, rows_for_display, truncate_name
+from carveracontroller.machine.clients import (
+    ClientRow,
+    holder_from_client_list,
+    row_display_text,
+    rows_for_display,
+    truncate_name,
+)
 from carveracontroller.protocols.handshake import ClientEntry
 
 SELF_ID = 1
@@ -75,3 +81,30 @@ def test_row_display_text_truncates_long_names_before_appending_suffixes():
     row = ClientRow(name="A" * 31, has_control=True, is_self=True)
     text = row_display_text(row, you_suffix=" (you)", control_suffix=" — in control", max_name_len=20)
     assert text == ("A" * 19 + "…" + " (you)" + " — in control")
+
+
+def test_holder_from_client_list_names_the_entry_that_has_control():
+    assert holder_from_client_list(_entries()) == (SELF_ID, "Office PC")
+
+
+def test_holder_from_client_list_names_someone_else():
+    entries = (
+        ClientEntry(id=OTHER_ID, name="Workshop Laptop", link=0, has_control=True),
+        ClientEntry(id=SELF_ID, name="Office PC", link=0, has_control=False),
+    )
+    assert holder_from_client_list(entries) == (OTHER_ID, "Workshop Laptop")
+
+
+def test_holder_from_client_list_is_nobody_when_no_entry_has_control():
+    entries = (
+        ClientEntry(id=OTHER_ID, name="Workshop Laptop", link=0, has_control=False),
+        ClientEntry(id=SELF_ID, name="Office PC", link=0, has_control=False),
+    )
+    assert holder_from_client_list(entries) == (0, "")
+
+
+def test_holder_from_client_list_is_nobody_for_an_empty_list():
+    # Also covers old firmware's client-list reply, which never sets
+    # has_control true for anyone -- indistinguishable from "nobody holds
+    # it" and from an empty list.
+    assert holder_from_client_list(()) == (0, "")

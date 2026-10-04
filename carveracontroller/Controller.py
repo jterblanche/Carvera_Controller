@@ -20,6 +20,7 @@ from functools import partial
 
 from . import Utils
 from .CNC import CMDPAT, CNC, LASER_TOOL_NUMBER, PARENPAT, SEMIPAT, ZPROBE_TOOL_NUMBER
+from .machine.clients import holder_from_client_list
 from .machine.control_refusal import is_control_refusal
 from .machine.heartbeat import heartbeat_due
 from .machine.hello import HelloNegotiator, Resolution
@@ -216,13 +217,14 @@ class Controller:
         self._reset_pending_sends()
         # The other controllers currently connected, from the last client-list reply.
         self.connected_clients: tuple[ClientEntry, ...] = ()
-        # Who holds control right now, from the last control-changed event
-        # (the machine's `0x68` event frame, kind 5) — the only source of
-        # truth for this: the client-list reply's own has_control field is
-        # not populated by firmware yet. 0 / "" is the machine's own
-        # "nobody" encoding, and also this controller's starting state
-        # before any event arrives: passive, same as after a reconnect. See
-        # has_control below and _on_control_changed.
+        # Who holds control right now: kept in step with the last
+        # control-changed event (the machine's `0x68` event frame, kind 5)
+        # and with every client-list reply's own has_control field, via
+        # _on_control_changed/_on_client_list below -- either can be the
+        # trigger that updates this. 0 / "" is the machine's own "nobody"
+        # encoding, and also this controller's starting state before either
+        # has told it otherwise: passive, same as after a reconnect. See
+        # has_control below.
         self.control_holder_id: int = 0
         self.control_holder_name: str = ""
         # Whether the machine hands control to whoever last acted
@@ -2973,18 +2975,31 @@ class Controller:
             self._notify_hello_rejected(reason)
 
     def _on_client_list(self, payload):
+        """A client-list reply (requested on identify, and again on every
+        client-joined/left event): the current roster, each entry carrying
+        the machine's own has_control flag (old firmware never sets it, so
+        holder_from_client_list reads such a list as "nobody", same as an
+        empty one). A controller that joins while control is not moving
+        never gets a control-changed event for it, so this is the only way
+        it learns who already holds control -- derived here and, when it
+        differs from what this controller already believes, applied through
+        _on_control_changed, exactly as a control-changed event would. A
+        list that agrees with the current state changes nothing."""
         self.connected_clients = decode_client_list(payload)
         self._notify_client_list_updated(self.connected_clients)
+        holder_id, holder_name = holder_from_client_list(self.connected_clients)
+        if holder_id != self.control_holder_id or holder_name != self.control_holder_name:
+            self._on_control_changed(holder_id, holder_name)
 
     def _on_control_changed(self, holder_id, holder_name):
-        """A control-changed event (the machine's `0x68` event frame, kind
-        5): the machine's control token moved, silently and at once, to
-        `holder_id`/`holder_name` — or to nobody (`holder_id == 0`), on a
-        disconnect or a silent drop. This is the only place
-        control_holder_id/control_holder_name are set, and the only trigger
-        for updating the "who has control" indicator: this controller never
-        guesses who holds control from its own sends, only from what the
-        machine actually publishes back."""
+        """Who holds control now: `holder_id`/`holder_name`, or nobody
+        (`holder_id == 0`). Called for a control-changed event (the
+        machine's `0x68` event frame, kind 5) -- a disconnect or a silent
+        drop included -- and for a client-list reply whose has_control
+        entries disagree with the current state (_on_client_list above).
+        This is the only place control_holder_id/control_holder_name are
+        set: this controller never guesses who holds control from its own
+        sends, only from what the machine actually publishes back."""
         self.control_holder_id = holder_id
         self.control_holder_name = holder_name
         self._notify_control_changed(holder_id, holder_name)
