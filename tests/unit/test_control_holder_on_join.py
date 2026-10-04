@@ -149,7 +149,7 @@ def test_list_agreeing_with_the_current_state_raises_no_spurious_event(controlle
 
 
 def test_joining_while_another_controller_holds_control_shows_it_without_any_event(machine, controller):
-    """The acceptance criterion from the bug report: join while another
+    """Join while another
     controller already holds control, and the joining controller shows
     "<name> has control" immediately -- from the client-list reply
     Controller._on_hello_ack already requests on identify, well before any
