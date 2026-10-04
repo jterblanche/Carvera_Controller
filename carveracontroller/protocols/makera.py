@@ -251,8 +251,8 @@ class MakeraProtocol(CommunicationProtocol):
             return self._buffer_published_line(parsed.payload)
         if parsed.ptype == PTYPE_EVENT:
             # This `0x68` event type also carries kinds this controller
-            # doesn't decode yet (job ended, alarm/halt) — reserved for a
-            # future ticket. Intercepted here, ahead of the unknown-type
+            # doesn't decode yet (job ended, alarm/halt). Intercepted
+            # here, ahead of the unknown-type
             # fallback below, purely so it's never mistaken for garbled
             # console text.
             return [ParsedMessage(MessageKind.EVENT, payload=parsed.payload)]

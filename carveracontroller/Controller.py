@@ -20,6 +20,8 @@ from functools import partial
 
 from . import Utils
 from .CNC import CMDPAT, CNC, LASER_TOOL_NUMBER, PARENPAT, SEMIPAT, ZPROBE_TOOL_NUMBER
+from .machine.clients import holder_from_client_list
+from .machine.control_refusal import is_control_refusal
 from .machine.heartbeat import heartbeat_due
 from .machine.hello import HelloNegotiator, Resolution
 from .machine.identity import ControllerIdentity, default_name, generate_id
@@ -76,6 +78,10 @@ TLOPAT = re.compile(r"^\[(...):([+\-]?\d*\.\d*)\]$")
 DOLLARPAT = re.compile(r"^\[G\d* .*\]$")
 SPLITPAT = re.compile(r"[:,]")
 VARPAT = re.compile(r"^\$(\d+)=(\d*\.?\d*) *\(?.*")
+# Configurator::config_set_command's success line ("%s: %s has been set to
+# %s", e.g. "sd: multi_client.mode has been set to single_user"). See
+# set_config_value_and_wait/_check_config_reply.
+CONFIG_SET_OK_PAT = re.compile(r"^(\S+): (\S+) has been set to (.*)$")
 
 
 WIKI = "https://github.com/vlachoudis/bCNC/wiki"
@@ -211,13 +217,14 @@ class Controller:
         self._reset_pending_sends()
         # The other controllers currently connected, from the last client-list reply.
         self.connected_clients: tuple[ClientEntry, ...] = ()
-        # Who holds control right now, from the last control-changed event
-        # (the machine's `0x68` event frame, kind 5) — the only source of
-        # truth for this: the client-list reply's own has_control field is
-        # not populated by firmware yet. 0 / "" is the machine's own
-        # "nobody" encoding, and also this controller's starting state
-        # before any event arrives: passive, same as after a reconnect. See
-        # has_control below and _on_control_changed.
+        # Who holds control right now: kept in step with the last
+        # control-changed event (the machine's `0x68` event frame, kind 5)
+        # and with every client-list reply's own has_control field, via
+        # _on_control_changed/_on_client_list below -- either can be the
+        # trigger that updates this. 0 / "" is the machine's own "nobody"
+        # encoding, and also this controller's starting state before either
+        # has told it otherwise: passive, same as after a reconnect. See
+        # has_control below.
         self.control_holder_id: int = 0
         self.control_holder_name: str = ""
         # Whether the machine hands control to whoever last acted
@@ -238,6 +245,12 @@ class Controller:
         # but it is kept here too so it can be asserted directly in a test
         # that has no Kivy app running. Reset to "" on every (re)connect.
         self.last_published_file_path: str = ""
+        # The checksum carried by that same event (b"" for a play-started
+        # event, which never carries one, or for an upload-finished one
+        # from old firmware, which announces checksum_type 0). Same
+        # test-visibility reason as last_published_file_path above; reset
+        # alongside it.
+        self.last_published_checksum: bytes = b""
         # Whether another controller joining or leaving the machine is
         # announced to the user. A user setting, pushed in by the UI; on by
         # default, so the user learns the behaviour exists. See
@@ -277,6 +290,12 @@ class Controller:
         self.loadERR = False
         self.loadCANCEL = False
         self.loadCANCELSENT = False
+        # Set instead of queuing into load_buffer when the firmware refused
+        # the in-flight ls/rm/mv/mkdir outright (see
+        # machine/control_refusal.py) -- the exact text parseLine already
+        # put on the console, kept here too so the UI can show it instead of
+        # a generic "Error loading ..." once loadERR ends the wait.
+        self.load_refused_reason = None
 
         self.sendNUM = 0
         self.sendEOF = False
@@ -296,6 +315,16 @@ class Controller:
         self._stop = False  # Raise to stop current run
         self._pause = False  # machine is on Hold
         self._alarm = True  # Display alarm message if true
+
+        # Set by set_config_value_and_wait() while it is waiting for one
+        # config-set reply; cleared again once that wait ends either way.
+        # parseLine checks this on every incoming line (_check_config_reply)
+        # to resolve the wait -- config-set replies carry no request id, so
+        # the next matching line while one is outstanding is taken to be
+        # this one's.
+        self._awaiting_config_key = None
+        self._config_reply_event = threading.Event()
+        self._config_reply_result = None  # (success, message) once resolved
 
         self._baud_upgrade_attempted = False
         self._baud_switch_in_progress = False
@@ -915,6 +944,54 @@ class Controller:
     def setConfigValue(self, key, value):
         if key and value:
             self.executeCommand("config-set sd %s %s\n" % (key, value))
+
+    def set_config_value_and_wait(self, key, value, timeout=3.0):
+        """Send config-set for key/value and block the calling thread for
+        up to timeout seconds until the firmware's reply is seen -- never
+        call this from the Kivy main thread, since a refusal or a slow
+        link can make it wait the whole timeout.
+
+        Returns (success, message). success is True only for the
+        firmware's own "<key> has been set to <value>" line (Configurator::
+        config_set_command); False for any error: line -- including the
+        control refusal "error:Refused -- <holder> has control" -- any
+        other config-set outcome line (not enough space, bad source), or a
+        timeout with no reply at all. See _check_config_reply, which
+        resolves this from parseLine on the reading thread.
+        """
+        if not key or not value:
+            return False, "missing key or value"
+        self._config_reply_event.clear()
+        self._config_reply_result = None
+        self._awaiting_config_key = key
+        try:
+            self.setConfigValue(key, value)
+            if not self._config_reply_event.wait(timeout):
+                return False, "no reply from the machine within %gs" % timeout
+            return self._config_reply_result
+        finally:
+            self._awaiting_config_key = None
+
+    def _check_config_reply(self, line):
+        """Resolve a set_config_value_and_wait() in progress, if any, from
+        a line just received on the reading thread. A config-set reply
+        matches no special prefix parseLine otherwise looks for, so this
+        runs ahead of that dispatch and only has a side effect (waking the
+        waiting thread) -- the line still flows through parseLine
+        afterwards exactly as before."""
+        key = self._awaiting_config_key
+        if key is None:
+            return
+        text = line.rstrip("\r\n")
+        match = CONFIG_SET_OK_PAT.match(text)
+        if match:
+            if match.group(2) == key:
+                self._config_reply_result = (True, text)
+                self._config_reply_event.set()
+            return
+        if text.lower().startswith("error") or text.startswith("sd"):
+            self._config_reply_result = (False, text)
+            self._config_reply_event.set()
 
     def dropToolCommand(self):
         self.executeCommand("M6T-1\n")
@@ -1935,6 +2012,7 @@ class Controller:
         self.control_mode = HELLO_MODE_SINGLE_USER
         self.relayed_tool_table = {}
         self.last_published_file_path = ""
+        self.last_published_checksum = b""
         self.clearRun()
 
     def _join_stream_io(self):
@@ -2087,6 +2165,7 @@ class Controller:
         self.control_mode = HELLO_MODE_SINGLE_USER
         self.relayed_tool_table = {}
         self.last_published_file_path = ""
+        self.last_published_checksum = b""
         CNC.vars["state"] = NOT_CONNECTED
         CNC.vars["color"] = STATECOLOR[CNC.vars["state"]]
 
@@ -2123,6 +2202,7 @@ class Controller:
         self.control_mode = HELLO_MODE_SINGLE_USER
         self.relayed_tool_table = {}
         self.last_published_file_path = ""
+        self.last_published_checksum = b""
         # Set a flag to indicate this was a manual disconnection
         self._manual_disconnect = True
         CNC.vars["state"] = NOT_CONNECTED
@@ -2601,6 +2681,7 @@ class Controller:
         if not line:
             return True
         try:
+            self._check_config_reply(line)
             if line[0] == "<":
                 self.parseBracketAngle(line)
                 self.sio_status = False
@@ -2688,7 +2769,7 @@ class Controller:
             return
         if message.kind == MessageKind.EVENT:
             # Kinds 3 (job ended) and 4 (alarm/halt) are not decoded yet --
-            # reserved for a future ticket. Intercepted here either way so
+            # they are left for later. Intercepted here either way so
             # an event can never fall through to the unknown-type-becomes-
             # console-LINE path below and show up as garbled text.
             changed = decode_control_changed_event(message.payload)
@@ -2701,7 +2782,7 @@ class Controller:
                 return
             finished = decode_upload_finished_event(message.payload)
             if finished is not None:
-                self._on_file_published(finished.path)
+                self._on_file_published(finished.path, finished.checksum)
                 return
             started = decode_play_started_event(message.payload)
             if started is not None:
@@ -2738,9 +2819,24 @@ class Controller:
         cleaned_line = re.sub(r"<.*?>", "", text).strip()
         if cleaned_line:
             for line2 in cleaned_line.replace("\r\n", "\n").split("\n"):
-                if line2:
-                    self.load_buffer.put(line2)
-                    self.load_buffer_size += len(line2) + 1
+                if not line2:
+                    continue
+                if is_control_refusal(line2):
+                    # The firmware refused this ls/rm/mv/mkdir outright
+                    # (ControlToken.cpp -- someone else has control, or
+                    # motion is in progress) and will send no listing data
+                    # at all. Show it the same way a refused "suspend" is
+                    # shown (parseLine's own "error" branch) instead of
+                    # queuing it into load_buffer as if it were directory
+                    # data, and end the wait now via loadERR rather than
+                    # waiting out SHORT_LOAD_TIMEOUT/WIFI_LOAD_TIMEOUT only
+                    # to show a generic "Error loading ..." with no reason.
+                    self.parseLine(line2)
+                    self.load_refused_reason = line2
+                    self.loadERR = True
+                    continue
+                self.load_buffer.put(line2)
+                self.load_buffer_size += len(line2) + 1
 
     def _advance_hello(self, now):
         """Called every streamIO tick. Sends hello the first time a frame is
@@ -2888,18 +2984,31 @@ class Controller:
             self._notify_hello_rejected(reason)
 
     def _on_client_list(self, payload):
+        """A client-list reply (requested on identify, and again on every
+        client-joined/left event): the current roster, each entry carrying
+        the machine's own has_control flag (old firmware never sets it, so
+        holder_from_client_list reads such a list as "nobody", same as an
+        empty one). A controller that joins while control is not moving
+        never gets a control-changed event for it, so this is the only way
+        it learns who already holds control -- derived here and, when it
+        differs from what this controller already believes, applied through
+        _on_control_changed, exactly as a control-changed event would. A
+        list that agrees with the current state changes nothing."""
         self.connected_clients = decode_client_list(payload)
         self._notify_client_list_updated(self.connected_clients)
+        holder_id, holder_name = holder_from_client_list(self.connected_clients)
+        if holder_id != self.control_holder_id or holder_name != self.control_holder_name:
+            self._on_control_changed(holder_id, holder_name)
 
     def _on_control_changed(self, holder_id, holder_name):
-        """A control-changed event (the machine's `0x68` event frame, kind
-        5): the machine's control token moved, silently and at once, to
-        `holder_id`/`holder_name` — or to nobody (`holder_id == 0`), on a
-        disconnect or a silent drop. This is the only place
-        control_holder_id/control_holder_name are set, and the only trigger
-        for updating the "who has control" indicator: this controller never
-        guesses who holds control from its own sends, only from what the
-        machine actually publishes back."""
+        """Who holds control now: `holder_id`/`holder_name`, or nobody
+        (`holder_id == 0`). Called for a control-changed event (the
+        machine's `0x68` event frame, kind 5) -- a disconnect or a silent
+        drop included -- and for a client-list reply whose has_control
+        entries disagree with the current state (_on_client_list above).
+        This is the only place control_holder_id/control_holder_name are
+        set: this controller never guesses who holds control from its own
+        sends, only from what the machine actually publishes back."""
         self.control_holder_id = holder_id
         self.control_holder_name = holder_name
         self._notify_control_changed(holder_id, holder_name)
@@ -2950,7 +3059,7 @@ class Controller:
         self.relayed_tool_table = table
         self._notify_relayed_tool_table(table)
 
-    def _on_file_published(self, path):
+    def _on_file_published(self, path, checksum=b""):
         """An upload-finished or play-started event named `path`. Neither
         kind is distinguished further here -- both mean the same thing to a
         listener: a file a passive controller may not have itself is now on
@@ -2959,9 +3068,13 @@ class Controller:
         does not decide here whether to actually fetch anything: it does
         not track holder-ness relative to itself for this purpose, nor the
         machine's own idle-ness beyond CNC.vars already being the source of
-        truth main.py reads elsewhere."""
+        truth main.py reads elsewhere. `checksum` is the upload-finished
+        event's own digest, or b"" for a play-started event (which never
+        carries one) -- passed through so the listener can skip a fetch
+        whose local copy already matches, instead of deciding that here."""
         self.last_published_file_path = path
-        self._notify_file_published(path)
+        self.last_published_checksum = checksum
+        self._notify_file_published(path, checksum)
 
     def _on_published_line(self, source_id, source_name, text):
         """A command's own text or its reply, published by the machine to
@@ -2977,7 +3090,7 @@ class Controller:
         controller's own reply, so it must not be able to affect this
         controller's own reply/status handling (sendNUM/loadNUM counters,
         the alarm/error detection in parseLine, hello re-send-on-reply) —
-        the isolation the ticket's acceptance criterion asks for. It is
+        that isolation is the point of this path. It is
         queued with MSG_PUBLISHED, a kind distinct from MSG_NORMAL/
         MSG_ERROR, so a UI listener can tell it apart too and skip any
         side effects (main.py's own clock-sync/model-detection regexes)
@@ -3023,6 +3136,7 @@ class Controller:
         self.control_mode = HELLO_MODE_SINGLE_USER
         self.relayed_tool_table = {}
         self.last_published_file_path = ""
+        self.last_published_checksum = b""
         if self.stream is not None:
             try:
                 self.stream.close()
@@ -3142,7 +3256,7 @@ class Controller:
         if hasattr(root, "update_relayed_tool_table"):
             Clock.schedule_once(lambda dt, t=table: root.update_relayed_tool_table(t), 0)
 
-    def _notify_file_published(self, path):
+    def _notify_file_published(self, path, checksum=b""):
         if App is None or Clock is None:
             return
         app = App.get_running_app()
@@ -3150,7 +3264,7 @@ class Controller:
             return
         root = app.root
         if hasattr(root, "on_passive_file_published"):
-            Clock.schedule_once(lambda dt, p=path: root.on_passive_file_published(p), 0)
+            Clock.schedule_once(lambda dt, p=path, c=checksum: root.on_passive_file_published(p, c), 0)
 
     # ----------------------------------------------------------------------
     # thread performing I/O on serial line

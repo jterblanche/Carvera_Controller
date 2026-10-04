@@ -1,13 +1,13 @@
 """End-to-end tests for multi-user mode — against a real Controller and a
 real socket (FakeMachine), the same style as test_passive_state.py.
 
-Covers the acceptance criteria of "Controller: multi-user mode":
+Covers:
 
   1. A release action, sent only when this controller currently holds
      control on a machine configured for multi-user mode — never
      accidentally, never when there is nothing to release.
   2. A refusal naming the holder is shown the same way a single-user
-     refusal already is (#23): as an ordinary text error reply, surfaced by
+     refusal already is: as an ordinary text error reply, surfaced by
      the existing generic error handling. Actions the passive-rights level
      allows (pause, stop, upload) are sent the same way any command is,
      never held back by this controller.

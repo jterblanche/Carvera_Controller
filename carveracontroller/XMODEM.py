@@ -101,6 +101,7 @@ import sys
 import time
 from enum import Enum, auto
 
+from .machine.control_refusal import is_control_refusal
 from .protocols.framing import (
     FRAME_END,
     FRAME_HEADER,
@@ -111,6 +112,7 @@ from .protocols.framing import (
     PTYPE_FILE_MD5,
     PTYPE_FILE_RETRY,
     PTYPE_FILE_VIEW,
+    PTYPE_NORMAL_INFO,
     build_frame,
     validate_packet_data,
 )
@@ -781,6 +783,24 @@ class XMODEM:
                 td = time.time()
                 cmd_type = self.packetData[2]
                 if cmd_type < PTYPE_FILE_MD5:
+                    if cmd_type == PTYPE_NORMAL_INFO:
+                        # Every ordinary command reply, including the
+                        # control gate's own refusal (ControlToken.cpp),
+                        # arrives as this type -- see
+                        # WifiProvider::printf()/PacketMessage(). Nothing
+                        # else sent as PTYPE_NORMAL_INFO belongs to this
+                        # transfer, but a refusal means the firmware will
+                        # never start one: stop waiting for file-transfer
+                        # packets that are not coming, the same way a
+                        # PTYPE_FILE_CAN with a reason does below, instead
+                        # of falling through to the plain `continue` and
+                        # only giving up once the 9s receive-timeout fires
+                        # with no reason at all.
+                        reason = self._file_packet_text()
+                        if is_control_refusal(reason):
+                            self.last_file_error = reason
+                            self.log.info("Transmission refused by Machine: %s", reason)
+                            return None
                     continue
                 if cmd_type == PTYPE_FILE_CAN:
                     # Abort on both C1/CA1 and Z1. Success is FILE_END. C1/CA1 may

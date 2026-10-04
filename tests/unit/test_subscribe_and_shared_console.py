@@ -2,8 +2,8 @@
 heartbeat, and the shared console — against a real Controller and a real
 socket (FakeMachine), the same style as test_controller_hello.py.
 
-Covers the four functional acceptance criteria of "Controller: subscribe
-instead of poll, heartbeat, shared console":
+Covers subscribing instead of polling, the heartbeat and the shared
+console:
 
   1. Once identified, status comes from published ticks, not polling; a
      subscribed controller stops sending `?`.

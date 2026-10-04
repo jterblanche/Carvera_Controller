@@ -93,6 +93,7 @@ class FakeMachine:
         close_after_ack=None,
         publish_status=False,
         status_interval_s=0.05,
+        client_list_entries=None,
     ):
         self.mode = mode
         self.ack_delay = ack_delay
@@ -104,6 +105,19 @@ class FakeMachine:
         self.close_after_ack = close_after_ack
         self.publish_status_enabled = publish_status
         self.status_interval_s = status_interval_s
+        # The roster sent back for every client-list request (on identify,
+        # and again on every client-joined/left event): a list of
+        # (id, name, link, has_control). name may be str or bytes. Defaults
+        # to one other identified client, holding no control -- same
+        # starting point ("nobody holds it") every other test here assumes
+        # unless it sends its own control-changed event. A test for a
+        # controller joining while someone already holds control passes
+        # its own entries with has_control=True set.
+        self.client_list_entries = (
+            client_list_entries
+            if client_list_entries is not None
+            else [(0xAAAABBBBCCCCDDDD, "Fake Machine Self", 0, False)]
+        )
 
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -267,9 +281,17 @@ class FakeMachine:
         if ptype == PTYPE_CLIENT_LIST_REQ:
             with self._lock:
                 self.client_list_requests += 1
-            name = b"Fake Machine Self"
-            entry = (0xAAAABBBBCCCCDDDD).to_bytes(8, "big") + bytes([len(name)]) + name + bytes([0, 1])
-            self._send(conn, build_frame(PTYPE_CLIENT_LIST_REPLY, bytes([1]) + entry))
+            entries = self.client_list_entries
+            payload = bytes([len(entries)])
+            for client_id, name, link, has_control in entries:
+                name_bytes = name if isinstance(name, bytes) else name.encode("utf-8")
+                payload += (
+                    client_id.to_bytes(8, "big")
+                    + bytes([len(name_bytes)])
+                    + name_bytes
+                    + bytes([link, 1 if has_control else 0])
+                )
+            self._send(conn, build_frame(PTYPE_CLIENT_LIST_REPLY, payload))
             return
 
     def _close_after_ack(self, conn):

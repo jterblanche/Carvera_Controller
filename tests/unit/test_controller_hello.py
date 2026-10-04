@@ -154,7 +154,7 @@ def test_no_reply_message_not_logged_against_old_firmware(machine, controller):
     it must stay silent, exactly as before this branch. Only a link that
     never produces a single valid frame at all (test_ordinary_command_flushed_
     after_open_timeout_against_a_silent_machine) gets the new console line.
-    Guards the "existing behaviour... unchanged" acceptance criterion: if
+    Guards against changing behaviour with old firmware: if
     the never_answered/frame_seen guard in _advance_hello ever broke, every
     connect to old (pre-hello) firmware — the common case — would start
     printing this line."""
@@ -251,7 +251,9 @@ def test_client_list_requested_and_stored_after_identify(machine, controller):
     assert m.wait_until(lambda: len(controller.connected_clients) == 1, timeout=2.0)
     entry = controller.connected_clients[0]
     assert entry.name == "Fake Machine Self"
-    assert entry.has_control is True
+    # FakeMachine's default roster holds no control -- the usual starting
+    # point every other test here assumes (see FakeMachine.client_list_entries).
+    assert entry.has_control is False
 
 
 def test_smoothie_link_never_sends_hello_and_never_gates_sends(machine, controller):

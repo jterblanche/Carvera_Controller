@@ -2,7 +2,7 @@
 real socket (FakeMachine), the same style as
 test_subscribe_and_shared_console.py.
 
-Covers the first four acceptance criteria of "Controller: passive state":
+Covers passive state:
 
   1. An indicator naming who has control, driven by control-changed events
      (the machine's `0x68` event frame, kind 5) — never guessed from this
