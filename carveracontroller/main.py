@@ -361,6 +361,7 @@ from .GcodeViewer import (
     VISIBILITY_MAX_TOOLS,
     GCodeViewer,
 )
+from .machine.busy_state import machine_is_busy
 from .machine.clients import row_display_text, rows_for_display
 from .machine.identity import load_or_create_identity, set_name
 from .machine.passive_fetch import PassiveFetchTracker
@@ -1716,12 +1717,19 @@ class ConfigPopup(ModalView):
     def on_dismiss(self):
         app = App.get_running_app()
         makera = app.root
-        if makera.setting_change_list and not makera.controller.can_write_machine_settings:
+        busy = machine_is_busy(app.state)
+        if makera.setting_change_list and (busy or not makera.controller.can_write_machine_settings):
+            if busy:
+                reason = tr._("The machine is busy")
+            else:
+                reason = tr._("{name} has control").format(
+                    name=makera.controller.control_holder_name or tr._("Another controller")
+                )
             makera.confirm_popup.lb_title.text = tr._("Unapplied Changes")
             makera.confirm_popup.lb_content.text = tr._(
-                "{name} has control, so your machine setting changes can't be applied. "
+                "{reason}, so your machine setting changes can't be applied. "
                 "Discard them and close? Changes to this controller's own settings are still applied."
-            ).format(name=makera.controller.control_holder_name or tr._("Another controller"))
+            ).format(reason=reason)
             makera.confirm_popup.confirm = self._discard_machine_changes_and_close
             makera.confirm_popup.cancel = None
             makera.confirm_popup.open()
@@ -1737,10 +1745,13 @@ class ConfigPopup(ModalView):
 
     def _apply_changes(self):
         app = App.get_running_app()
-        if app.root.setting_change_list and not app.root.controller.can_write_machine_settings:
-            # Control moved to another controller after Apply was enabled.
-            # The machine would refuse every write, so apply nothing and
-            # leave the changes pending.
+        if app.root.setting_change_list and (
+            machine_is_busy(app.state) or not app.root.controller.can_write_machine_settings
+        ):
+            # The machine became busy, or control moved to another
+            # controller, after Apply was enabled. The machine would
+            # refuse every write, so apply nothing and leave the changes
+            # pending.
             app.root.refresh_settings_apply_button()
             return
         # Write pending widget values to their Config instances
@@ -3338,6 +3349,7 @@ class Makera(RelativeLayout):
             self.allow_jogging_while_spindle_on = Config.get("carvera", "allow_jogging_while_spindle_on")
 
         self._bind_jog_control_deps()
+        self._bind_settings_busy_gate()
 
         # Setup pendant
         self.refresh_pendant_settings()
@@ -6421,33 +6433,46 @@ class Makera(RelativeLayout):
         self.status_drop_down.can_release_control = self.controller.can_release_control
         self.refresh_settings_apply_button()
 
-    def refresh_settings_apply_button(self):
+    def refresh_settings_apply_button(self, *_args):
         """Enable or disable the settings page's Apply button, and say why
-        beside it when machine settings can't be applied from here: another
-        controller holds control on a machine in multi-user mode, so the
-        machine would refuse the write. Called whenever a setting changes,
-        when the page opens, and on every control-changed event."""
+        beside it when machine settings can't be applied from here: the
+        machine is busy (see machine_is_busy -- anything other than Idle,
+        Alarm or Sleep), or another controller holds control on a machine
+        in multi-user mode, so the machine would refuse the write. Called
+        whenever a setting changes, when the page opens, on every
+        control-changed event, and bound to the app's ``state`` property
+        (see ``_bind_settings_busy_gate``) so a page left open updates live
+        when the machine starts or finishes being busy. The extra
+        ``*_args`` swallows the (instance, value) pair Kivy passes a
+        property-bound callback."""
         popup = self.config_popup
         if popup is None:
             return
-        writable = self.controller.can_write_machine_settings
+        busy = machine_is_busy(App.get_running_app().state)
+        writable = self.controller.can_write_machine_settings and not busy
         popup.btn_apply.disabled = settings_apply_disabled(
             bool(self.controller_setting_change_list), bool(self.setting_change_list), writable
         )
-        popup.apply_blocked_text = "" if writable else self._machine_settings_blocked_text()
+        popup.apply_blocked_text = "" if writable else self._machine_settings_blocked_text(busy)
 
-    def _machine_settings_blocked_text(self):
+    def _machine_settings_blocked_text(self, busy=None):
+        if busy is None:
+            busy = machine_is_busy(App.get_running_app().state)
+        if busy:
+            return tr._("Machine settings can't be changed while the machine is busy")
         name = self.controller.control_holder_name or tr._("Another controller")
         return tr._("{name} has control: machine settings can't be changed here").format(name=name)
 
     def refuse_machine_settings_write(self):
         """For a settings-page action that writes machine settings straight
-        away (Restore, Save As Default): if the machine would refuse it
-        because another controller holds control, say so and return True so
-        the caller does nothing. Returns False when the write may go ahead."""
-        if self.controller.can_write_machine_settings:
+        away (Restore, Save As Default): if the machine would refuse it --
+        because it is busy, or another controller holds control -- say so
+        and return True so the caller does nothing. Returns False when the
+        write may go ahead."""
+        busy = machine_is_busy(App.get_running_app().state)
+        if not busy and self.controller.can_write_machine_settings:
             return False
-        self.show_message_popup(self._machine_settings_blocked_text(), False)
+        self.show_message_popup(self._machine_settings_blocked_text(busy), False)
         return True
 
     def announce_client_presence(self, announcement):
@@ -8702,6 +8727,19 @@ class Makera(RelativeLayout):
                 spindle_or_laser_is_on=self.update_jog_controls_enabled,
             )
         self.update_jog_controls_enabled()
+
+    def _bind_settings_busy_gate(self):
+        """Keep the settings page's machine-write gating (the Apply
+        button, and refuse_machine_settings_write for Restore/Save As
+        Default) current while the machine's reported busy state changes
+        underneath an open settings page. refresh_settings_apply_button
+        already runs on every control-changed event and setting change;
+        this adds the app's ``state`` property as a third trigger, the
+        same live-binding pattern _bind_jog_control_deps uses."""
+        app = App.get_running_app()
+        if app is not None:
+            app.bind(state=self.refresh_settings_apply_button)
+        self.refresh_settings_apply_button()
 
     def update_jog_controls_enabled(self, *args):
         app = App.get_running_app()
