@@ -77,6 +77,14 @@
         "default": "watch_stop_upload"
     },
     {
+        "type": "numeric",
+        "title": "Status rate (Hz)",
+        "desc": "How many times per second the machine sends status to each connected controller (1 - 50). Takes effect after the machine restarts. Higher values use more WiFi bandwidth for each connected controller.",
+        "section": "Basic",
+        "key": "multi_client.status_publish_hz",
+        "default": "5"
+    },
+    {
         "type": "title",
         "title": "Power management",
         "section": "Basic"

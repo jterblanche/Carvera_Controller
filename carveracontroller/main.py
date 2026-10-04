@@ -14,6 +14,11 @@ MACHINE_CONFIG_FILES = {
 
 MAX_CONFIG_DOWNLOAD_ATTEMPTS = 3
 
+# How long apply_machine_setting_changes() waits for each config-set's
+# reply (Controller.set_config_value_and_wait) before treating it as a
+# failed write.
+CONFIG_SET_REPLY_TIMEOUT_S = 3.0
+
 # How many times check_model_metadata() will send "version" or "model" while
 # waiting for a first reply, before it gives up and stops asking. Two
 # callers share this same counter: the 10-second status timer
@@ -38,6 +43,19 @@ MAX_CONFIG_DOWNLOAD_ATTEMPTS = 3
 # resolves, so this does not change how many times a value is asked for,
 # only when the earliest ones actually reach the wire.
 MACHINE_METADATA_QUERY_MAX_ATTEMPTS = 3
+
+# How long to wait for the next decompress progress reply from the firmware
+# (Player::decompress, Player.cpp) before giving up instead of waiting
+# forever. That loop sends "#Info: decompart = N" every 11 blocks, plus one
+# more, unconditional, once the whole file is unpacked, so once any progress
+# has arrived this only has to cover a stall between two of those replies,
+# not the whole transfer. DECOMPRESS_TIMEOUT_PER_BLOCK_SEC is a conservative
+# per-block allowance (decompress plus an SD-card write, well above the
+# well-under-a-second each normally takes); DECOMPRESS_TIMEOUT_FLOOR_SEC
+# covers link latency before the first -- or, for a file under 11 blocks,
+# the only -- reply arrives.
+DECOMPRESS_TIMEOUT_FLOOR_SEC = 15
+DECOMPRESS_TIMEOUT_PER_BLOCK_SEC = 1.0
 
 
 def is_android():
@@ -343,7 +361,7 @@ from .GcodeViewer import (
     VISIBILITY_MAX_TOOLS,
     GCodeViewer,
 )
-from .machine.clients import rows_for_display
+from .machine.clients import row_display_text, rows_for_display
 from .machine.identity import load_or_create_identity, set_name
 from .machine.passive_fetch import PassiveFetchTracker
 from .ui import widget_helpers
@@ -688,6 +706,9 @@ class ConfirmPopup(ModalView):
     content_scroll = ObjectProperty(None)
     lb_title = ObjectProperty(None)
     lb_content = ObjectProperty(None)
+    # Normally "Confirm"; the tool-change popup relabels it when pressing
+    # it would take control from another controller (tool_confirm_button_text).
+    confirm_text = StringProperty("")
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -696,6 +717,7 @@ class ConfirmPopup(ModalView):
         self._default_pos_hint = dict(self.pos_hint)
         self._default_title_size_hint_y = self.lb_title.size_hint_y
         self._default_content_halign = self.lb_content.halign
+        self.confirm_text = tr._("Confirm")
 
     def dismiss(self, *largs, **kwargs):
         # Instant dismiss so layout defaults restore before the next open.
@@ -707,6 +729,7 @@ class ConfirmPopup(ModalView):
         self.pos_hint = dict(self._default_pos_hint)
         self.lb_title.size_hint_y = self._default_title_size_hint_y
         self.lb_content.halign = self._default_content_halign
+        self.confirm_text = tr._("Confirm")
         if self.content_scroll is not None:
             self.content_scroll.scroll_y = 1
 
@@ -1638,6 +1661,32 @@ def settings_apply_disabled(has_controller_changes, has_machine_changes, machine
     return not (has_controller_changes or has_machine_changes)
 
 
+def with_controller_name(text, name):
+    """Append this controller's own identity name to ``text`` (the window
+    title, or a tool-change popup's heading) so two windows on the same
+    screen -- this controller's own and a browser demo view, say -- can be
+    told apart at a glance. Unchanged when there is no name to show."""
+    if not name:
+        return text
+    return tr._("{text} — {name}").format(text=text, name=name)
+
+
+def tool_confirm_button_text(*, has_control, control_holder_id, control_holder_name):
+    """The tool-change popup's Confirm button label. Unchanged ("Confirm")
+    while this controller holds control, or while nobody holds it --
+    confirming there has nothing to take. Otherwise, in either mode,
+    pressing Confirm moves control here just like any other user-caused
+    command (Controller.update_control_holder): acting on a controller
+    without control takes it in single-user mode too, and a single-user
+    controller is told who holds it the same as a multi-user one, so the
+    button names the controller it would take control from regardless of
+    mode."""
+    if has_control or control_holder_id == 0:
+        return tr._("Confirm")
+    name = control_holder_name or tr._("Another controller")
+    return tr._("Confirm and take control from {name}").format(name=name)
+
+
 class ConfigPopup(ModalView):
     # Why machine settings can't be applied from here right now, shown beside
     # the Apply button; empty while they can. See
@@ -2162,32 +2211,42 @@ class FuncDropDown(ToolTipDropDown):
     pass
 
 
-class StatusDropDown(ToolTipDropDown):
-    # A simple "who else is connected" list, one line per row, newest data
-    # from the last client-list reply. Empty when there is nothing to show
-    # (not connected, or no reply received yet).
-    connected_controllers_text = StringProperty("")
+class ConnectedControllerRow(Label):
+    """One row in the status drop-down's connected-controllers list: a
+    single, legible line that never wraps -- a wrapped line reads as a
+    second controller. The name is already truncated with an
+    ellipsis by machine.clients.row_display_text before it gets here, and
+    `has_control` only changes this row's colour, so "you" and "in control"
+    stay readable at a glance without the row growing a second line."""
 
+    has_control = BooleanProperty(False)
+
+
+class StatusDropDown(ToolTipDropDown):
     # Whether releasing control right now would do anything -- pushed from
-    # Makera.update_control_holder, the same way connected_controllers_text
-    # is pushed from set_connected_controllers below, rather than bound live
-    # to app.root: this widget is built before app.root is assigned, so a
-    # live `app.root.can_release_control` binding fails at kv-parse time.
+    # Makera.update_control_holder, rather than bound live to app.root: this
+    # widget is built before app.root is assigned, so a live
+    # `app.root.can_release_control` binding fails at kv-parse time.
     can_release_control = BooleanProperty(False)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
     def set_connected_controllers(self, rows):
-        lines = []
+        """Rebuild the connected-controllers list as one row per
+        controller (see ConnectedControllerRow): a wrapped second line on a
+        single shared label could be mistaken for another controller, so
+        each controller gets its own single-line row instead. Empty `rows`
+        leaves the container with no children, so nothing is shown."""
+        container = self.connected_controllers_container
+        container.clear_widgets()
         for row in rows:
-            label = row.name
-            if row.is_self:
-                label += tr._(" (you)")
-            if row.has_control:
-                label += tr._(" — in control")
-            lines.append(label)
-        self.connected_controllers_text = "\n".join(lines)
+            text = row_display_text(
+                row,
+                you_suffix=tr._(" (you)"),
+                control_suffix=tr._(" — in control"),
+            )
+            container.add_widget(ConnectedControllerRow(text=text, has_control=row.has_control))
 
 
 class ComPortsDropDown(ToolTipDropDown):
@@ -4712,14 +4771,7 @@ class Makera(RelativeLayout):
                     break
             # Update Decompress status bar
             if self.decompstatus == True:
-                if self.decompercent != self.decompercentlast:
-                    self.updateCompressProgress(self.decompercent)
-                    self.decompercentlast = self.decompercent
-                    self.decomptime = time.time()
-                else:
-                    t = time.time()
-                    if t - self.decomptime > 8:
-                        self.updateCompressProgress(self.fileCompressionBlocks)
+                self._update_decompress_progress(t)
 
             # Update position if needed
             if self.controller.posUpdate:
@@ -5063,6 +5115,19 @@ class Makera(RelativeLayout):
                 + tr._("Then press ' Confirm' or main button to proceed")
             )
 
+        # Name this controller, so two windows showing the same popup can be
+        # told apart, and -- without control, while someone else holds it --
+        # say that confirming takes control from them, since confirming
+        # from the wrong window would otherwise move control silently. This
+        # applies in single-user mode too: acting without control takes it
+        # there as well, and the holder is known there too.
+        self.confirm_popup.lb_title.text = with_controller_name(self.confirm_popup.lb_title.text, self.identity.name)
+        self.confirm_popup.confirm_text = tool_confirm_button_text(
+            has_control=self.controller.has_control,
+            control_holder_id=self.controller.control_holder_id,
+            control_holder_name=self.controller.control_holder_name,
+        )
+
         self.confirm_popup.cancel = partial(self.controller.abortCommand)
         self.confirm_popup.confirm = partial(self.changeTool)
         self.confirm_popup.open(self)
@@ -5167,6 +5232,12 @@ class Makera(RelativeLayout):
         app = App.get_running_app()
         app.selected_local_filename = local_cached_file_path
         app.selected_remote_filename = remote_path
+        # The operator just opened this by hand -- the passive-fetch tracker
+        # (machine/passive_fetch.py) must agree this file is the one on
+        # screen, or a later play-started event for it gets wrongly
+        # dropped as "already loaded" against whatever this controller
+        # last auto-fetched instead (see on_passive_file_published()).
+        self._passive_fetch.mark_loaded(remote_path)
 
         Clock.schedule_once(partial(self._select_file_ui_update, remote_path, local_cached_file_path), 0)
 
@@ -6083,8 +6154,23 @@ class Makera(RelativeLayout):
         self.controller.loadNUM = LOAD_DIR
         self.controller.loadEOF = False
         self.controller.loadERR = False
+        # A refusal left over from a previous, different load command (e.g.
+        # a refused delete) must never be read as this ls's own outcome.
+        self.controller.load_refused_reason = None
         self.short_load_time = time.time()
         self.controller.lsCommand(os.path.normpath(ls_dir))
+
+    def _consume_load_refusal(self):
+        """True, and clears the flag, when the load command that just ended
+        was refused by the firmware's control token (ControlToken.cpp)
+        rather than failing or timing out. The refusal's own text -- naming
+        whoever has control -- already reached the console through
+        Controller.parseLine, the same way a refused "suspend" is shown, so
+        showing it again here as a generic "Error loading ..." popup would
+        just be a second, less specific message for the same event."""
+        refused = self.controller.load_refused_reason is not None
+        self.controller.load_refused_reason = None
+        return refused
 
     def _finish_machine_ls(self, now):
         with self._machine_ls_lock:
@@ -6094,7 +6180,10 @@ class Makera(RelativeLayout):
             superseded = machine_ls_is_superseded(sent_path, wanted_path)
             if not superseded:
                 if self.controller.loadERR:
-                    Clock.schedule_once(partial(self.loadError, tr._("Error loading dir") + " '%s'!" % (sent_path,)), 0)
+                    if not self._consume_load_refusal():
+                        Clock.schedule_once(
+                            partial(self.loadError, tr._("Error loading dir") + " '%s'!" % (sent_path,)), 0
+                        )
                 elif timed_out:
                     Clock.schedule_once(
                         partial(self.loadError, tr._("Timeout loading dir") + " '%s'!" % (sent_path,)), 0
@@ -6439,10 +6528,24 @@ class Makera(RelativeLayout):
         catalogue). Queues the path and checks immediately in case the
         machine is already idle (the common upload-finished case); if not,
         updateStatus()'s own idle check catches it once the job finishes.
+
+        Dispatched via Clock.schedule_once by the caller (Controller.py's
+        _notify_file_published), so this already runs on the main thread --
+        safe to touch app.selected_* directly, unlike _auto_fetch_played_file.
+        If `path` is not what is currently on screen, that drawing cannot be
+        this job's: blank the selection (the same "nothing selected" state
+        cancelSelectFile() uses) so updateStatus()'s progress/position
+        plotting -- gated on selected_remote_filename/selected_local_filename
+        being non-blank -- stops drawing the old file's geometry under the
+        new job's line numbers. The fetch below redraws the right file once
+        it lands.
         """
         app = App.get_running_app()
         if app is None or self.controller.has_control:
             return
+        if path and path != app.selected_remote_filename:
+            app.selected_remote_filename = ""
+            app.selected_local_filename = ""
         self._passive_fetch.note_published_file(path)
         self._check_passive_fetch(app.state == "Idle")
 
@@ -6454,7 +6557,7 @@ class Makera(RelativeLayout):
         playing (see machine/passive_fetch.py)."""
         if self._auto_fetch_in_progress:
             return
-        path = self._passive_fetch.due_fetch(is_idle)
+        path = self._passive_fetch.due_fetch(is_idle, now=time.monotonic())
         if path is None:
             return
         self._auto_fetch_in_progress = True
@@ -6466,25 +6569,73 @@ class Makera(RelativeLayout):
         fetch already use. automatic=True routes the download command
         through the automatic-command wrapper (0x6B) so it is never
         mistaken for a user action and never takes control on this
-        controller's behalf; open_after=True parses and draws it exactly
-        like opening a file locally. Runs on its own thread: doDownload
-        blocks until the transfer finishes, and this must not stall the
-        Kivy clock or the status-polling loop that called it.
+        controller's behalf. open_after=False keeps the transfer itself
+        Kivy-free: doDownload's open_after=True branch calls
+        load_gcode_file() -- which draws the toolpath -- straight from
+        whatever thread called it, and the file browser (upstream
+        4cd0dcc/0d95a6a) redraws from selected_remote_filename's change,
+        so setting that property here used to crash off the main Kivy
+        thread ("Cannot change graphics instruction outside the main Kivy
+        thread"). Runs on its own thread (started by _check_passive_fetch):
+        doDownload blocks until the transfer finishes, and this must not
+        stall the Kivy clock or the status-polling loop that called it.
+
+        Everything that touches Kivy -- the selected-file properties and
+        loading the toolpath -- is handed to the main thread via
+        Clock.schedule_once in _finish_auto_fetch_played_file, and only
+        once the download has actually succeeded. mark_loaded is called
+        from there too: a failed download instead calls
+        note_fetch_failed(), which re-queues the path for a later idle
+        status tick -- backed off (machine/passive_fetch.py's
+        RETRY_BACKOFF_S) and capped (MAX_FETCH_ATTEMPTS) so a file that
+        keeps failing is not retried on every tick forever.
+        """
+        local_path = os.path.join(self.temp_dir, os.path.basename(remote_path))
+        try:
+            download_result = self.doDownload(
+                remote_path, local_path, show_progress=False, open_after=False, automatic=True
+            )
+        except Exception:
+            logger.exception("Passive auto-fetch of %s raised during download", remote_path)
+            download_result = None
+        if download_result is None or download_result < 0:
+            logger.warning(
+                "Passive auto-fetch of %s did not complete (doDownload returned %r); "
+                "retrying on a later idle status or file event",
+                remote_path,
+                download_result,
+            )
+            self._passive_fetch.note_fetch_failed(remote_path, time.monotonic())
+            self._auto_fetch_in_progress = False
+            return
+        Clock.schedule_once(partial(self._finish_auto_fetch_played_file, remote_path, local_path))
+
+    def _finish_auto_fetch_played_file(self, remote_path, local_path, *_args):
+        """Main-thread completion of _auto_fetch_played_file, scheduled
+        only after the download succeeded. Sets the selected file (matches
+        what a manual download/play sets, see check_and_download(), so the
+        rest of the UI -- the progress bar's filename, "recent files" --
+        reflects this file the same way it would if the operator had
+        opened it) and draws the toolpath via load_gcode_file() -- both
+        require the main Kivy thread, see _auto_fetch_played_file. Marks
+        the tracker loaded only once this has actually happened; an
+        exception here (e.g. a corrupt file) counts as a failed attempt
+        (note_fetch_failed) instead, the same recovery as a download
+        failure.
         """
         try:
-            local_path = os.path.join(self.temp_dir, os.path.basename(remote_path))
             app = App.get_running_app()
             if app is not None:
-                # Matches what a manual download/play sets (see
-                # check_and_download()) so the rest of the UI -- the
-                # progress bar's filename, "recent files" -- reflects this
-                # file the same way it would if the operator had opened it.
                 app.selected_remote_filename = remote_path
                 app.selected_local_filename = local_path
-            self.doDownload(remote_path, local_path, show_progress=False, open_after=True, automatic=True)
+            self.load_gcode_file(local_path)
+        except Exception:
+            logger.exception("Passive auto-fetch of %s failed to load after download", remote_path)
+            self._passive_fetch.note_fetch_failed(remote_path, time.monotonic())
+            return
         finally:
-            self._passive_fetch.mark_loaded(remote_path)
             self._auto_fetch_in_progress = False
+        self._passive_fetch.mark_loaded(remote_path)
 
     def show_usb_reset_blocked_popup(self, *args):
         content = BoxLayout(orientation="vertical", padding=dp(15))
@@ -7353,8 +7504,65 @@ class Makera(RelativeLayout):
         self.progress_info = self._format_file_progress_info(playing=True, remaining_sec=self._current_remaining_sec())
 
     # --------------------------------------------------------------`---------
+    def _update_decompress_progress(self, now):
+        """Advance the "Decompressing" progress bar once per monitorSerial
+        tick while an uploaded .lz file is being unpacked on the machine's
+        card (doUpload sets self.decompstatus after a successful upload).
+
+        Progress comes entirely from the firmware's own replies
+        (Player::decompress, Player.cpp): a "#Info: decompart = N" line
+        every 11 blocks, plus one more, unconditional, once the whole file
+        is done (main.py's remote_decompercent regex turns that into
+        self.decompercent). If none of that ever arrives -- the reply is
+        lost, or the decompress itself hangs or errors out on the machine --
+        this must still end the upload instead of waiting forever, so a
+        watchdog (DECOMPRESS_TIMEOUT_FLOOR_SEC and
+        DECOMPRESS_TIMEOUT_PER_BLOCK_SEC) gives up with a clear message
+        instead.
+        """
+        if self.fileCompressionBlocks <= 0:
+            # Nothing to decompress (the source compressed to zero blocks,
+            # e.g. an empty file): there is no firmware reply to wait for,
+            # and nothing to divide by in updateCompressProgress below, so
+            # finish at once instead of waiting on a reply that may never
+            # add new information.
+            self.updateCompressProgress(self.fileCompressionBlocks)
+            return
+        if self.decompercent != self.decompercentlast:
+            self.updateCompressProgress(self.decompercent)
+            self.decompercentlast = self.decompercent
+            self.decomptime = now
+            return
+        timeout = max(
+            DECOMPRESS_TIMEOUT_FLOOR_SEC,
+            DECOMPRESS_TIMEOUT_PER_BLOCK_SEC * self.fileCompressionBlocks,
+        )
+        if now - self.decomptime > timeout:
+            self._decompress_timed_out()
+
+    # --------------------------------------------------------------`---------
+    def _decompress_timed_out(self):
+        """No decompress progress arrived within the watchdog's time (see
+        _update_decompress_progress): end the upload state honestly -- a
+        clear error, the progress popup dismissed, the UI left usable --
+        instead of the old fallback of silently treating the wait's end as
+        a finished transfer either way.
+        """
+        self.decompstatus = False
+        self.pending_decompress_callback = None
+        message = tr._("Decompressing on the machine timed out; the file may not be usable.")
+        self.controller.log.put((Controller.MSG_ERROR, message))
+        Clock.schedule_once(self.progressFinish, 0)
+        Clock.schedule_once(partial(self.show_message_popup, message, False), 0)
+
+    # --------------------------------------------------------------`---------
     def updateCompressProgress(self, value):
-        Clock.schedule_once(partial(self.progressUpdate, value * 100.0 / self.fileCompressionBlocks, "", True), 0)
+        # self.fileCompressionBlocks is 0 only when there was nothing to
+        # decompress (an empty source file); treat that as 100% rather than
+        # dividing by zero.
+        total_blocks = self.fileCompressionBlocks
+        percent = 100.0 if total_blocks <= 0 else value * 100.0 / total_blocks
+        Clock.schedule_once(partial(self.progressUpdate, percent, "", True), 0)
         if value == self.fileCompressionBlocks:
             Clock.schedule_once(self.progressFinish, 0)
             # Refresh the remote dir since upload finished
@@ -8734,13 +8942,72 @@ class Makera(RelativeLayout):
             self.apply_controller_setting_changes()
 
     def apply_machine_setting_changes(self):
-        for key in self.setting_change_list:
-            self.controller.setConfigValue(key, self.setting_change_list[key])
-            time.sleep(0.1)
+        """Send every pending machine setting as its own config-set and
+        confirm it actually reached the card before telling the user it
+        was applied: a refusal because another controller holds control,
+        or a dropped link, must not look like success.
+
+        Runs the sends on a worker thread (_apply_machine_setting_changes_worker)
+        since confirming a write can take up to CONFIG_SET_REPLY_TIMEOUT_S per
+        key -- this is called directly from the Apply button's UI handler, so
+        doing that on the calling (Kivy main) thread would freeze the window
+        for the whole wait.
+        """
+        pending = dict(self.setting_change_list)
         self.setting_change_list.clear()
         self.config_popup.btn_apply.disabled = True
-        self.message_popup.lb_content.text = tr._("Settings applied, need machine reset to take effect !")
+        threading.Thread(
+            target=self._apply_machine_setting_changes_worker,
+            args=(pending,),
+            daemon=True,
+        ).start()
+
+    def _apply_machine_setting_changes_worker(self, pending):
+        """Off the Kivy main thread (see apply_machine_setting_changes):
+        send each key and wait for its own reply before sending the next,
+        then hand the result back to the main thread via Clock.schedule_once
+        -- nothing here touches a widget or a popup directly."""
+        failures = []
+        for key, value in pending.items():
+            success, message = self.controller.set_config_value_and_wait(key, value, timeout=CONFIG_SET_REPLY_TIMEOUT_S)
+            if not success:
+                failures.append((key, message))
+        Clock.schedule_once(partial(self._finish_apply_machine_setting_changes, pending, failures), 0)
+
+    def _finish_apply_machine_setting_changes(self, pending, failures, *_args):
+        """Runs on the Kivy main thread, scheduled by the worker above.
+        Reports success only when every key was acknowledged. On any
+        failure: name the failed settings and the firmware's reason (or
+        the timeout), revert just those widgets to their pre-Apply value --
+        the card's own value, since that write never landed -- and leave
+        the snapshot for keys that did succeed pointing at their new,
+        now-applied value, so a later Apply does not treat them as still
+        pending. Either way, re-read config.txt afterwards
+        (download_config_file, the same path the settings page uses to
+        load it) so the page reflects whatever is actually on the card
+        rather than what this attempt assumed."""
+        failed_keys = {key for key, _reason in failures}
+        for widget in self.config_popup._all_setting_items():
+            if widget.key not in pending:
+                continue
+            if widget.key in failed_keys:
+                original = self.config_popup.get_original(widget.section, widget.key)
+                if original is not None:
+                    widget.value = original
+            else:
+                # Succeeded: the card now holds this value, so the
+                # snapshot must too, or the next Apply would see a change
+                # that was already applied and resend it.
+                self.config_popup._widget_snapshot[(widget.section, widget.key)] = widget.value
+        if failures:
+            reasons = "\n".join(f"{key}: {reason}" for key, reason in failures)
+            self.message_popup.lb_content.text = tr._(
+                "Could not apply the following settings; reverted to the current value:\n{reasons}"
+            ).format(reasons=reasons)
+        else:
+            self.message_popup.lb_content.text = tr._("Settings applied, need machine reset to take effect !")
         self.message_popup.open()
+        self.download_config_file()
 
     def apply_controller_setting_changes(self):
         if self.controller_setting_change_list.get("ui_density_override") or self.controller_setting_change_list.get(
@@ -8794,6 +9061,9 @@ class Makera(RelativeLayout):
             # agree even if the settings panel accepted a longer name.
             self.identity = set_name(_KivyConfigIdentityStore(), self.controller_setting_change_list["controller_name"])
             self.controller.identity = self.identity
+            App.get_running_app().title = with_controller_name(
+                tr._("Carvera Controller Community") + " v" + __version__, self.identity.name
+            )
 
         pendant_changed = any(
             k == "pendant_type" or k.startswith("gamepad_") for k in self.controller_setting_change_list
@@ -9815,10 +10085,14 @@ class MakeraApp(App):
     def build(self):
         self.settings_cls = SettingsWithSidebar
         self.use_kivy_settings = True
-        self.title = tr._("Carvera Controller Community") + " v" + __version__
         self.icon = os.path.join(os.path.dirname(__file__), "icon.png")
 
-        return Makera(ctl_version=__version__)
+        root = Makera(ctl_version=__version__)
+        # Identity (and its name) is created in Makera.__init__, above, so
+        # the title can show it from the first frame -- two windows on the
+        # same screen are otherwise identical.
+        self.title = with_controller_name(tr._("Carvera Controller Community") + " v" + __version__, root.identity.name)
+        return root
 
     def on_start(self):
         # Workaround for Android blank screen issue
