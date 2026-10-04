@@ -8,8 +8,10 @@ Covers:
   2. A relay from another identified client is decoded into
      relayed_tool_table; an unrecognised relay payload is dropped.
   3. Upload-finished and play-started events are decoded and recorded
-     (last_published_file_path); other event kinds still do not crash.
-  4. A fresh reconnect clears both, same as connected_clients/control state.
+     (last_published_file_path, last_published_checksum); other event
+     kinds still do not crash.
+  4. A fresh reconnect clears all of these, same as connected_clients/
+     control state.
 """
 
 from __future__ import annotations
@@ -133,6 +135,36 @@ def test_play_started_event_is_recorded(machine, controller):
     assert m.wait_until(lambda: controller.last_published_file_path == "/sd/other.nc")
 
 
+def test_upload_finished_event_records_its_checksum(machine, controller):
+    m = machine(mode="new")
+    controller.open(CONN_WIFI, m.address())
+    assert _wait_identified(m, controller)
+
+    checksum = bytes(range(16))
+    assert m.send_upload_finished_event(b"/sd/job.nc", size=42, checksum_type=1, checksum=checksum)
+    assert m.wait_until(lambda: controller.last_published_checksum == checksum)
+
+
+def test_upload_finished_event_with_no_checksum_records_blank(machine, controller):
+    m = machine(mode="new")
+    controller.open(CONN_WIFI, m.address())
+    assert _wait_identified(m, controller)
+
+    assert m.send_upload_finished_event(b"/sd/job.nc", size=42)
+    assert m.wait_until(lambda: controller.last_published_file_path == "/sd/job.nc")
+    assert controller.last_published_checksum == b""
+
+
+def test_play_started_event_carries_no_checksum(machine, controller):
+    m = machine(mode="new")
+    controller.open(CONN_WIFI, m.address())
+    assert _wait_identified(m, controller)
+
+    assert m.send_play_started_event(b"/sd/other.nc")
+    assert m.wait_until(lambda: controller.last_published_file_path == "/sd/other.nc")
+    assert controller.last_published_checksum == b""
+
+
 def test_control_changed_event_still_works_alongside_file_events(machine, controller):
     """The EVENT dispatch now tries three decoders in turn -- a
     control-changed event must still be recognised correctly, not
@@ -161,3 +193,15 @@ def test_reconnect_clears_relayed_table_and_published_path(machine, controller):
     controller.close(allow_reconnect=False)
     assert controller.relayed_tool_table == {}
     assert controller.last_published_file_path == ""
+
+
+def test_reconnect_clears_published_checksum_too(machine, controller):
+    m = machine(mode="new")
+    controller.open(CONN_WIFI, m.address())
+    assert _wait_identified(m, controller)
+    checksum = bytes(range(16))
+    assert m.send_upload_finished_event(b"/sd/job.nc", checksum_type=1, checksum=checksum)
+    assert m.wait_until(lambda: controller.last_published_checksum == checksum)
+
+    controller.close(allow_reconnect=False)
+    assert controller.last_published_checksum == b""

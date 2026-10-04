@@ -3170,6 +3170,12 @@ class Makera(RelativeLayout):
         # events -- see on_passive_file_published() and updateStatus().
         self._passive_fetch = PassiveFetchTracker()
         self._auto_fetch_in_progress = False
+        # The path/digest of the most recent upload-finished event seen,
+        # so a play-started event for the same path -- which never carries
+        # a checksum of its own -- can still be checked against the local
+        # copy in on_passive_file_published().
+        self._last_upload_checksum_path = None
+        self._last_upload_checksum = b""
         # Fill basic global variables
         CNC.vars["state"] = NOT_CONNECTED
         CNC.vars["color"] = STATECOLOR[NOT_CONNECTED]
@@ -6534,7 +6540,7 @@ class Makera(RelativeLayout):
         if self.tool_table:
             self.controller.send_tool_table_relay(self._tool_table_relay_entries())
 
-    def on_passive_file_published(self, path):
+    def on_passive_file_published(self, path, checksum=b""):
         """The machine published an upload-finished or play-started event
         naming `path` (Controller._on_file_published). Only a passive
         controller acts on this: the controller that is actually driving
@@ -6555,13 +6561,41 @@ class Makera(RelativeLayout):
         being non-blank -- stops drawing the old file's geometry under the
         new job's line numbers. The fetch below redraws the right file once
         it lands.
+
+        `checksum` is the upload-finished event's own digest (b"" for a
+        play-started event, or for old firmware, which announces no
+        usable one). Remembered per path, so a play-started event that
+        follows shortly after for the same path can still use it -- the
+        path plus the last upload-finished checksum is enough; a
+        play-started event never needs one of its own. When `path` is
+        already on screen and this digest matches the local copy already
+        there (Utils.md5), the file does not need fetching again: the
+        download is skipped outright and the tracker is told the file is
+        loaded, exactly as a real fetch would. Any other case -- a
+        different file on screen, no checksum known, or a mismatch --
+        fetches exactly as before; this only ever removes a fetch that
+        would have re-downloaded identical bytes, never adds a reason to
+        skip one.
         """
         app = App.get_running_app()
         if app is None or self.controller.has_control:
             return
+        if checksum:
+            self._last_upload_checksum_path = path
+            self._last_upload_checksum = checksum
+        elif path == self._last_upload_checksum_path:
+            checksum = self._last_upload_checksum
         if path and path != app.selected_remote_filename:
             app.selected_remote_filename = ""
             app.selected_local_filename = ""
+        elif (
+            checksum
+            and app.selected_local_filename
+            and os.path.exists(app.selected_local_filename)
+            and Utils.md5(app.selected_local_filename) == checksum.hex()
+        ):
+            self._passive_fetch.mark_loaded(path)
+            return
         self._passive_fetch.note_published_file(path)
         self._check_passive_fetch(app.state == "Idle")
 

@@ -19,6 +19,7 @@ that has actually happened.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import threading
 from types import SimpleNamespace
@@ -68,7 +69,17 @@ def _passive_host(tmp_path):
     root.temp_dir = str(tmp_path)
     root._passive_fetch = PassiveFetchTracker()
     root._auto_fetch_in_progress = False
+    root._last_upload_checksum_path = None
+    root._last_upload_checksum = b""
     return root
+
+
+def _write_local_file(tmp_path, name, content=b"G0 X0\n"):
+    """A local file with known bytes, plus the raw md5 digest an
+    upload-finished event would announce for the same content."""
+    path = tmp_path / name
+    path.write_bytes(content)
+    return str(path), hashlib.md5(content).digest()
 
 
 def test_mark_loaded_not_called_on_download_failure(monkeypatch, tmp_path):
@@ -296,6 +307,112 @@ def test_on_passive_file_published_does_nothing_with_control(monkeypatch, tmp_pa
     assert app.selected_remote_filename == "/sd/other.nc"  # untouched -- this controller has control
     root._check_passive_fetch.assert_not_called()
     assert root._passive_fetch.pending_path is None
+
+
+# -- skipping the fetch when a matching local copy is already on screen ------
+
+
+def test_on_passive_file_published_skips_fetch_when_checksum_matches_local_copy(monkeypatch, tmp_path):
+    """The announced path is already the file on screen, and the
+    upload-finished event's own digest matches the local copy already
+    there: nothing needs to come off the machine's single transfer slot."""
+    root = _passive_host(tmp_path)
+    root.controller = SimpleNamespace(has_control=False)
+    root._check_passive_fetch = MagicMock()
+    local_path, digest = _write_local_file(tmp_path, "job.nc")
+    app = SimpleNamespace(selected_remote_filename="/sd/job.nc", selected_local_filename=local_path, state="Idle")
+    monkeypatch.setattr("carveracontroller.main.App.get_running_app", lambda: app)
+
+    Makera.on_passive_file_published(root, "/sd/job.nc", digest)
+
+    root._check_passive_fetch.assert_not_called()
+    assert root._passive_fetch.pending_path is None
+    # Treated exactly as a completed fetch -- a repeat of the same
+    # announcement is deduplicated the ordinary way too.
+    assert root._passive_fetch.due_fetch(is_idle=True) is None
+
+
+def test_on_passive_file_published_fetches_when_checksum_differs(monkeypatch, tmp_path):
+    """Same path on screen, but the announced digest does not match the
+    local copy -- the card's file changed since it was last fetched, so
+    this must still fetch."""
+    root = _passive_host(tmp_path)
+    root.controller = SimpleNamespace(has_control=False)
+    root._check_passive_fetch = MagicMock()
+    local_path, _stale_digest = _write_local_file(tmp_path, "job.nc", content=b"old content")
+    app = SimpleNamespace(selected_remote_filename="/sd/job.nc", selected_local_filename=local_path, state="Idle")
+    monkeypatch.setattr("carveracontroller.main.App.get_running_app", lambda: app)
+    new_digest = hashlib.md5(b"new content").digest()
+
+    Makera.on_passive_file_published(root, "/sd/job.nc", new_digest)
+
+    root._check_passive_fetch.assert_called_once_with(True)
+    assert root._passive_fetch.pending_path == "/sd/job.nc"
+
+
+def test_on_passive_file_published_fetches_when_no_checksum_is_known(monkeypatch, tmp_path):
+    """Old firmware (checksum_type 0, decoded as b"") or a play-started
+    event with no prior upload-finished checksum for this path: fetch
+    exactly as before, even though the announced path matches what is on
+    screen -- a path match alone is never enough to skip."""
+    root = _passive_host(tmp_path)
+    root.controller = SimpleNamespace(has_control=False)
+    root._check_passive_fetch = MagicMock()
+    local_path, _digest = _write_local_file(tmp_path, "job.nc")
+    app = SimpleNamespace(selected_remote_filename="/sd/job.nc", selected_local_filename=local_path, state="Idle")
+    monkeypatch.setattr("carveracontroller.main.App.get_running_app", lambda: app)
+
+    Makera.on_passive_file_published(root, "/sd/job.nc")  # no checksum arg -- b"" default
+
+    root._check_passive_fetch.assert_called_once_with(True)
+    assert root._passive_fetch.pending_path == "/sd/job.nc"
+
+
+def test_on_passive_file_published_skip_requires_a_real_local_file(monkeypatch, tmp_path):
+    """A matching path and a checksum are not enough on their own -- the
+    local file selected_local_filename names has to actually exist (it
+    may have been moved or cleaned up since it was selected)."""
+    root = _passive_host(tmp_path)
+    root.controller = SimpleNamespace(has_control=False)
+    root._check_passive_fetch = MagicMock()
+    missing_path = str(tmp_path / "gone.nc")
+    app = SimpleNamespace(selected_remote_filename="/sd/job.nc", selected_local_filename=missing_path, state="Idle")
+    monkeypatch.setattr("carveracontroller.main.App.get_running_app", lambda: app)
+
+    Makera.on_passive_file_published(root, "/sd/job.nc", hashlib.md5(b"anything").digest())
+
+    root._check_passive_fetch.assert_called_once_with(True)
+
+
+def test_on_passive_file_published_reuses_last_upload_checksum_for_a_later_play_started(monkeypatch, tmp_path):
+    """The path plus the last upload-finished checksum is enough: a
+    play-started event for the same path, which never carries a checksum
+    of its own, still benefits from the skip."""
+    root = _passive_host(tmp_path)
+    root.controller = SimpleNamespace(has_control=False)
+    local_path, digest = _write_local_file(tmp_path, "job.nc")
+    app = SimpleNamespace(selected_remote_filename="", selected_local_filename="", state="Idle")
+    monkeypatch.setattr("carveracontroller.main.App.get_running_app", lambda: app)
+
+    # upload-finished: the file is not yet on screen, so this still
+    # queues a fetch -- but the digest is remembered for the path either
+    # way.
+    root._check_passive_fetch = MagicMock()
+    Makera.on_passive_file_published(root, "/sd/job.nc", digest)
+    root._check_passive_fetch.assert_called_once_with(True)
+
+    # The earlier fetch has now landed (what _finish_auto_fetch_played_file
+    # does on success): the file is on screen with matching content.
+    app.selected_remote_filename = "/sd/job.nc"
+    app.selected_local_filename = local_path
+    root._passive_fetch.mark_loaded("/sd/job.nc")
+
+    # A later play-started event for the same path carries no checksum of
+    # its own -- the one remembered from the upload-finished still
+    # applies, so this is skipped rather than re-fetched.
+    root._check_passive_fetch = MagicMock()
+    Makera.on_passive_file_published(root, "/sd/job.nc")
+    root._check_passive_fetch.assert_not_called()
 
 
 def test_select_file_marks_the_tracker_loaded(monkeypatch, tmp_path):
