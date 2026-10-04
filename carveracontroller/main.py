@@ -5640,6 +5640,19 @@ class Makera(RelativeLayout):
         cache.ingest_file(source, machine_cache_key(conn, remote_path), size, date_raw)
 
     # -----------------------------------------------------------------------
+    def _finish_downloaded_file_open(self, remote_path, local_path, *_args):
+        """Main-thread completion of doDownload's open_after branch (a
+        manual download-and-open from the file browser's
+        check_and_download(), which starts doDownload on a worker thread).
+        load_gcode_file() draws the toolpath and must run on the main Kivy
+        thread, so it -- and the thumbnail ingest alongside it -- are
+        scheduled here rather than called inline from doDownload."""
+        # Decompress QuickLZ in place first; ingesting the compressed
+        # payload would wrongly cache this file as having no thumbnail.
+        self.load_gcode_file(local_path)
+        self._ingest_machine_gcode_thumbnail(remote_path, local_path)
+
+    # -----------------------------------------------------------------------
     def doDownload(self, remote_path, local_path, show_progress=True, open_after=True, automatic=False):
         app = App.get_running_app()
         was_config_download = self.downloading_config
@@ -5778,10 +5791,13 @@ class Makera(RelativeLayout):
                     Clock.schedule_once(
                         partial(self.progressUpdate, 0, tr._("Open cached file") + " \n%s" % local_path, True), 0
                     )
-                # Decompress QuickLZ in place first; ingesting the compressed
-                # payload would cache a false "no preview" hit.
-                self.load_gcode_file(local_path)
-                self._ingest_machine_gcode_thumbnail(remote_path, local_path)
+                # load_gcode_file() draws the toolpath, which only the main
+                # Kivy thread may touch; doDownload's callers that use
+                # open_after=True (check_and_download) run it on a worker
+                # thread, so the load (and the thumbnail ingest alongside
+                # it) is deferred via Clock.schedule_once rather than run
+                # inline here.
+                Clock.schedule_once(partial(self._finish_downloaded_file_open, remote_path, local_path))
             else:
                 if self._decompress_downloaded_file_in_place(local_path):
                     self._ingest_machine_gcode_thumbnail(remote_path, local_path)
