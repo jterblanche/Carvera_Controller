@@ -29,3 +29,11 @@ def test_is_not_fooled_by_an_unrelated_error_or_alarm():
 def test_handles_empty_or_none_input():
     assert is_control_refusal("") is False
     assert is_control_refusal(None) is False
+
+
+def test_recognises_the_busy_refusal():
+    # Firmware's own config-write gate refuses config-set,
+    # config-restore and config-default the same way: an "error:Refused"
+    # line. Nothing here needs to be busy-specific -- the generic
+    # "error:Refused" shape this module already matches covers it.
+    assert is_control_refusal("error:Refused -- can't change settings while the machine is busy") is True
