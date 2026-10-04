@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import Callable
 
 from .base import CommunicationProtocol
@@ -25,7 +26,7 @@ def _normalize_message(message: ParsedMessage) -> ParsedMessage:
     cleaned = message.text.rstrip("\r\n")
     if cleaned == message.text:
         return message
-    return ParsedMessage(message.kind, cleaned)
+    return replace(message, text=cleaned)
 
 
 def protocol_name_from_announcement(text: str) -> str | None:

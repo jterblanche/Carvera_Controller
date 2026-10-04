@@ -178,6 +178,41 @@ def test_own_published_echo_is_not_shown_a_second_time(machine, controller):
     assert not any(kind == controller.MSG_PUBLISHED for kind, _text in seen)
 
 
+def test_published_reply_with_line_ending_is_shown_with_source_name(machine, controller):
+    """A reply (unlike a command echo) always ends in CRLF on the wire --
+    the shared console must still show it tagged with the sender's name
+    once that line ending is trimmed for display."""
+    m = machine(mode="new")
+    controller.open(CONN_WIFI, m.address())
+    assert _wait_identified(m, controller)
+
+    assert m.send_published_line(OTHER_ID, b"Shop PC", b"ok C: X:0\r\n")
+
+    seen = []
+
+    def _check():
+        seen.extend(_drain_log_messages(controller))
+        return any(kind == controller.MSG_PUBLISHED and text == "[Shop PC] ok C: X:0" for kind, text in seen)
+
+    assert m.wait_until(_check, timeout=1.0)
+
+
+def test_own_published_reply_with_line_ending_is_not_shown_a_second_time(machine, controller):
+    """The self-filter in _on_published_line compares source_id against
+    this controller's own identity -- it must still recognise its own
+    reply once the CRLF the firmware always sends on a reply has been
+    trimmed, not just a bare command echo with no line ending at all."""
+    m = machine(mode="new")
+    controller.open(CONN_WIFI, m.address())
+    assert _wait_identified(m, controller)
+
+    assert m.send_published_line(IDENTITY.id, b"Test PC", b"ok C: X:0\r\n")
+    time.sleep(0.3)
+
+    seen = _drain_log_messages(controller)
+    assert not any(kind == controller.MSG_PUBLISHED for kind, _text in seen)
+
+
 def test_published_line_from_another_controller_never_reaches_own_reply_handling(machine, controller):
     """Proves AC3's isolation requirement structurally, not just by
     absence of a symptom: a foreign published line carrying the exact
