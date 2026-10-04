@@ -688,6 +688,9 @@ class ConfirmPopup(ModalView):
     content_scroll = ObjectProperty(None)
     lb_title = ObjectProperty(None)
     lb_content = ObjectProperty(None)
+    # Normally "Confirm"; the tool-change popup relabels it when pressing
+    # it would take control from another controller (tool_confirm_button_text).
+    confirm_text = StringProperty("")
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -696,6 +699,7 @@ class ConfirmPopup(ModalView):
         self._default_pos_hint = dict(self.pos_hint)
         self._default_title_size_hint_y = self.lb_title.size_hint_y
         self._default_content_halign = self.lb_content.halign
+        self.confirm_text = tr._("Confirm")
 
     def dismiss(self, *largs, **kwargs):
         # Instant dismiss so layout defaults restore before the next open.
@@ -707,6 +711,7 @@ class ConfirmPopup(ModalView):
         self.pos_hint = dict(self._default_pos_hint)
         self.lb_title.size_hint_y = self._default_title_size_hint_y
         self.lb_content.halign = self._default_content_halign
+        self.confirm_text = tr._("Confirm")
         if self.content_scroll is not None:
             self.content_scroll.scroll_y = 1
 
@@ -1636,6 +1641,32 @@ def settings_apply_disabled(has_controller_changes, has_machine_changes, machine
     if has_machine_changes and not machine_writable:
         return True
     return not (has_controller_changes or has_machine_changes)
+
+
+def with_controller_name(text, name):
+    """Append this controller's own identity name to ``text`` (the window
+    title, or a tool-change popup's heading) so two windows on the same
+    screen -- this controller's own and a browser demo view, say -- can be
+    told apart at a glance. Unchanged when there is no name to show."""
+    if not name:
+        return text
+    return tr._("{text} — {name}").format(text=text, name=name)
+
+
+def tool_confirm_button_text(*, has_control, control_holder_id, control_holder_name):
+    """The tool-change popup's Confirm button label. Unchanged ("Confirm")
+    while this controller holds control, or while nobody holds it --
+    confirming there has nothing to take. Otherwise, in either mode,
+    pressing Confirm moves control here just like any other user-caused
+    command (Controller.update_control_holder): acting on a controller
+    without control takes it in single-user mode too, and a single-user
+    controller is told who holds it the same as a multi-user one, so the
+    button names the controller it would take control from regardless of
+    mode."""
+    if has_control or control_holder_id == 0:
+        return tr._("Confirm")
+    name = control_holder_name or tr._("Another controller")
+    return tr._("Confirm and take control from {name}").format(name=name)
 
 
 class ConfigPopup(ModalView):
@@ -5062,6 +5093,19 @@ class Makera(RelativeLayout):
                 + "%s\n" % (target_tool)
                 + tr._("Then press ' Confirm' or main button to proceed")
             )
+
+        # Name this controller, so two windows showing the same popup can be
+        # told apart, and -- without control, while someone else holds it --
+        # say that confirming takes control from them, since confirming
+        # from the wrong window would otherwise move control silently. This
+        # applies in single-user mode too: acting without control takes it
+        # there as well, and the holder is known there too.
+        self.confirm_popup.lb_title.text = with_controller_name(self.confirm_popup.lb_title.text, self.identity.name)
+        self.confirm_popup.confirm_text = tool_confirm_button_text(
+            has_control=self.controller.has_control,
+            control_holder_id=self.controller.control_holder_id,
+            control_holder_name=self.controller.control_holder_name,
+        )
 
         self.confirm_popup.cancel = partial(self.controller.abortCommand)
         self.confirm_popup.confirm = partial(self.changeTool)
@@ -8880,6 +8924,9 @@ class Makera(RelativeLayout):
             # agree even if the settings panel accepted a longer name.
             self.identity = set_name(_KivyConfigIdentityStore(), self.controller_setting_change_list["controller_name"])
             self.controller.identity = self.identity
+            App.get_running_app().title = with_controller_name(
+                tr._("Carvera Controller Community") + " v" + __version__, self.identity.name
+            )
 
         pendant_changed = any(
             k == "pendant_type" or k.startswith("gamepad_") for k in self.controller_setting_change_list
@@ -9901,10 +9948,14 @@ class MakeraApp(App):
     def build(self):
         self.settings_cls = SettingsWithSidebar
         self.use_kivy_settings = True
-        self.title = tr._("Carvera Controller Community") + " v" + __version__
         self.icon = os.path.join(os.path.dirname(__file__), "icon.png")
 
-        return Makera(ctl_version=__version__)
+        root = Makera(ctl_version=__version__)
+        # Identity (and its name) is created in Makera.__init__, above, so
+        # the title can show it from the first frame -- two windows on the
+        # same screen are otherwise identical.
+        self.title = with_controller_name(tr._("Carvera Controller Community") + " v" + __version__, root.identity.name)
+        return root
 
     def on_start(self):
         # Workaround for Android blank screen issue
