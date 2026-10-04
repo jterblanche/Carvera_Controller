@@ -2769,7 +2769,7 @@ class Controller:
             return
         if message.kind == MessageKind.EVENT:
             # Kinds 3 (job ended) and 4 (alarm/halt) are not decoded yet --
-            # reserved for a future ticket. Intercepted here either way so
+            # they are left for later. Intercepted here either way so
             # an event can never fall through to the unknown-type-becomes-
             # console-LINE path below and show up as garbled text.
             changed = decode_control_changed_event(message.payload)
@@ -3090,7 +3090,7 @@ class Controller:
         controller's own reply, so it must not be able to affect this
         controller's own reply/status handling (sendNUM/loadNUM counters,
         the alarm/error detection in parseLine, hello re-send-on-reply) —
-        the isolation the ticket's acceptance criterion asks for. It is
+        that isolation is the point of this path. It is
         queued with MSG_PUBLISHED, a kind distinct from MSG_NORMAL/
         MSG_ERROR, so a UI listener can tell it apart too and skip any
         side effects (main.py's own clock-sync/model-detection regexes)

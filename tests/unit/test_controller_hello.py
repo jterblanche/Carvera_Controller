@@ -154,7 +154,7 @@ def test_no_reply_message_not_logged_against_old_firmware(machine, controller):
     it must stay silent, exactly as before this branch. Only a link that
     never produces a single valid frame at all (test_ordinary_command_flushed_
     after_open_timeout_against_a_silent_machine) gets the new console line.
-    Guards the "existing behaviour... unchanged" acceptance criterion: if
+    Guards against changing behaviour with old firmware: if
     the never_answered/frame_seen guard in _advance_hello ever broke, every
     connect to old (pre-hello) firmware — the common case — would start
     printing this line."""
