@@ -3079,6 +3079,16 @@ class Makera(RelativeLayout):
     fw_version_query_attempts = 0
     model_query_attempts = 0
     backing_up_config = False
+    # True from the start of a passive fetch until it has finished; see
+    # _check_passive_fetch and _passive_fetch_finished.
+    _auto_fetch_in_progress = False
+    # Operator actions waiting for a passive fetch to finish, oldest first
+    # (see _hold_for_passive_fetch). A tuple, replaced rather than added to,
+    # so this class-level default is never shared state. The lock guards it
+    # together with _auto_fetch_in_progress; there is one Makera per app.
+    _held_for_passive_fetch = ()
+    _held_for_passive_fetch_lock = threading.Lock()
+    _passive_fetch_hint_shown = False
 
     # Bounded round trip for verifying a firmware upload's bytes on the SD
     # card with the "md5sum" console command (see Controller.md5Command).
@@ -5308,11 +5318,14 @@ class Makera(RelativeLayout):
         # Clock.schedule_once(partial(self.load_gcode_file, filepath), 0)
 
     # -----------------------------------------------------------------------
-    def check_and_download(self):
-        remote_path = self.file_popup.selected_machine_file
+    def check_and_download(self, remote_path=None, remote_size=None):
+        if remote_path is None:
+            remote_path = self.file_popup.selected_machine_file
+            remote_size = self.file_popup.selected_machine_filesize
         if not remote_path:
             return
-        remote_size = self.file_popup.selected_machine_filesize
+        if self._hold_for_passive_fetch(partial(self.check_and_download, remote_path, remote_size)):
+            return
         remote_post_path = remote_path.replace("/sd/", "").replace("\\sd\\", "")
         local_path = os.path.join(self.temp_dir, remote_post_path)
         app = App.get_running_app()
@@ -5346,6 +5359,8 @@ class Makera(RelativeLayout):
 
     def save_machine_file_to_device(self, remote_path, dest):
         if not remote_path or not dest:
+            return
+        if self._hold_for_passive_fetch(partial(self.save_machine_file_to_device, remote_path, dest)):
             return
         self.downloading_file = remote_path
         self.downloading_size = self.file_popup.selected_machine_filesize
@@ -6021,6 +6036,8 @@ class Makera(RelativeLayout):
 
     # -----------------------------------------------------------------------
     def startLoadWiFi(self, button):
+        if self._hold_for_passive_fetch(partial(self.startLoadWiFi, button)):
+            return
         self.wifi_ap_drop_down.open(button)
         # start loading
         if self.wifi_ap_status_bar != None:
@@ -6163,6 +6180,8 @@ class Makera(RelativeLayout):
             self._machine_ls_wanted_path = ls_dir
             if self.controller.loadNUM == LOAD_DIR:
                 return
+        if self._hold_for_passive_fetch(partial(self.request_machine_ls, ls_dir)):
+            return
         threading.Thread(target=self._run_machine_ls, daemon=True).start()
 
     def _run_machine_ls(self):
@@ -6246,6 +6265,8 @@ class Makera(RelativeLayout):
 
     # -----------------------------------------------------------------------
     def startRemoteDelete(self, filename):
+        if self._hold_for_passive_fetch(partial(self.startRemoteDelete, filename)):
+            return
         self.deleting_remote_file = filename
         self.controller.sendNUM = 0
         self.controller.loadNUM = LOAD_RM
@@ -6255,30 +6276,38 @@ class Makera(RelativeLayout):
         self.controller.rmCommand(os.path.normpath(filename))
 
     # -----------------------------------------------------------------------
-    def renameRemoteFile(self, filename):
-        if not self.input_popup.txt_content.text.strip():
+    def renameRemoteFile(self, filename, new_text=None):
+        if new_text is None:
+            new_text = self.input_popup.txt_content.text
+        if not new_text.strip():
             return False
+        if self._hold_for_passive_fetch(partial(self.renameRemoteFile, filename, new_text)):
+            return True
         self.controller.sendNUM = 0
         self.controller.loadNUM = LOAD_MV
         self.controller.readEOF = False
         self.controller.readERR = False
         self.short_load_time = time.time()
-        new_name = os.path.join(self.file_popup.machine_dir, self.input_popup.txt_content.text)
+        new_name = os.path.join(self.file_popup.machine_dir, new_text)
         if filename == new_name:
             return False
         self.controller.mvCommand(os.path.normpath(filename), os.path.normpath(new_name))
         return True
 
     # -----------------------------------------------------------------------
-    def createRemoteDir(self):
-        if not self.input_popup.txt_content.text.strip():
+    def createRemoteDir(self, name=None):
+        if name is None:
+            name = self.input_popup.txt_content.text
+        if not name.strip():
             return False
+        if self._hold_for_passive_fetch(partial(self.createRemoteDir, name)):
+            return True
         self.controller.sendNUM = 0
         self.controller.loadNUM = LOAD_MKDIR
         self.controller.readEOF = False
         self.controller.readERR = False
         self.short_load_time = time.time()
-        dirname = os.path.join(self.file_popup.machine_dir, self.input_popup.txt_content.text)
+        dirname = os.path.join(self.file_popup.machine_dir, name)
         self.controller.mkdirCommand(os.path.normpath(dirname))
         return True
 
@@ -6367,21 +6396,23 @@ class Makera(RelativeLayout):
                 app.selected_local_filename = replacement + local_norm[len(old_norm) :]
 
     # -----------------------------------------------------------------------
-    def connectToWiFi(self):
-        password = self.input_popup.txt_content.text.strip()
+    def connectToWiFi(self, password=None, ssid=None):
+        if password is None:
+            password = self.input_popup.txt_content.text.strip()
+            ssid = self.input_popup.cache_var1
         if not password:
             return False
+        if self._hold_for_passive_fetch(partial(self.connectToWiFi, password, ssid)):
+            return True
         self.controller.sendNUM = 0
         self.controller.loadNUM = LOAD_CONN_WIFI
         self.controller.readEOF = False
         self.controller.readERR = False
         self.wifi_load_time = time.time()
 
-        Clock.schedule_once(
-            partial(self.show_message_popup, tr._("Connecting to") + " %s...\n" % self.input_popup.cache_var1, True), 0
-        )
+        Clock.schedule_once(partial(self.show_message_popup, tr._("Connecting to") + " %s...\n" % ssid, True), 0)
 
-        self.controller.connectWiFiCommand(self.input_popup.cache_var1, password)
+        self.controller.connectWiFiCommand(ssid, password)
         return True
 
     # -----------------------------------------------------------------------
@@ -6636,8 +6667,10 @@ class Makera(RelativeLayout):
         load command (a listing, delete, rename, ...) has the link: the
         machine runs one of these at a time, and a download sent in the
         middle of another one ends both. The fetch stays pending and starts
-        on the first status update after the link is free."""
-        if self._auto_fetch_in_progress or self._link_busy_for_passive_fetch():
+        on the first status update after the link is free. Nor does one
+        start while an operator action held for the previous fetch
+        (_hold_for_passive_fetch) is still to run: that action goes first."""
+        if self._auto_fetch_in_progress or self._held_for_passive_fetch or self._link_busy_for_passive_fetch():
             return
         path = self._passive_fetch.due_fetch(is_idle, now=time.monotonic())
         if path is None:
@@ -6650,14 +6683,83 @@ class Makera(RelativeLayout):
         is using the link: an upload from the moment it is requested
         (sendNUM) to the end of the machine unpacking a compressed one
         (decompstatus), a download, or any load command still waiting for
-        its reply (loadNUM)."""
+        its reply (loadNUM). A config backup counts for its whole length: it
+        lists /sd and then downloads several files one after another, and
+        the link is free for a moment between each of them."""
         return bool(
             self.uploading
             or self.downloading
             or self.decompstatus
+            or self.backing_up_config
             or self.controller.sendNUM != 0
             or self.controller.loadNUM != 0
         )
+
+    def _hold_for_passive_fetch(self, action):
+        """Keep an operator action that needs the link (a listing, upload,
+        download, delete, rename or other load command) while a passive
+        fetch is downloading. True when `action` was kept, and the caller
+        then returns without sending anything; False to go ahead now.
+
+        The machine runs one file transfer or load command at a time, and
+        one sent in the middle of a download ends both. `action` is the
+        caller itself, with the arguments it was given, and runs on the
+        main thread once the fetch has finished (_passive_fetch_finished),
+        in the order the actions were asked for. Nothing is marked as using
+        the link while it waits, so status queries carry on.
+
+        Meanwhile the progress popup says what is happening; cancelling it
+        drops the waiting actions, never the fetch. A config backup shows
+        its own progress popup, which is left as it is. Called on the main
+        thread."""
+        with self._held_for_passive_fetch_lock:
+            if not (self._auto_fetch_in_progress or self._held_for_passive_fetch):
+                return False
+            self._held_for_passive_fetch = (*self._held_for_passive_fetch, action)
+        if not self.backing_up_config:
+            self._passive_fetch_hint_shown = True
+            self.progressStart(tr._("Waiting for a download to finish..."), self._cancel_held_for_passive_fetch)
+        return True
+
+    def _cancel_held_for_passive_fetch(self):
+        """The operator cancelled the wait: drop the waiting actions and
+        say so in the console. The fetch carries on."""
+        with self._held_for_passive_fetch_lock:
+            held, self._held_for_passive_fetch = self._held_for_passive_fetch, ()
+        self._passive_fetch_hint_shown = False
+        self.progressFinish()
+        if held:
+            self.controller.log.put(
+                (
+                    Controller.MSG_NORMAL,
+                    tr._("Cancelled while waiting for a download to finish; the action was not started."),
+                )
+            )
+
+    def _passive_fetch_finished(self):
+        """The passive fetch has handed the link back. Any operator action
+        held meanwhile runs on the main thread's next frame
+        (_run_held_for_passive_fetch); no other fetch can start before it,
+        see _check_passive_fetch. Called on the fetch's own thread when the
+        download fails, and on the main thread once a downloaded file has
+        been drawn, hence the lock shared with _hold_for_passive_fetch."""
+        with self._held_for_passive_fetch_lock:
+            self._auto_fetch_in_progress = False
+            held = bool(self._held_for_passive_fetch)
+        if held:
+            Clock.schedule_once(self._run_held_for_passive_fetch)
+
+    def _run_held_for_passive_fetch(self, *_args):
+        with self._held_for_passive_fetch_lock:
+            held, self._held_for_passive_fetch = self._held_for_passive_fetch, ()
+        if self._passive_fetch_hint_shown:
+            self._passive_fetch_hint_shown = False
+            self.progressFinish()
+        for action in held:
+            try:
+                action()
+            except Exception:
+                logger.exception("An action that waited for a download to finish failed")
 
     def _auto_fetch_played_file(self, remote_path):
         """Background download of a passively-observed job file, reusing
@@ -6702,7 +6804,7 @@ class Makera(RelativeLayout):
                 download_result,
             )
             self._passive_fetch.note_fetch_failed(remote_path, time.monotonic())
-            self._auto_fetch_in_progress = False
+            self._passive_fetch_finished()
             return
         Clock.schedule_once(partial(self._finish_auto_fetch_played_file, remote_path, local_path))
 
@@ -6730,7 +6832,7 @@ class Makera(RelativeLayout):
             self._passive_fetch.note_fetch_failed(remote_path, time.monotonic())
             return
         finally:
-            self._auto_fetch_in_progress = False
+            self._passive_fetch_finished()
         self._passive_fetch.mark_loaded(remote_path)
 
     def show_usb_reset_blocked_popup(self, *args):
@@ -7184,6 +7286,8 @@ class Makera(RelativeLayout):
     def uploadLocalFile(self, filepath, callback=None, firmware=None):
         if firmware is None:
             firmware = bool(self.file_popup.firmware_mode)
+        if self._hold_for_passive_fetch(partial(self.uploadLocalFile, filepath, callback, firmware)):
+            return
         self._uploading_firmware = bool(firmware)
         self.controller.sendNUM = SEND_FILE
         self.uploading_file = filepath
