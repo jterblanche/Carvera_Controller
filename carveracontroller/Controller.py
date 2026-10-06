@@ -3356,8 +3356,10 @@ class Controller:
                 self._advance_heartbeat(time.monotonic())
 
             except PeerClosedError:
-                # USB's version of the WiFi b"" case just above: the device
-                # itself is gone (unplugged, or the OS reclaimed the port).
+                # USB's version of the WiFi b"" case just above: a USB read
+                # or write failed in a way USBStream does not recognise as
+                # the device going away (an unplug is torn down quietly
+                # there, and left to the app's connection-lost check).
                 # Raised by USBStream.recv()/send() from a caught
                 # serial.SerialException, so it can arrive from either call
                 # in this same try block. Always treated as an established
