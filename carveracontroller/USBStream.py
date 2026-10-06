@@ -25,7 +25,6 @@ class USBStream:
         # Rely on the app/Kivy root logger; do not attach extra StreamHandlers to
         # the shared "xmodem.XMODEM" logger (USB+WiFi would duplicate every line).
         self.log_sent_receive = log_sent_receive
-        self._send_log_buffer = b""
         self._recv_log_buffer = b""
         # Set by Controller when the communication protocol is selected.
         self.uses_framed_transfer = False
@@ -41,21 +40,9 @@ class USBStream:
         except serial.SerialException as exc:
             self._fail(exc)
             raise PeerClosedError(str(exc)) from exc
-        if not self.log_sent_receive:
-            return
-        if data == b"?":
-            logger.debug("SENT: ?")
-            return
-        self._send_log_buffer += data
-        while b"\n" in self._send_log_buffer:
-            idx = self._send_log_buffer.index(b"\n") + 1
-            line = self._send_log_buffer[:idx]
-            self._send_log_buffer = self._send_log_buffer[idx:]
-            line_str = line.decode("utf-8", errors="replace").rstrip("\r\n")
-            logger.debug("SENT: %s", line_str)
-        if len(self._send_log_buffer) > 4096:
-            logger.debug("SENT: <%d bytes (no newline)>", len(self._send_log_buffer))
-            self._send_log_buffer = b""
+        if self.log_sent_receive:
+            # One line per write, holding exactly the bytes just written.
+            logger.debug("SENT: %r", data)
 
     # ----------------------------------------------------------------------
     def recv(self):
@@ -121,7 +108,6 @@ class USBStream:
         baud = int(baud)
         old = self.serial
         self.serial = None
-        self._send_log_buffer = b""
         self._recv_log_buffer = b""
         if old is not None:
             try:
@@ -182,7 +168,6 @@ class USBStream:
             except Exception:
                 pass
         self.serial = None
-        self._send_log_buffer = b""
         self._recv_log_buffer = b""
 
     # ----------------------------------------------------------------------
@@ -196,7 +181,6 @@ class USBStream:
         except:
             pass
         self.serial = None
-        self._send_log_buffer = b""
         self._recv_log_buffer = b""
         return True
 

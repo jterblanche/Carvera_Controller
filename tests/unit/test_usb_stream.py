@@ -56,7 +56,6 @@ def _stream_with(fake_serial):
     stream = USBStream.__new__(USBStream)
     stream.serial = fake_serial
     stream.log_sent_receive = False
-    stream._send_log_buffer = b""
     stream._recv_log_buffer = b""
     return stream
 
