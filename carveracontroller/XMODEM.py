@@ -461,6 +461,9 @@ class XMODEM:
         self.download_md5_failed = False
         # Text from a FILE_CAN payload when the machine included one.
         self.last_file_error = None
+        # Frame bodies (packetData) that arrived during the last framed
+        # transfer but were not part of it; see take_other_frames().
+        self.other_frames = []
 
     def clear_mode_set(self):
         self.mode_set = False
@@ -496,6 +499,13 @@ class XMODEM:
 
     def _send_file_trans_command(self, cmd: int, data: bytes) -> None:
         self.putc(build_frame(cmd, data))
+
+    def take_other_frames(self):
+        """Return the frames kept by the last framed transfer, oldest first,
+        and forget them. The controller dispatches them once the transfer
+        has handed the link back."""
+        frames, self.other_frames = self.other_frames, []
+        return frames
 
     @staticmethod
     def _normalize_advertised_md5(expected_md5):
@@ -643,6 +653,7 @@ class XMODEM:
         first_bytes = bytearray()
         self.deferred_download_md5 = None
         self.download_md5_failed = False
+        self.other_frames = []
         self.FileRcvState = FileTransState.WAIT_MD5
         while True:
             if self.canceled:
@@ -654,6 +665,8 @@ class XMODEM:
             if result:
                 cmd_type = self.packetData[2]
                 if cmd_type < PTYPE_FILE_MD5:
+                    # Not part of this transfer: kept for the controller.
+                    self.other_frames.append(bytes(self.packetData))
                     continue
                 if cmd_type == PTYPE_FILE_CAN:
                     self.log.info("Transmission canceled by Machine.")
@@ -767,6 +780,7 @@ class XMODEM:
         packet_size = self._framed_packet_size()
         data = md5.encode()
         self.last_file_error = None
+        self.other_frames = []
         self._send_file_trans_command(PTYPE_FILE_MD5, data)
         lastcmd = PTYPE_FILE_MD5
         lastseq = 0
@@ -801,6 +815,8 @@ class XMODEM:
                             self.last_file_error = reason
                             self.log.info("Transmission refused by Machine: %s", reason)
                             return None
+                    # Not part of this transfer: kept for the controller.
+                    self.other_frames.append(bytes(self.packetData))
                     continue
                 if cmd_type == PTYPE_FILE_CAN:
                     # Abort on both C1/CA1 and Z1. Success is FILE_END. C1/CA1 may

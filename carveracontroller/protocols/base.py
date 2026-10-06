@@ -40,6 +40,12 @@ class CommunicationProtocol(ABC):
     def feed(self, data: bytes) -> list[ParsedMessage]:
         """Consume inbound bytes and return zero or more parsed messages."""
 
+    def feed_packet(self, packet: bytes) -> list[ParsedMessage]:
+        """Parse one complete frame body that a file transfer read off the
+        link itself. Only a framed protocol has frames; others return
+        nothing."""
+        return []
+
     @abstractmethod
     def reset(self) -> None:
         """Reset RX parser state for a new connection or after errors."""

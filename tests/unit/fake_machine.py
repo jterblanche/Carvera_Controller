@@ -94,6 +94,7 @@ class FakeMachine:
         publish_status=False,
         status_interval_s=0.05,
         client_list_entries=None,
+        frame_hook=None,
     ):
         self.mode = mode
         self.ack_delay = ack_delay
@@ -132,6 +133,11 @@ class FakeMachine:
         self.client_list_requests = 0
         self.smoothie_bytes_received = bytearray()  # "smoothie" mode only
         self._active_conn = None  # the one connected client's socket, or None
+        # Optional callable(conn, ptype, payload) -> bool, given every frame
+        # before the built-in handling below; returning True means the hook
+        # dealt with it. Lets a test play the machine's side of something
+        # this fake does not model itself, such as a file transfer.
+        self.frame_hook = frame_hook
 
         self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._accept_thread.start()
@@ -252,6 +258,9 @@ class FakeMachine:
     def _handle_frame(self, conn, ptype, payload):
         if self.mode == "silent":
             return  # answers nothing at all: models a dead/unresponsive link.
+
+        if self.frame_hook is not None and self.frame_hook(conn, ptype, payload):
+            return
 
         if ptype == PTYPE_CTRL_SINGLE:
             if payload[:1] == b"?":
@@ -436,6 +445,17 @@ class FakeMachine:
         if conn is None:
             return False
         self._send(conn, build_frame(PTYPE_NORMAL_INFO, text))
+        return True
+
+    def send_frame(self, frame):
+        """Test helper: send one already-built frame (or several joined
+        together, so they leave in one write) to the currently-connected
+        client. Returns False if there is no connected client to send to."""
+        with self._lock:
+            conn = self._active_conn
+        if conn is None:
+            return False
+        self._send(conn, frame)
         return True
 
     def _send(self, conn, frame):
