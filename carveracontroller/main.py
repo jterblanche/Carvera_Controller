@@ -379,6 +379,7 @@ from .ui.job_start_popup import (
     JobStartPopup,
     cancelled_text,
     countdown_text,
+    no_toolpath_progress_text,
     not_loaded_text,
     started_without_text,
 )
@@ -3205,6 +3206,13 @@ class Makera(RelativeLayout):
         self._job_start = JobStartTracker(own_id=self.identity.id)
         self._job_start_popup = None
         self._job_start_clock = None
+        # The path of a held start's file whose download or drawing was
+        # still under way when the job started (see on_job_start_event).
+        self._job_start_late = None
+        # The path of the playing file when this controller could not draw
+        # it before the job started: its name and progress are shown
+        # without a toolpath until it is fetched after the job.
+        self._job_without_toolpath = None
         # Fill basic global variables
         CNC.vars["state"] = NOT_CONNECTED
         CNC.vars["color"] = STATECOLOR[NOT_CONNECTED]
@@ -6650,6 +6658,12 @@ class Makera(RelativeLayout):
             return
         if self._show_local_copy(path, size, event_checksum):
             return
+        if played and size is not None and path and path != app.selected_remote_filename:
+            # Firmware that announces the size: show the job's name and
+            # progress without a toolpath, and fetch the file after it.
+            self._show_job_without_toolpath(path)
+            self._check_passive_fetch(app.state == "Idle")
+            return
         if path and path != app.selected_remote_filename:
             app.selected_remote_filename = ""
             app.selected_local_filename = ""
@@ -6688,6 +6702,7 @@ class Makera(RelativeLayout):
 
         def drawn(ok):
             if not ok:
+                self._passive_fetch.forget_loaded(path)
                 self._passive_fetch.note_published_file(path)
             if on_done is not None:
                 on_done(ok)
@@ -6708,6 +6723,7 @@ class Makera(RelativeLayout):
         if app is not None:
             app.selected_remote_filename = remote_path
             app.selected_local_filename = local_path
+        self._job_without_toolpath = None
 
         def load():
             ok = True
@@ -6731,10 +6747,15 @@ class Makera(RelativeLayout):
         While the machine waits: show the countdown, and if this controller
         is listed as not ready, draw the file from a local copy or fetch it,
         then report ready (or report ready again, if a ready was already
-        sent and lost). When the hold ends: close the countdown, and say why
-        if the job will not start."""
+        sent and lost). Ready is only ever sent for a drawing whose size and
+        MD5 are the announced ones. When the hold ends: close the countdown,
+        say why if the job will not start, and if the job starts before this
+        controller has the file drawn, show the job without its toolpath
+        (_show_job_without_toolpath)."""
         now = time.monotonic()
         previous = self._job_start.event
+        was_ready = self._job_start.ready_sent
+        was_starter = self._job_start.is_starter
         action = self._job_start.on_event(event, now)
         if event.phase == JOB_START_WAITING:
             self._show_job_start_countdown()
@@ -6745,16 +6766,26 @@ class Makera(RelativeLayout):
             return
         self._close_job_start_countdown()
         if event.phase == JOB_START_CANCELLED:
+            self._job_start_late = None
             self.show_message_popup(cancelled_text(event.path, event.reason), False)
-        elif event.phase == JOB_START_STARTING and event.reason in (
-            JOB_START_REASON_TIME_LIMIT,
-            JOB_START_REASON_START_NOW,
-        ):
+            return
+        if event.phase != JOB_START_STARTING:
+            return
+        if event.reason in (JOB_START_REASON_TIME_LIMIT, JOB_START_REASON_START_NOW):
             waiting = previous.not_ready_ids if previous is not None else event.not_ready_ids
             if waiting:
                 self.controller.log.put(
                     (Controller.MSG_NORMAL, started_without_text(event.path, event.reason, self._client_names(waiting)))
                 )
+        awaited = previous is not None and self.identity.id in previous.not_ready_ids
+        if was_ready or was_starter or not awaited or self._job_file_on_screen(event):
+            return
+        if self._auto_fetch_in_progress:
+            # A download or drawing for this start is still under way: it
+            # decides once it ends (_job_start_fetched).
+            self._job_start_late = event.path
+            return
+        self._show_job_without_toolpath(event.path)
 
     def _prepare_for_job_start(self, event):
         """Get the announced file on screen for the held start, then report
@@ -6762,16 +6793,22 @@ class Makera(RelativeLayout):
         Otherwise the file is fetched first -- never while this
         controller's own transfer or listing has the link, while another
         fetch is running, or while the machine reports a file playing: the
-        next waiting event, a second later, tries again."""
+        next waiting event, a second later, tries again. Without an
+        announced MD5 no copy can be checked, so nothing is fetched and no
+        ready is sent; the file is fetched after the job."""
         start_id = event.start_id
-        if self._show_local_copy(event.path, event.size, event.checksum, partial(self._job_start_prepared, start_id)):
+        if self._show_local_copy(
+            event.path, event.size, event.checksum, partial(self._job_start_copy_drawn, start_id, event.path)
+        ):
             self._job_start.begin_preparing(start_id)
             return
         app = App.get_running_app()
         if app is not None and app.selected_remote_filename != event.path:
             # Not this job's drawing: never plot its progress over it.
-            app.selected_remote_filename = ""
-            app.selected_local_filename = ""
+            self._clear_job_drawing()
+        if len(event.checksum) != 16:
+            self._job_start.give_up(start_id)
+            return
         if self._auto_fetch_in_progress or self._link_busy_for_passive_fetch() or self._machine_reports_playing():
             return
         self._job_start.begin_preparing(start_id)
@@ -6779,27 +6816,83 @@ class Makera(RelativeLayout):
         threading.Thread(
             target=self._auto_fetch_played_file,
             args=(event.path,),
-            kwargs={"on_done": partial(self._job_start_fetched, start_id, event.path)},
+            kwargs={"on_done": partial(self._job_start_fetched, start_id, event.path, event.size, event.checksum)},
             daemon=True,
         ).start()
 
-    def _job_start_fetched(self, start_id, path, ok):
-        """The fetch for a held start has ended (main thread). Ready is sent
-        either way: the machine must not wait for a controller that cannot
-        load the file. Without it, the toolpath is not shown, and the file
-        is fetched once the job ends (the passive-fetch tracker still owes
-        it)."""
-        if not ok:
+    def _job_start_copy_drawn(self, start_id, path, ok):
+        """A local copy checked against the announced size and MD5 has been
+        drawn for a held start (main thread), or drawing it failed."""
+        if ok:
+            if self._job_start.prepared(start_id):
+                self.controller.send_job_start_ready(start_id)
+            return
+        self._job_start_attempt_failed(start_id, path)
+
+    def _job_start_fetched(self, start_id, path, size, checksum, ok):
+        """The fetch for a held start has ended (main thread), with the file
+        drawn if `ok`. Ready is sent only if the downloaded copy has the
+        announced size and MD5 (checked after drawing, which also unpacks a
+        compressed download). Otherwise its drawing is removed, and the next
+        waiting event tries again after a backoff (JobStartTracker.failed)."""
+        local_path = os.path.join(self.temp_dir, os.path.basename(path))
+        if ok and self._local_copies.matches(local_path, size, checksum):
+            self._job_start_late = None
+            if self._job_start.prepared(start_id):
+                self.controller.send_job_start_ready(start_id)
+            return
+        if ok:
+            # Drawn, but not the announced file: never show it as the job.
             app = App.get_running_app()
             if app is not None and app.selected_remote_filename == path:
-                app.selected_remote_filename = ""
-                app.selected_local_filename = ""
-            self.controller.log.put((Controller.MSG_NORMAL, not_loaded_text(path)))
-        self._job_start_prepared(start_id, ok)
+                self._clear_job_drawing()
+            self._passive_fetch.forget_loaded(path)
+        self._job_start_attempt_failed(start_id, path)
 
-    def _job_start_prepared(self, start_id, ok=True):
-        if self._job_start.prepared(start_id):
-            self.controller.send_job_start_ready(start_id)
+    def _job_start_attempt_failed(self, start_id, path):
+        """No good copy from this attempt. While the start is still held,
+        another attempt follows after a backoff. If the job has started
+        meanwhile, show it without its toolpath."""
+        self._job_start.failed(start_id, time.monotonic())
+        if self._job_start_late == path:
+            self._job_start_late = None
+            self._show_job_without_toolpath(path)
+
+    def _job_file_on_screen(self, event):
+        """True when the drawing on screen is the job's file: the machine's
+        path, with the announced size and MD5."""
+        app = App.get_running_app()
+        return bool(
+            app is not None
+            and app.selected_remote_filename == event.path
+            and self._local_copies.matches(app.selected_local_filename, event.size, event.checksum)
+        )
+
+    def _clear_job_drawing(self):
+        """Remove the drawing on screen, so no line or position of the
+        running job is ever plotted over another file. The same as the file
+        view's own reset when the machine changes."""
+        app = App.get_running_app()
+        if app is not None:
+            app.selected_remote_filename = ""
+            app.selected_local_filename = ""
+        self._last_loaded_file_key = None
+        self.clear_selection()
+
+    def _show_job_without_toolpath(self, path):
+        """The job started before this controller had its file drawn (the
+        machine's time limit, or Start now): show the file's name and the
+        job's progress, say plainly that the toolpath is not loaded, plot
+        nothing, and fetch the file once the job has ended."""
+        app = App.get_running_app()
+        if app is not None and (app.selected_remote_filename or app.selected_local_filename):
+            self._clear_job_drawing()
+        self._passive_fetch.forget_loaded(path)
+        self._passive_fetch.note_published_file(path)
+        if self._job_without_toolpath == path:
+            return
+        self._job_without_toolpath = path
+        self.controller.log.put((Controller.MSG_NORMAL, not_loaded_text(path)))
 
     def _machine_reports_playing(self):
         """True while the machine's status reports a file playing (the P:
@@ -6870,8 +6963,11 @@ class Makera(RelativeLayout):
         load command (a listing, delete, rename, ...) has the link: the
         machine runs one of these at a time, and a download sent in the
         middle of another one ends both. The fetch stays pending and starts
-        on the first status update after the link is free."""
-        if self._auto_fetch_in_progress or self._link_busy_for_passive_fetch():
+        on the first status update after the link is free. Nor while the
+        machine holds a job's start: the job-start sync fetches then
+        (on_job_start_event), and anything still owed is fetched after the
+        job."""
+        if self._auto_fetch_in_progress or self._link_busy_for_passive_fetch() or self._job_start.held:
             return
         app = App.get_running_app()
         reports_flag = (
@@ -8008,6 +8104,8 @@ class Makera(RelativeLayout):
                     # A held start belongs to the connection too.
                     self._job_start.clear()
                     self._close_job_start_countdown()
+                    self._job_start_late = None
+                    self._job_without_toolpath = None
 
                     # Clean up light toggle binding when disconnected
                     if hasattr(self, "_light_toggle_bound"):
@@ -8409,6 +8507,10 @@ class Makera(RelativeLayout):
                     self.progress_info = tr._(" No Remote File Selected") + last_job_elapsed
             else:
                 app.playing = True
+                if self._job_without_toolpath:
+                    self.progress_info = no_toolpath_progress_text(
+                        self._job_without_toolpath, CNC.vars["playedlines"], CNC.vars.get("playedseconds", 0) or 0
+                    )
                 if self.played_lines != CNC.vars["playedlines"]:
                     self.played_lines = CNC.vars["playedlines"]
                     self.wpb_play.value = play_percent_from_line(self.played_lines, self.selected_file_line_count)
@@ -10040,6 +10142,7 @@ class Makera(RelativeLayout):
     def load_gcode_file(self, filepath):
         # Every file drawn here is a local copy the machine may later play.
         self._local_copies.remember(filepath)
+        self._job_without_toolpath = None
         self.load_event.set()
         self.upcoming_tool = 0
         self.file_has_ocodes = False

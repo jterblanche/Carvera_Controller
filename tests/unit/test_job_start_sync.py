@@ -37,6 +37,7 @@ from carveracontroller.protocols.handshake import (
     JOB_START_REASON_ABORT,
     JOB_START_REASON_ALL_READY,
     JOB_START_REASON_HALT,
+    JOB_START_REASON_START_NOW,
     JOB_START_REASON_STARTER_LEFT,
     JOB_START_REASON_TIME_LIMIT,
     JOB_START_REASON_WAITING,
@@ -174,6 +175,10 @@ def _host(tmp_path, own_id=DEMO, has_control=False):
     root.doDownload = MagicMock(side_effect=download)
     root.load_gcode_file = MagicMock()
     root.show_message_popup = MagicMock()
+    root.clear_selection = MagicMock()
+    root._last_loaded_file_key = None
+    root._job_start_late = None
+    root._job_without_toolpath = None
     return root
 
 
@@ -247,9 +252,10 @@ def test_play_started_with_a_matching_copy_draws_it_at_once(tmp_path, app):
     assert root._passive_fetch.pending_path is None
 
 
-def test_play_started_without_a_copy_waits_for_the_job_to_end(tmp_path, app):
-    """No local copy: the file on screen is blanked and the fetch waits
-    until the player stops -- never during the job."""
+def test_play_started_without_a_copy_shows_the_job_without_its_toolpath(tmp_path, app):
+    """No local copy: the other file's drawing is removed, the job's name
+    and progress are shown with a plain note that the toolpath is not
+    loaded, and the fetch waits until the player stops."""
     root = _host(tmp_path)
     CNC.vars["is_playing"] = 1
 
@@ -257,6 +263,10 @@ def test_play_started_without_a_copy_waits_for_the_job_to_end(tmp_path, app):
 
     root.doDownload.assert_not_called()
     assert app.selected_remote_filename == ""
+    assert app.selected_local_filename == ""
+    root.clear_selection.assert_called_once()
+    assert root._job_without_toolpath == PATH
+    assert any("toolpath is not shown" in text for text in _logged(root))
     assert root._passive_fetch.pending_path == PATH
 
 
@@ -348,17 +358,155 @@ def test_ready_is_sent_again_while_the_machine_still_lists_this_controller(tmp_p
     root.load_gcode_file.assert_called_once()
 
 
-def test_a_failed_fetch_still_reports_ready_and_fetches_after_the_job(tmp_path, app):
+def _download_results(*results):
+    """A doDownload stand-in: each call writes the next content (None: the
+    download fails)."""
+    calls = list(results)
+
+    def download(remote_path, local_path, show_progress=True, open_after=True, automatic=False):
+        content = calls.pop(0) if calls else results[-1]
+        if content is None:
+            return None
+        with open(local_path, "wb") as f:
+            f.write(content)
+        return 1
+
+    return MagicMock(side_effect=download)
+
+
+def _clock(monkeypatch, start=100.0):
+    now = [start]
+    monkeypatch.setattr("carveracontroller.main.time.monotonic", lambda: now[0])
+    return now
+
+
+def _hold_until(root, now, first=30, last=1, **kw):
+    """Waiting events once a second, `first` down to `last` seconds left."""
+    start = now[0]
+    for left in range(first, last - 1, -1):
+        now[0] = start + (first - left)
+        Makera.on_job_start_event(root, _event(seconds_left=left, **kw))
+
+
+def test_a_failed_download_is_retried_and_ready_follows_a_good_copy(tmp_path, app, monkeypatch):
+    now = _clock(monkeypatch)
     root = _host(tmp_path)
-    root.doDownload = MagicMock(return_value=None)
+    root.doDownload = _download_results(None, CONTENT)
+
+    Makera.on_job_start_event(root, _event(seconds_left=30))
+    root.controller.send_job_start_ready.assert_not_called()
+    assert root.doDownload.call_count == 1
+
+    now[0] += 1  # still backing off
+    Makera.on_job_start_event(root, _event(seconds_left=29))
+    assert root.doDownload.call_count == 1
+
+    now[0] += 1
+    Makera.on_job_start_event(root, _event(seconds_left=28))
+    assert root.doDownload.call_count == 2
+    root.controller.send_job_start_ready.assert_called_once_with(7)
+    assert app.selected_remote_filename == PATH
+
+
+def test_a_download_failing_until_the_time_limit_never_sends_ready(tmp_path, app, monkeypatch):
+    """Retries back off and stop when too little time is left. The job
+    starts at the limit: its name and progress are shown with the
+    toolpath-not-loaded note, nothing is plotted, and the file is fetched
+    once the job has ended."""
+    now = _clock(monkeypatch)
+    root = _host(tmp_path)
+    root.doDownload = _download_results(None)
+
+    _hold_until(root, now)
+    attempts = root.doDownload.call_count
+    assert 1 < attempts < 10
+
+    Makera.on_job_start_event(
+        root, _event(phase=JOB_START_STARTING, reason=JOB_START_REASON_TIME_LIMIT, seconds_left=0)
+    )
+    root.controller.send_job_start_ready.assert_not_called()
+    assert root._job_without_toolpath == PATH
+    assert app.selected_remote_filename == ""
+    assert app.selected_local_filename == ""
+    assert any("toolpath is not shown" in text for text in _logged(root))
+
+    # The job plays: nothing is fetched.
+    CNC.vars["is_playing"] = 1
+    Makera.on_passive_file_published(root, PATH, MD5, size=len(CONTENT), played=True)
+    for _ in range(3):
+        Makera._check_passive_fetch(root, True)
+    assert root.doDownload.call_count == attempts
+
+    # The job ends: the file is fetched and drawn.
+    root.doDownload = _download_results(CONTENT)
+    CNC.vars["is_playing"] = 0
+    now[0] += 60
+    for _ in range(3):
+        Makera._check_passive_fetch(root, True)
+    root.doDownload.assert_called_once()
+    assert app.selected_remote_filename == PATH
+    assert root._job_without_toolpath is None
+    root.controller.send_job_start_ready.assert_not_called()
+
+
+def test_no_retry_starts_with_too_little_time_left(tmp_path, app, monkeypatch):
+    now = _clock(monkeypatch)
+    root = _host(tmp_path)
+    root.doDownload = _download_results(None)
+
+    Makera.on_job_start_event(root, _event(seconds_left=4))
+    now[0] += 10
+    Makera.on_job_start_event(root, _event(seconds_left=2))
+
+    assert root.doDownload.call_count == 1
+
+
+def test_a_download_that_is_not_the_announced_file_sends_no_ready(tmp_path, app, monkeypatch):
+    """The card's MD5 does not match what was downloaded: the drawing is
+    removed, no ready is sent, and a later attempt is made."""
+    now = _clock(monkeypatch)
+    root = _host(tmp_path)
+    root.doDownload = _download_results(b"G0 X99 Y99\n")
 
     Makera.on_job_start_event(root, _event())
 
-    root.controller.send_job_start_ready.assert_called_once_with(7)
-    root.load_gcode_file.assert_not_called()
+    root.load_gcode_file.assert_called_once()
+    root.controller.send_job_start_ready.assert_not_called()
     assert app.selected_remote_filename == ""
+    root.clear_selection.assert_called()
+
+    now[0] += 2
+    Makera.on_job_start_event(root, _event(seconds_left=28))
+    assert root.doDownload.call_count == 2
+    root.controller.send_job_start_ready.assert_not_called()
+
+
+def test_a_local_copy_that_fails_to_draw_sends_no_ready(tmp_path, app):
+    root = _host(tmp_path)
+    root._local_copies.remember(_local_copy(tmp_path))
+    root.load_gcode_file = MagicMock(side_effect=ValueError("bad"))
+
+    Makera.on_job_start_event(root, _event())
+
+    root.controller.send_job_start_ready.assert_not_called()
+
+
+def test_without_an_announced_md5_nothing_is_fetched_and_no_ready_is_sent(tmp_path, app, monkeypatch):
+    """No copy can be checked, so none is fetched during the hold. The job
+    is shown without its toolpath and fetched after it."""
+    now = _clock(monkeypatch)
+    root = _host(tmp_path)
+
+    _hold_until(root, now, first=5, checksum=b"")
+    Makera.on_job_start_event(
+        root,
+        _event(phase=JOB_START_STARTING, reason=JOB_START_REASON_TIME_LIMIT, seconds_left=0, checksum=b""),
+    )
+
+    root.doDownload.assert_not_called()
+    root.controller.send_job_start_ready.assert_not_called()
+    assert root._job_without_toolpath == PATH
     assert root._passive_fetch.pending_path == PATH
-    assert any("toolpath is not shown" in text for text in _logged(root))
 
 
 def test_never_fetches_while_the_machine_reports_a_file_playing(tmp_path, app, monkeypatch):
@@ -499,6 +647,25 @@ def test_a_fetch_still_running_when_the_job_starts_draws_but_sends_no_ready(tmp_
 
     root.load_gcode_file.assert_called_once()
     root.controller.send_job_start_ready.assert_not_called()
+    assert root._job_without_toolpath is None
+
+
+def test_a_fetch_failing_after_the_job_started_shows_it_without_toolpath(tmp_path, app, monkeypatch):
+    _HeldThread.started = []
+    monkeypatch.setattr("carveracontroller.main.threading.Thread", _HeldThread)
+    root = _host(tmp_path)
+    root.doDownload = _download_results(None)
+    Makera.on_job_start_event(root, _event())
+    Makera.on_job_start_event(
+        root, _event(phase=JOB_START_STARTING, reason=JOB_START_REASON_START_NOW, seconds_left=12)
+    )
+    assert root._job_without_toolpath is None  # decided once the fetch ends
+
+    _HeldThread.started[0].run()
+
+    root.controller.send_job_start_ready.assert_not_called()
+    assert root._job_without_toolpath == PATH
+    assert root._passive_fetch.pending_path == PATH
 
 
 def test_disconnecting_forgets_the_hold(tmp_path, app):

@@ -3,7 +3,13 @@ job-start event asks of this controller, and the countdown."""
 
 from __future__ import annotations
 
-from carveracontroller.machine.job_start import STALE_AFTER_LIMIT_S, JobStartAction, JobStartTracker
+from carveracontroller.machine.job_start import (
+    MIN_SECONDS_LEFT_TO_RETRY,
+    RETRY_BACKOFF_S,
+    STALE_AFTER_LIMIT_S,
+    JobStartAction,
+    JobStartTracker,
+)
 from carveracontroller.protocols.handshake import (
     JOB_START_CANCELLED,
     JOB_START_REASON_ABORT,
@@ -119,3 +125,58 @@ def test_a_hold_whose_end_was_lost_goes_stale():
     assert not t.stale(30.0 + STALE_AFTER_LIMIT_S)
     assert t.stale(30.0 + STALE_AFTER_LIMIT_S + 0.1)
     assert not JobStartTracker(own_id=ME).stale(1000.0)
+
+
+def test_a_failed_attempt_is_retried_after_a_backoff():
+    t = JobStartTracker(own_id=ME)
+    t.on_event(_event(), now=0.0)
+    t.begin_preparing(7)
+    t.failed(7, now=0.0)
+    assert not t.ready_sent
+    assert t.on_event(_event(seconds_left=29), now=RETRY_BACKOFF_S - 0.5) is JobStartAction.NONE
+    assert t.on_event(_event(seconds_left=28), now=RETRY_BACKOFF_S) is JobStartAction.PREPARE
+
+
+def test_the_backoff_doubles():
+    t = JobStartTracker(own_id=ME)
+    t.on_event(_event(), now=0.0)
+    t.failed(7, now=0.0)
+    t.on_event(_event(seconds_left=28), now=RETRY_BACKOFF_S)
+    t.begin_preparing(7)
+    t.failed(7, now=RETRY_BACKOFF_S)
+    later = RETRY_BACKOFF_S + 2 * RETRY_BACKOFF_S
+    assert t.on_event(_event(seconds_left=25), now=later - 0.5) is JobStartAction.NONE
+    assert t.on_event(_event(seconds_left=24), now=later) is JobStartAction.PREPARE
+
+
+def test_no_retry_with_too_little_time_left():
+    t = JobStartTracker(own_id=ME)
+    t.on_event(_event(), now=0.0)
+    t.failed(7, now=0.0)
+    left = MIN_SECONDS_LEFT_TO_RETRY - 1
+    assert t.on_event(_event(seconds_left=left), now=100.0) is JobStartAction.NONE
+
+
+def test_given_up_asks_for_nothing_more():
+    t = JobStartTracker(own_id=ME)
+    t.on_event(_event(), now=0.0)
+    t.give_up(7)
+    assert t.on_event(_event(seconds_left=20), now=1000.0) is JobStartAction.NONE
+    assert not t.ready_sent
+
+
+def test_ready_sent_is_known_until_the_hold_ends():
+    t = JobStartTracker(own_id=ME)
+    t.on_event(_event(), now=0.0)
+    t.begin_preparing(7)
+    t.prepared(7)
+    assert t.ready_sent
+    t.on_event(_event(phase=JOB_START_STARTING, reason=JOB_START_REASON_ALL_READY, seconds_left=0), now=1.0)
+    assert not t.ready_sent
+
+
+def test_a_new_start_forgets_earlier_failures():
+    t = JobStartTracker(own_id=ME)
+    t.on_event(_event(start_id=7), now=0.0)
+    t.give_up(7)
+    assert t.on_event(_event(start_id=8), now=1.0) is JobStartAction.PREPARE

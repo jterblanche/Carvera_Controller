@@ -15,6 +15,9 @@ This tracker turns those events into what this controller has to do:
 - prepare (draw the announced file from a local copy, or fetch it) the
   first time a waiting event lists this controller as not ready;
 - nothing while that is under way;
+- prepare again after a failed attempt (a download that failed, or a copy
+  whose MD5 is not the announced one), once a backoff has passed and only
+  while enough of the machine's time limit is left for another attempt;
 - send ready again when a later waiting event for the same start still
   lists it, because a ready can be lost (frames from other WiFi
   controllers are dropped while one controller's transfer runs);
@@ -36,6 +39,15 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 
 from ..protocols.handshake import JOB_START_WAITING, JobStartEvent
+
+# The wait after a failed attempt before the next one: doubled after each
+# failure of the same start, up to the maximum.
+RETRY_BACKOFF_S = 2.0
+MAX_RETRY_BACKOFF_S = 8.0
+
+# No new attempt starts with fewer seconds than this left to the machine's
+# limit: a download, its drawing and the ready would not finish in time.
+MIN_SECONDS_LEFT_TO_RETRY = 3
 
 # How long past the machine's limit a hold is still shown with no further
 # event. The start can come later than the limit only while a download is
@@ -61,6 +73,8 @@ class JobStartTracker:
     _deadline: float = field(default=0.0, init=False, repr=False)
     _preparing_for: int = field(default=0, init=False, repr=False)
     _ready_for: int = field(default=0, init=False, repr=False)
+    _failures: int = field(default=0, init=False, repr=False)
+    _retry_after: float = field(default=0.0, init=False, repr=False)
 
     @property
     def held(self) -> bool:
@@ -71,6 +85,12 @@ class JobStartTracker:
     def event(self) -> JobStartEvent | None:
         """The latest waiting event of the held start, or None."""
         return self._event
+
+    @property
+    def ready_sent(self) -> bool:
+        """True while a start is held for which this controller has sent
+        ready."""
+        return self._event is not None and self._ready_for == self._event.start_id
 
     @property
     def is_starter(self) -> bool:
@@ -87,6 +107,8 @@ class JobStartTracker:
         if self._event is None or self._event.start_id != event.start_id:
             self._preparing_for = 0
             self._ready_for = 0
+            self._failures = 0
+            self._retry_after = 0.0
         self._event = event
         self._deadline = now + event.seconds_left
         if event.starter_id == self.own_id or self.own_id not in event.not_ready_ids:
@@ -94,6 +116,8 @@ class JobStartTracker:
         if self._ready_for == event.start_id:
             return JobStartAction.RESEND_READY
         if self._preparing_for == event.start_id:
+            return JobStartAction.NONE
+        if self._failures and (now < self._retry_after or event.seconds_left < MIN_SECONDS_LEFT_TO_RETRY):
             return JobStartAction.NONE
         return JobStartAction.PREPARE
 
@@ -104,16 +128,39 @@ class JobStartTracker:
         self._preparing_for = start_id
 
     def prepared(self, start_id: int) -> bool:
-        """The caller has drawn the file for `start_id`, or given up on it.
-        Returns True if a ready should be sent now: the start is still the
-        one held. Later waiting events that still list this controller ask
-        for the ready again."""
+        """The caller has drawn the file for `start_id` from a copy whose
+        size and MD5 are the announced ones. Returns True if a ready should
+        be sent now: the start is still the one held. Later waiting events
+        that still list this controller ask for the ready again."""
         if self._preparing_for == start_id:
             self._preparing_for = 0
         if self._event is None or self._event.start_id != start_id:
             return False
         self._ready_for = start_id
         return True
+
+    def failed(self, start_id: int, now: float) -> None:
+        """The attempt for `start_id` did not give a good copy. A later
+        waiting event asks for another attempt once the backoff has passed
+        (see on_event); no ready is sent."""
+        if self._preparing_for == start_id:
+            self._preparing_for = 0
+        if self._event is None or self._event.start_id != start_id:
+            return
+        self._failures += 1
+        backoff = min(RETRY_BACKOFF_S * 2 ** (self._failures - 1), MAX_RETRY_BACKOFF_S)
+        self._retry_after = now + backoff
+
+    def give_up(self, start_id: int) -> None:
+        """No attempt for `start_id` can give a good copy (the machine
+        announced no MD5 to check one against): ask for nothing more, and
+        send no ready."""
+        if self._preparing_for == start_id:
+            self._preparing_for = 0
+        if self._event is None or self._event.start_id != start_id:
+            return
+        self._failures += 1
+        self._retry_after = math.inf
 
     def seconds_left(self, now: float) -> int:
         """Whole seconds to the machine's limit, rounded up, never below 0."""
@@ -133,3 +180,5 @@ class JobStartTracker:
         self._deadline = 0.0
         self._preparing_for = 0
         self._ready_for = 0
+        self._failures = 0
+        self._retry_after = 0.0

@@ -357,3 +357,13 @@ def test_a_fresh_tracker_knows_no_digest_or_own_upload():
     t = PassiveFetchTracker()
     assert t.checksum_for("/sd/job.nc", b"") == b""
     assert not t.is_own_upload("/sd/job.nc", hashlib.md5(b"mine").digest())
+
+
+def test_forget_loaded_lets_a_later_announcement_queue_a_fetch():
+    t = passive_fetch.PassiveFetchTracker()
+    t.mark_loaded("/sd/a.nc")
+    t.note_published_file("/sd/a.nc")
+    assert t.pending_path is None
+    t.forget_loaded("/sd/a.nc")
+    t.note_published_file("/sd/a.nc")
+    assert t.pending_path == "/sd/a.nc"

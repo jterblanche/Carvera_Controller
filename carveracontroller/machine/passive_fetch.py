@@ -173,6 +173,13 @@ class PassiveFetchTracker:
         self._failing_path = None
         self._fail_count = 0
 
+    def forget_loaded(self, path: str) -> None:
+        """Call when `path` is no longer drawn (its drawing was removed, or
+        did not match the file on the card), so a later
+        ``note_published_file`` for it queues a fetch again."""
+        if self._loaded_path == path:
+            self._loaded_path = None
+
     def checksum_for(self, path: str, checksum: bytes) -> bytes:
         """The digest to check a local copy of `path` against, for an event
         naming `path` with `checksum` (b"" when the event carries none). An

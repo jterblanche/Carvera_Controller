@@ -16,6 +16,7 @@ from kivy.uix.button import Button
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 
+from .. import Utils
 from ..protocols.handshake import (
     JOB_START_REASON_ABORT,
     JOB_START_REASON_HALT,
@@ -75,6 +76,15 @@ def not_loaded_text(path: str) -> str:
     return tr._(
         "Could not load {} before the job started, so its toolpath is not shown. It will be fetched when the job ends."
     ).format(_file_name(path))
+
+
+def no_toolpath_progress_text(path: str, played_lines: int, played_seconds: float) -> str:
+    """The progress text while a job plays whose file this controller could
+    not draw: the name, a plain note that the toolpath is not loaded, the
+    lines played and the time elapsed."""
+    return " " + tr._("{} (toolpath not loaded): line {}, {} elapsed").format(
+        _file_name(path), played_lines, Utils.second2hour(int(played_seconds))
+    )
 
 
 class JobStartPopup(Popup):

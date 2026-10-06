@@ -26,6 +26,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from carveracontroller.Controller import LOAD_DIR, SEND_FILE
+from carveracontroller.machine.job_start import JobStartTracker
 from carveracontroller.machine.local_copies import LocalCopyStore
 from carveracontroller.machine.passive_fetch import PassiveFetchTracker
 from carveracontroller.main import Makera
@@ -49,6 +50,7 @@ def _host(tmp_path, *, has_control=False):
     root._passive_fetch = PassiveFetchTracker()
     root._auto_fetch_in_progress = False
     root._local_copies = LocalCopyStore()
+    root._job_start = JobStartTracker(own_id=1)
     root._uploading_firmware = False
     root.file_popup = SimpleNamespace(machine_dir="/sd/gcodes", refresh_machine=MagicMock())
     root.controller = SimpleNamespace(
