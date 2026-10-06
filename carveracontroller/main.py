@@ -3089,6 +3089,9 @@ class Makera(RelativeLayout):
     _held_for_passive_fetch = ()
     _held_for_passive_fetch_lock = threading.Lock()
     _passive_fetch_hint_shown = False
+    # Worker threads started for a listing or download that have not yet
+    # returned; see _start_link_worker.
+    _link_workers = 0
 
     # Bounded round trip for verifying a firmware upload's bytes on the SD
     # card with the "md5sum" console command (see Controller.md5Command).
@@ -5336,7 +5339,7 @@ class Makera(RelativeLayout):
         self.downloading_file = remote_path
         self.downloading_size = remote_size
         self.downloading_config = False
-        threading.Thread(target=self.doDownload, args=(remote_path, local_path)).start()
+        self._start_link_worker(self.doDownload, remote_path, local_path)
 
     # -----------------------------------------------------------------------
     def check_and_save_to_device(self):
@@ -5365,7 +5368,7 @@ class Makera(RelativeLayout):
         self.downloading_file = remote_path
         self.downloading_size = self.file_popup.selected_machine_filesize
         self.downloading_config = False
-        threading.Thread(target=self.doDownload, args=(remote_path, dest), kwargs={"open_after": False}).start()
+        self._start_link_worker(self.doDownload, remote_path, dest, open_after=False)
 
     # -----------------------------------------------------------------------
     def start_back_up_config(self):
@@ -5494,7 +5497,7 @@ class Makera(RelativeLayout):
         remote_path = "/sd/config.txt"
         self.downloading_file = remote_path
         local_path = self._machine_config_cache_path()
-        threading.Thread(target=self.doDownload, args=(remote_path, local_path), kwargs={"automatic": True}).start()
+        self._start_link_worker(self.doDownload, remote_path, local_path, automatic=True)
 
     # -----------------------------------------------------------------------
     def finishLoadConfig(self, success, *args):
@@ -6182,7 +6185,7 @@ class Makera(RelativeLayout):
                 return
         if self._hold_for_passive_fetch(partial(self.request_machine_ls, ls_dir)):
             return
-        threading.Thread(target=self._run_machine_ls, daemon=True).start()
+        self._start_link_worker(self._run_machine_ls, daemon=True)
 
     def _run_machine_ls(self):
         """Start `ls` for the UI-requested folder if none is in flight."""
@@ -6683,17 +6686,47 @@ class Makera(RelativeLayout):
         is using the link: an upload from the moment it is requested
         (sendNUM) to the end of the machine unpacking a compressed one
         (decompstatus), a download, or any load command still waiting for
-        its reply (loadNUM). A config backup counts for its whole length: it
-        lists /sd and then downloads several files one after another, and
-        the link is free for a moment between each of them."""
+        its reply (loadNUM), counted from the moment its worker thread is
+        started (_start_link_worker). A config backup counts for its whole
+        length: it lists /sd and then downloads several files one after
+        another, and the link is free for a moment between each of them."""
         return bool(
-            self.uploading
+            self._link_workers
+            or self.uploading
             or self.downloading
             or self.decompstatus
             or self.backing_up_config
             or self.controller.sendNUM != 0
             or self.controller.loadNUM != 0
         )
+
+    def _start_link_worker(self, target, *args, daemon=None, **kwargs):
+        """Start `target(*args, **kwargs)` on a worker thread that is about
+        to use the link (a listing or a download), with the link counted as
+        busy from now until `target` returns, however it ends.
+
+        The worker marks the link busy itself (loadNUM, downloading), but
+        only once it runs. A status update handled on the main thread
+        before then would otherwise find the link free and start a passive
+        fetch, which would collide with the listing or download. Called on
+        the main thread; the count is shared with the worker, hence the
+        lock."""
+
+        def run():
+            try:
+                target(*args, **kwargs)
+            finally:
+                with self._held_for_passive_fetch_lock:
+                    self._link_workers -= 1
+
+        with self._held_for_passive_fetch_lock:
+            self._link_workers += 1
+        try:
+            threading.Thread(target=run, daemon=daemon).start()
+        except BaseException:
+            with self._held_for_passive_fetch_lock:
+                self._link_workers -= 1
+            raise
 
     def _hold_for_passive_fetch(self, action):
         """Keep an operator action that needs the link (a listing, upload,
