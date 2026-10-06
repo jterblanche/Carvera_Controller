@@ -6742,6 +6742,7 @@ class Makera(RelativeLayout):
 
     # -----------------------------------------------------------------------
     def compress_file(self, input_filename):
+        output_filename = None
         try:
             # If the uploaded file is a firmware file, return the original filename without compression.
             if input_filename.find(".bin") != -1:
@@ -6795,8 +6796,13 @@ class Makera(RelativeLayout):
 
         except Exception as e:
             logger.error(f"Compression failed: {e}")
-            if os.path.exists(output_filename):
-                os.remove(output_filename)
+            # Remove a partly written output; if it cannot be removed, the
+            # caller still falls back to the uncompressed file.
+            if output_filename and os.path.exists(output_filename):
+                try:
+                    os.remove(output_filename)
+                except OSError as remove_error:
+                    logger.warning(f"Could not remove '{output_filename}': {remove_error}")
             return None
 
     # -----------------------------------------------------------------------
@@ -7165,13 +7171,27 @@ class Makera(RelativeLayout):
             firmware = bool(self.file_popup.firmware_mode)
         self._uploading_firmware = bool(firmware)
         self.controller.sendNUM = SEND_FILE
-        self.uploading_file = filepath
-        self.original_upload_filepath = filepath  # Store original path for recent directory tracking
-        if "lz" in self.filetype and not self._uploading_firmware:  # Compress file if supported
-            qlzfilename = self.compress_file(filepath)
-            if qlzfilename:
-                self.uploading_file = qlzfilename
-        threading.Thread(target=self.doUpload, args=(callback,)).start()
+        try:
+            self.uploading_file = filepath
+            self.original_upload_filepath = filepath  # Store original path for recent directory tracking
+            if "lz" in self.filetype and not self._uploading_firmware:  # Compress file if supported
+                qlzfilename = self.compress_file(filepath)
+                if qlzfilename:
+                    self.uploading_file = qlzfilename
+                else:
+                    note = tr._("Could not compress {}; uploading it uncompressed.").format(os.path.basename(filepath))
+                    self.controller.log.put((Controller.MSG_NORMAL, note))
+            threading.Thread(target=self.doUpload, args=(callback,)).start()
+        except Exception as exc:
+            # doUpload never ran, so nothing else will clear the busy mark.
+            self.controller.sendNUM = 0
+            logger.exception("Upload could not start")
+            self.controller.log.put((Controller.MSG_ERROR, tr._("Upload could not start: {}").format(exc)))
+            Clock.schedule_once(partial(self.show_message_popup, tr._("Upload file error!"), False), 0)
+            if firmware:
+                self._log_firmware("SD transfer failed: %s" % exc, error=True)
+            self._cleanup_firmware_temp(success=False)
+            self._uploading_firmware = False
 
     # -----------------------------------------------------------------------
     def doUpload(self, callback):
