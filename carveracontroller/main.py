@@ -364,7 +364,7 @@ from .GcodeViewer import (
 from .machine.busy_state import machine_is_busy
 from .machine.clients import row_display_text, rows_for_display
 from .machine.identity import load_or_create_identity, set_name
-from .machine.passive_fetch import PassiveFetchTracker
+from .machine.passive_fetch import PassiveFetchTracker, player_flag
 from .ui import widget_helpers
 from .ui.PlayProgressBar import (
     next_tool_change_after_line,
@@ -6629,10 +6629,19 @@ class Makera(RelativeLayout):
         Called both right after a publish (on_passive_file_published) and
         on every status update (updateStatus) -- the machine going idle is
         what actually releases a fetch that arrived while a job was still
-        playing (see machine/passive_fetch.py)."""
+        playing (see machine/passive_fetch.py). The player flag from the
+        status report's P: field is passed alongside the state word, since
+        the firmware also reports Idle mid-job; it is trusted at 0 only on
+        firmware that reports it, the same test updateStatus uses for
+        app.playing."""
         if self._auto_fetch_in_progress:
             return
-        path = self._passive_fetch.due_fetch(is_idle, now=time.monotonic())
+        app = App.get_running_app()
+        reports_flag = (
+            app is not None and app.is_community_firmware and app.fw_version_digitized >= Utils.digitize_v("2.1.0")
+        )
+        playing = player_flag(CNC.vars.get("is_playing", 0), reports_flag)
+        path = self._passive_fetch.due_fetch(is_idle, now=time.monotonic(), playing=playing)
         if path is None:
             return
         self._auto_fetch_in_progress = True
