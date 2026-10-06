@@ -1,5 +1,6 @@
 from carveracontroller.machine.clients import (
     ClientRow,
+    entries_with_holder,
     holder_from_client_list,
     row_display_text,
     rows_for_display,
@@ -108,3 +109,35 @@ def test_holder_from_client_list_is_nobody_for_an_empty_list():
     # has_control true for anyone -- indistinguishable from "nobody holds
     # it" and from an empty list.
     assert holder_from_client_list(()) == (0, "")
+
+
+def test_entries_with_holder_marks_only_the_new_holder():
+    marked = entries_with_holder(_entries(), OTHER_ID)
+
+    assert [(entry.id, entry.has_control) for entry in marked] == [(OTHER_ID, True), (SELF_ID, False)]
+
+
+def test_entries_with_holder_nobody_clears_every_mark():
+    marked = entries_with_holder(_entries(), 0)
+
+    assert not any(entry.has_control for entry in marked)
+
+
+def test_entries_with_holder_missing_from_the_list_marks_nobody():
+    # The holder can be a controller whose joined event has not been
+    # followed by a fresh client list yet; no row may keep a stale mark.
+    marked = entries_with_holder(_entries(), 99)
+
+    assert not any(entry.has_control for entry in marked)
+
+
+def test_entries_with_holder_keeps_everything_else_and_the_order():
+    marked = entries_with_holder(_entries(), OTHER_ID)
+
+    assert [(entry.id, entry.name, entry.link) for entry in marked] == [
+        (entry.id, entry.name, entry.link) for entry in _entries()
+    ]
+
+
+def test_entries_with_holder_agreeing_with_the_list_returns_an_equal_list():
+    assert entries_with_holder(_entries(), SELF_ID) == _entries()

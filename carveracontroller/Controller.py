@@ -20,7 +20,7 @@ from functools import partial
 
 from . import Utils
 from .CNC import CMDPAT, CNC, LASER_TOOL_NUMBER, PARENPAT, SEMIPAT, ZPROBE_TOOL_NUMBER
-from .machine.clients import holder_from_client_list
+from .machine.clients import entries_with_holder, holder_from_client_list
 from .machine.control_refusal import is_control_refusal
 from .machine.heartbeat import heartbeat_due
 from .machine.hello import HelloNegotiator, Resolution
@@ -215,7 +215,9 @@ class Controller:
         # command) or 1 (file transfer start), matching the automatic-
         # command wrapper's `kind` field.
         self._reset_pending_sends()
-        # The other controllers currently connected, from the last client-list reply.
+        # The other controllers currently connected, from the last client-list
+        # reply, with each entry's has_control kept in step with control-changed
+        # events (see _on_control_changed).
         self.connected_clients: tuple[ClientEntry, ...] = ()
         # Who holds control right now: kept in step with the last
         # control-changed event (the machine's `0x68` event frame, kind 5)
@@ -3008,10 +3010,20 @@ class Controller:
         entries disagree with the current state (_on_client_list above).
         This is the only place control_holder_id/control_holder_name are
         set: this controller never guesses who holds control from its own
-        sends, only from what the machine actually publishes back."""
+        sends, only from what the machine actually publishes back.
+
+        connected_clients takes the new holder here too: the machine sends
+        no client list when control moves, so the has_control marks from
+        the last one would otherwise keep naming whoever held control at
+        the last join or leave. Nothing is requested from the machine for
+        this."""
         self.control_holder_id = holder_id
         self.control_holder_name = holder_name
         self._notify_control_changed(holder_id, holder_name)
+        marked = entries_with_holder(self.connected_clients, holder_id)
+        if marked != self.connected_clients:
+            self.connected_clients = marked
+            self._notify_client_list_updated(marked)
 
     def _on_client_presence(self, event):
         """A client-joined or client-left event (the machine's `0x68` event
