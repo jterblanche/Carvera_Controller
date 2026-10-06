@@ -148,3 +148,44 @@ def test_nothing_is_logged_when_logging_is_off(make_stream, caplog):
         stream.send(frame)
 
     assert _sent_messages(caplog) == []
+
+
+class _ShortWriteSocket:
+    """socket double whose send() takes only the first few bytes, as a
+    socket with a send timeout may."""
+
+    def __init__(self, accept):
+        self.accept = accept
+        self.wire = bytearray()
+
+    def send(self, data):
+        taken = data[: self.accept]
+        self.wire.extend(taken)
+        return len(taken)
+
+
+class _FailingSocket:
+    def send(self, data):
+        raise OSError("Broken pipe")
+
+
+def test_wifi_sent_line_reports_only_the_bytes_the_socket_took(caplog):
+    caplog.set_level(logging.DEBUG)
+    stream = WIFIStream(log_sent_receive=True)
+    stream.socket = _ShortWriteSocket(accept=4)
+    frame = MakeraProtocol().encode_command(PLAY)
+
+    stream.send(frame)
+
+    assert _sent_messages(caplog) == [f"SENT: {frame[:4]!r}"]
+
+
+def test_wifi_send_that_fails_logs_no_sent_line(caplog):
+    caplog.set_level(logging.DEBUG)
+    stream = WIFIStream(log_sent_receive=True)
+    stream.socket = _FailingSocket()
+
+    with pytest.raises(OSError):
+        stream.send(MakeraProtocol().encode_command(PLAY))
+
+    assert _sent_messages(caplog) == []
