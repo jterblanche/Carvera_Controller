@@ -69,8 +69,6 @@ def _passive_host(tmp_path):
     root.temp_dir = str(tmp_path)
     root._passive_fetch = PassiveFetchTracker()
     root._auto_fetch_in_progress = False
-    root._last_upload_checksum_path = None
-    root._last_upload_checksum = b""
     return root
 
 

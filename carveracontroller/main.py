@@ -364,7 +364,7 @@ from .GcodeViewer import (
 from .machine.busy_state import machine_is_busy
 from .machine.clients import row_display_text, rows_for_display
 from .machine.identity import load_or_create_identity, set_name
-from .machine.passive_fetch import PassiveFetchTracker
+from .machine.passive_fetch import PassiveFetchTracker, published_upload_path
 from .ui import widget_helpers
 from .ui.PlayProgressBar import (
     next_tool_change_after_line,
@@ -3181,12 +3181,6 @@ class Makera(RelativeLayout):
         # events -- see on_passive_file_published() and updateStatus().
         self._passive_fetch = PassiveFetchTracker()
         self._auto_fetch_in_progress = False
-        # The path/digest of the most recent upload-finished event seen,
-        # so a play-started event for the same path -- which never carries
-        # a checksum of its own -- can still be checked against the local
-        # copy in on_passive_file_published().
-        self._last_upload_checksum_path = None
-        self._last_upload_checksum = b""
         # Fill basic global variables
         CNC.vars["state"] = NOT_CONNECTED
         CNC.vars["color"] = STATECOLOR[NOT_CONNECTED]
@@ -6587,12 +6581,20 @@ class Makera(RelativeLayout):
         new job's line numbers. The fetch below redraws the right file once
         it lands.
 
+        An upload-finished event for a file this controller sent itself
+        (the same path and the same digest it announced, see doUpload) is
+        the echo of its own upload: nothing to fetch, and nothing on
+        screen to blank, whether or not this controller currently believes
+        it has control. Another client's later upload to the same path
+        carries a different digest and is fetched as usual.
+
         `checksum` is the upload-finished event's own digest (b"" for a
         play-started event, or for old firmware, which announces no
-        usable one). Remembered per path, so a play-started event that
-        follows shortly after for the same path can still use it -- the
-        path plus the last upload-finished checksum is enough; a
-        play-started event never needs one of its own. When `path` is
+        usable one). Remembered per path for this connection
+        (PassiveFetchTracker.checksum_for), so a play-started event that
+        follows for the same path can still use it -- the path plus the
+        last upload-finished checksum is enough; a play-started event
+        never needs one of its own. When `path` is
         already on screen and this digest matches the local copy already
         there (Utils.md5), the file does not need fetching again: the
         download is skipped outright and the tracker is told the file is
@@ -6603,13 +6605,12 @@ class Makera(RelativeLayout):
         skip one.
         """
         app = App.get_running_app()
-        if app is None or self.controller.has_control:
+        if app is None:
             return
-        if checksum:
-            self._last_upload_checksum_path = path
-            self._last_upload_checksum = checksum
-        elif path == self._last_upload_checksum_path:
-            checksum = self._last_upload_checksum
+        own_upload = self._passive_fetch.is_own_upload(path, checksum)
+        checksum = self._passive_fetch.checksum_for(path, checksum)
+        if own_upload or self.controller.has_control:
+            return
         if path and path != app.selected_remote_filename:
             app.selected_remote_filename = ""
             app.selected_local_filename = ""
@@ -7206,6 +7207,10 @@ class Makera(RelativeLayout):
         try:
             # md5 = Utils.md5(self.uploading_file)
             md5 = Utils.md5(displayname)
+            # Before the upload command goes out, so the machine's
+            # announcement of this upload is recognised as this
+            # controller's own whenever it arrives (on_passive_file_published).
+            self._passive_fetch.note_own_upload(published_upload_path(os.path.normpath(remotename)), md5)
             sent = self.controller.uploadCommand(os.path.normpath(remotename))
             if not sent:
                 # Held back: the identify handshake is still unresolved (a
@@ -7725,9 +7730,11 @@ class Makera(RelativeLayout):
                     # that is no longer open.
                     self.control_holder_text = ""
                     self.status_drop_down.can_release_control = False
-                    # A relayed tool table and a pending passive fetch both
-                    # belong to the connection that produced them; a fresh
-                    # connection starts with neither, same as control state.
+                    # A relayed tool table and the passive-fetch tracker (a
+                    # pending fetch, the digests announced, this
+                    # controller's own uploads) belong to the connection
+                    # that produced them; a fresh connection starts with
+                    # neither, same as control state.
                     self.relayed_tool_table = {}
                     self._passive_fetch = PassiveFetchTracker()
 
