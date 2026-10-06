@@ -1,0 +1,672 @@
+"""The controller's side of the job-start sync.
+
+A machine that holds starts announces a job with a job-start event (0x68
+kind 8) and waits, up to its time limit, until every other controller that
+takes part has drawn the job's file and sent ready (0x6C). These tests
+drive the controller through that from the events: drawing a local copy
+at once, fetching a file it lacks before the start, reporting ready (again,
+when the machine still lists it), the countdown on every controller with
+Start now and Cancel on the starter only, a cancelled start, a start at the
+time limit, resume-at-line, and firmware without the hold.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+from carveracontroller import Utils
+from carveracontroller.CNC import CNC
+from carveracontroller.Controller import Controller
+from carveracontroller.machine.control_refusal import JOB_START_REFUSAL
+from carveracontroller.machine.hello import HelloNegotiator
+from carveracontroller.machine.identity import ControllerIdentity
+from carveracontroller.machine.job_start import JobStartTracker
+from carveracontroller.machine.local_copies import LocalCopyStore
+from carveracontroller.machine.passive_fetch import PassiveFetchTracker
+from carveracontroller.main import Makera
+from carveracontroller.protocols.framing import build_frame
+from carveracontroller.protocols.handshake import (
+    EVENT_KIND_PLAY_STARTED,
+    HELLO_ACCEPTED,
+    JOB_START_CANCELLED,
+    JOB_START_REASON_ABORT,
+    JOB_START_REASON_ALL_READY,
+    JOB_START_REASON_HALT,
+    JOB_START_REASON_STARTER_LEFT,
+    JOB_START_REASON_TIME_LIMIT,
+    JOB_START_REASON_WAITING,
+    JOB_START_STARTING,
+    JOB_START_WAITING,
+    ClientEntry,
+    JobStartEvent,
+)
+from carveracontroller.protocols.makera import HELLO_PROTOCOL_VERSION
+from carveracontroller.protocols.messages import MessageKind, ParsedMessage
+
+PC = 0x1111  # the controller that starts the job
+DEMO = 0x2222  # the controller under test, unless it is the starter
+THIRD = 0x3333
+
+PATH = "/sd/gcodes/air-test-long.nc"
+CONTENT = b"G21\nG90\nG0 X0 Y0\nG1 X10 F500\n"
+MD5 = hashlib.md5(CONTENT).digest()
+
+
+def _event(
+    start_id=7,
+    phase=JOB_START_WAITING,
+    reason=JOB_START_REASON_WAITING,
+    seconds_left=30,
+    starter_id=PC,
+    not_ready=(DEMO,),
+    path=PATH,
+    size=len(CONTENT),
+    checksum=MD5,
+):
+    return JobStartEvent(
+        path=path,
+        size=size,
+        checksum=checksum,
+        start_id=start_id,
+        phase=phase,
+        reason=reason,
+        seconds_left=seconds_left,
+        starter_id=starter_id,
+        not_ready_ids=tuple(not_ready),
+    )
+
+
+class _FakePopup:
+    def __init__(self):
+        self.showing = False
+        self.texts = []
+        self.buttons = []
+
+    def update(self, text, show_buttons):
+        self.showing = True
+        self.texts.append(text)
+        self.buttons.append(show_buttons)
+
+    def close(self):
+        self.showing = False
+
+
+class _HeldThread:
+    """Records each thread started and runs it only when the test says so,
+    with its keyword arguments."""
+
+    started: list = []
+
+    def __init__(self, target=None, args=(), kwargs=None, **_ignored):
+        self.target = target
+        self.args = args
+        self.kwargs = kwargs or {}
+
+    def start(self):
+        _HeldThread.started.append(self)
+
+    def run(self):
+        self.target(*self.args, **self.kwargs)
+
+
+class _ImmediateThread(_HeldThread):
+    def start(self):
+        self.run()
+
+
+@pytest.fixture
+def app(monkeypatch):
+    """The running app on firmware that reports the player flag, machine
+    idle and not playing, another file on screen."""
+    running = SimpleNamespace(
+        selected_remote_filename="/sd/gcodes/spindle-test.nc",
+        selected_local_filename="/tmp/spindle-test.nc",
+        state="Idle",
+        playing=False,
+        is_community_firmware=True,
+        fw_version_digitized=Utils.digitize_v("2.2.0"),
+    )
+    monkeypatch.setattr("carveracontroller.main.App.get_running_app", lambda: running)
+    monkeypatch.setattr("carveracontroller.main.Clock.schedule_once", lambda cb, *a, **kw: cb(0))
+    monkeypatch.setattr("carveracontroller.main.Clock.schedule_interval", lambda *a, **kw: MagicMock())
+    monkeypatch.setattr("carveracontroller.main.threading.Thread", _ImmediateThread)
+    monkeypatch.setitem(CNC.vars, "is_playing", 0)
+    return running
+
+
+def _host(tmp_path, own_id=DEMO, has_control=False):
+    root = Makera.__new__(Makera)
+    root.temp_dir = str(tmp_path / "cache")
+    os.makedirs(root.temp_dir, exist_ok=True)
+    root.identity = SimpleNamespace(id=own_id)
+    root._passive_fetch = PassiveFetchTracker()
+    root._auto_fetch_in_progress = False
+    root._local_copies = LocalCopyStore()
+    root._job_start = JobStartTracker(own_id=own_id)
+    root._job_start_popup = _FakePopup()
+    root._job_start_clock = None
+    root.controller = SimpleNamespace(
+        has_control=has_control,
+        sendNUM=0,
+        loadNUM=0,
+        connected_clients=(
+            ClientEntry(id=PC, name="PC", link=1, has_control=True),
+            ClientEntry(id=DEMO, name="Demo", link=0, has_control=False),
+            ClientEntry(id=THIRD, name="Shop", link=0, has_control=False),
+        ),
+        send_job_start_ready=MagicMock(return_value=True),
+        startNowCommand=MagicMock(),
+        abortCommand=MagicMock(),
+        log=MagicMock(),
+    )
+
+    def download(remote_path, local_path, show_progress=True, open_after=True, automatic=False):
+        with open(local_path, "wb") as f:
+            f.write(CONTENT)
+        return 1
+
+    root.doDownload = MagicMock(side_effect=download)
+    root.load_gcode_file = MagicMock()
+    root.show_message_popup = MagicMock()
+    return root
+
+
+def _local_copy(tmp_path, name="air-test-long.nc", content=CONTENT):
+    path = tmp_path / name
+    path.write_bytes(content)
+    return str(path)
+
+
+def _logged(root):
+    return [c.args[0][1] for c in root.controller.log.put.call_args_list]
+
+
+# -- a local copy with the same content ---------------------------------------
+
+
+def test_identical_copy_of_a_card_file_is_drawn_without_a_fetch(tmp_path, app):
+    """Another controller plays a file from the card. This controller
+    fetched an identical copy earlier and has a different file on screen. It draws its copy at once, fetches nothing,
+    and reports ready."""
+    root = _host(tmp_path)
+    copy = _local_copy(tmp_path)
+    root._local_copies.remember(copy)
+
+    Makera.on_job_start_event(root, _event())
+
+    root.doDownload.assert_not_called()
+    root.load_gcode_file.assert_called_once_with(copy)
+    assert app.selected_remote_filename == PATH
+    assert app.selected_local_filename == copy
+    root.controller.send_job_start_ready.assert_called_once_with(7)
+
+    # The job starts; play-started carries the same size and MD5.
+    Makera.on_job_start_event(root, _event(phase=JOB_START_STARTING, reason=JOB_START_REASON_ALL_READY, not_ready=()))
+    Makera.on_passive_file_published(root, PATH, MD5, size=len(CONTENT), played=True)
+
+    root.doDownload.assert_not_called()
+    root.load_gcode_file.assert_called_once()
+    assert app.selected_remote_filename == PATH
+    assert app.selected_local_filename == copy
+    assert root._passive_fetch.pending_path is None
+
+
+def test_copy_already_on_screen_reports_ready_at_once(tmp_path, app):
+    root = _host(tmp_path)
+    copy = _local_copy(tmp_path, "renamed.nc")
+    app.selected_remote_filename = "/sd/gcodes/renamed.nc"
+    app.selected_local_filename = copy
+
+    Makera.on_job_start_event(root, _event())
+
+    root.doDownload.assert_not_called()
+    root.load_gcode_file.assert_not_called()
+    assert app.selected_remote_filename == PATH  # named as the machine names it
+    root.controller.send_job_start_ready.assert_called_once_with(7)
+
+
+def test_play_started_with_a_matching_copy_draws_it_at_once(tmp_path, app):
+    """Without a hold (the machine's wait is turned off, or this controller
+    was not waited for), play-started's size and MD5 still let a controller
+    holding an identical copy draw it at once instead of after the job."""
+    root = _host(tmp_path)
+    copy = _local_copy(tmp_path)
+    root._local_copies.remember(copy)
+
+    Makera.on_passive_file_published(root, PATH, MD5, size=len(CONTENT), played=True)
+
+    root.doDownload.assert_not_called()
+    root.load_gcode_file.assert_called_once_with(copy)
+    assert app.selected_local_filename == copy
+    assert root._passive_fetch.pending_path is None
+
+
+def test_play_started_without_a_copy_waits_for_the_job_to_end(tmp_path, app):
+    """No local copy: the file on screen is blanked and the fetch waits
+    until the player stops -- never during the job."""
+    root = _host(tmp_path)
+    CNC.vars["is_playing"] = 1
+
+    Makera.on_passive_file_published(root, PATH, MD5, size=len(CONTENT), played=True)
+
+    root.doDownload.assert_not_called()
+    assert app.selected_remote_filename == ""
+    assert root._passive_fetch.pending_path == PATH
+
+
+def test_a_copy_with_the_same_name_but_other_content_is_not_drawn(tmp_path, app):
+    root = _host(tmp_path)
+    root._local_copies.remember(_local_copy(tmp_path, content=b"G0 X99\n"))
+    CNC.vars["is_playing"] = 1
+
+    Makera.on_passive_file_published(root, PATH, MD5, size=len(CONTENT), played=True)
+
+    root.load_gcode_file.assert_not_called()
+    assert app.selected_remote_filename == ""
+
+
+def test_old_play_started_without_size_or_checksum_behaves_as_before(tmp_path, app):
+    """Firmware without the hold names only the path: even an identical
+    local copy is not drawn from it, and the file is fetched once the job
+    has ended, exactly as before."""
+    root = _host(tmp_path)
+    root._local_copies.remember(_local_copy(tmp_path))
+    CNC.vars["is_playing"] = 1
+
+    Makera.on_passive_file_published(root, PATH, b"", size=None, played=True)
+
+    root.load_gcode_file.assert_not_called()
+    root.doDownload.assert_not_called()
+    assert app.selected_remote_filename == ""
+    assert root._passive_fetch.pending_path == PATH
+
+
+def test_play_started_is_never_taken_for_own_upload(tmp_path, app):
+    """This controller uploaded the file earlier; another controller now
+    plays it while a different file is on screen. That file must not stay
+    under the job's progress."""
+    root = _host(tmp_path)
+    root._passive_fetch.note_own_upload(PATH, MD5.hex())
+    CNC.vars["is_playing"] = 1
+
+    Makera.on_passive_file_published(root, PATH, MD5, size=len(CONTENT), played=True)
+
+    assert app.selected_remote_filename == ""
+    assert root._passive_fetch.pending_path == PATH
+
+
+# -- fetching before the start ------------------------------------------------
+
+
+def test_card_file_this_controller_lacks_is_fetched_before_the_start(tmp_path, app, monkeypatch):
+    """A file played from the card that this controller has never had: it
+    is fetched while the machine holds the start, drawn, and ready follows.
+    A waiting event during the fetch starts nothing more."""
+    _HeldThread.started = []
+    monkeypatch.setattr("carveracontroller.main.threading.Thread", _HeldThread)
+    root = _host(tmp_path)
+
+    Makera.on_job_start_event(root, _event())
+    assert app.selected_remote_filename == ""  # the old drawing is gone at once
+    assert len(_HeldThread.started) == 1
+    fetch = _HeldThread.started[0]
+    assert fetch.args == (PATH,)
+
+    Makera.on_job_start_event(root, _event(seconds_left=29))
+    assert len(_HeldThread.started) == 1
+    root.controller.send_job_start_ready.assert_not_called()
+
+    fetch.run()  # the download; the drawing is the next thread
+    root.doDownload.assert_called_once()
+    assert root.doDownload.call_args.kwargs["automatic"] is True
+    local = os.path.join(root.temp_dir, "air-test-long.nc")
+    assert app.selected_remote_filename == PATH
+    assert app.selected_local_filename == local
+    _HeldThread.started[1].run()
+
+    root.load_gcode_file.assert_called_once_with(local)
+    root.controller.send_job_start_ready.assert_called_once_with(7)
+    assert root._auto_fetch_in_progress is False
+    assert root._passive_fetch.pending_path is None
+
+
+def test_ready_is_sent_again_while_the_machine_still_lists_this_controller(tmp_path, app):
+    root = _host(tmp_path)
+    root._local_copies.remember(_local_copy(tmp_path))
+
+    Makera.on_job_start_event(root, _event())
+    Makera.on_job_start_event(root, _event(seconds_left=29))
+    Makera.on_job_start_event(root, _event(seconds_left=28, not_ready=()))
+
+    assert root.controller.send_job_start_ready.call_count == 2
+    root.load_gcode_file.assert_called_once()
+
+
+def test_a_failed_fetch_still_reports_ready_and_fetches_after_the_job(tmp_path, app):
+    root = _host(tmp_path)
+    root.doDownload = MagicMock(return_value=None)
+
+    Makera.on_job_start_event(root, _event())
+
+    root.controller.send_job_start_ready.assert_called_once_with(7)
+    root.load_gcode_file.assert_not_called()
+    assert app.selected_remote_filename == ""
+    assert root._passive_fetch.pending_path == PATH
+    assert any("toolpath is not shown" in text for text in _logged(root))
+
+
+def test_never_fetches_while_the_machine_reports_a_file_playing(tmp_path, app, monkeypatch):
+    _HeldThread.started = []
+    monkeypatch.setattr("carveracontroller.main.threading.Thread", _HeldThread)
+    root = _host(tmp_path)
+    CNC.vars["is_playing"] = 1
+
+    Makera.on_job_start_event(root, _event())
+
+    assert _HeldThread.started == []
+    root.controller.send_job_start_ready.assert_not_called()
+
+
+def test_waits_for_its_own_transfer_then_fetches_on_the_next_event(tmp_path, app, monkeypatch):
+    _HeldThread.started = []
+    monkeypatch.setattr("carveracontroller.main.threading.Thread", _HeldThread)
+    root = _host(tmp_path)
+    root.controller.loadNUM = 1  # a listing is waiting for its reply
+
+    Makera.on_job_start_event(root, _event())
+    assert _HeldThread.started == []
+
+    root.controller.loadNUM = 0
+    Makera.on_job_start_event(root, _event(seconds_left=29))
+    assert len(_HeldThread.started) == 1
+
+
+def test_an_event_that_does_not_list_this_controller_asks_nothing(tmp_path, app):
+    root = _host(tmp_path)
+
+    Makera.on_job_start_event(root, _event(not_ready=(THIRD,)))
+
+    root.doDownload.assert_not_called()
+    root.controller.send_job_start_ready.assert_not_called()
+    assert root._job_start_popup.showing
+
+
+# -- countdown, Start now, Cancel ---------------------------------------------
+
+
+def test_every_controller_shows_the_countdown_without_buttons(tmp_path, app):
+    root = _host(tmp_path)
+
+    Makera.on_job_start_event(root, _event(not_ready=(THIRD,)))
+
+    popup = root._job_start_popup
+    assert popup.showing
+    assert popup.buttons == [False]
+    assert "air-test-long.nc" in popup.texts[-1]
+    assert "30" in popup.texts[-1]
+    assert "Shop" in popup.texts[-1]
+
+
+def test_the_starter_gets_start_now_and_cancel(tmp_path, app):
+    root = _host(tmp_path, own_id=PC, has_control=True)
+
+    Makera.on_job_start_event(root, _event(not_ready=(DEMO,)))
+
+    popup = root._job_start_popup
+    assert popup.buttons == [True]
+    assert "Demo" in popup.texts[-1]
+    root.controller.send_job_start_ready.assert_not_called()
+    root.doDownload.assert_not_called()
+
+
+def test_countdown_counts_down_between_events(tmp_path, app, monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr("carveracontroller.main.time.monotonic", lambda: clock[0])
+    root = _host(tmp_path)
+
+    Makera.on_job_start_event(root, _event(not_ready=(THIRD,)))
+    clock[0] += 3
+    Makera._tick_job_start_countdown(root)
+
+    assert "27" in root._job_start_popup.texts[-1]
+
+
+def test_countdown_closes_once_the_job_is_playing(tmp_path, app):
+    """The starting event can be lost; the playing flag ends the countdown."""
+    root = _host(tmp_path)
+    Makera.on_job_start_event(root, _event(not_ready=(THIRD,)))
+
+    CNC.vars["is_playing"] = 1
+    Makera._tick_job_start_countdown(root)
+
+    assert not root._job_start_popup.showing
+    assert not root._job_start.held
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        (JOB_START_REASON_ABORT, "cancelled from a controller"),
+        (JOB_START_REASON_STARTER_LEFT, "started it disconnected"),
+        (JOB_START_REASON_HALT, "machine halted"),
+    ],
+)
+def test_a_cancelled_start_closes_the_countdown_and_says_why(tmp_path, app, reason, expected):
+    root = _host(tmp_path)
+    Makera.on_job_start_event(root, _event(not_ready=(THIRD,)))
+
+    Makera.on_job_start_event(root, _event(phase=JOB_START_CANCELLED, reason=reason, seconds_left=0, not_ready=()))
+
+    assert not root._job_start_popup.showing
+    message = root.show_message_popup.call_args.args[0]
+    assert "air-test-long.nc" in message
+    assert expected in message
+
+
+def test_a_start_at_the_time_limit_names_who_was_not_waited_for(tmp_path, app):
+    root = _host(tmp_path, own_id=PC, has_control=True)
+    Makera.on_job_start_event(root, _event(not_ready=(DEMO,), seconds_left=1))
+
+    Makera.on_job_start_event(
+        root, _event(phase=JOB_START_STARTING, reason=JOB_START_REASON_TIME_LIMIT, seconds_left=0, not_ready=(DEMO,))
+    )
+
+    assert not root._job_start_popup.showing
+    root.show_message_popup.assert_not_called()
+    assert any("time limit" in text and "Demo" in text for text in _logged(root))
+
+
+def test_a_fetch_still_running_when_the_job_starts_draws_but_sends_no_ready(tmp_path, app, monkeypatch):
+    """The start came at the limit (or by Start now) while this controller
+    was still fetching: the file is still drawn once fetched, and no ready
+    goes out for a start that is over."""
+    _HeldThread.started = []
+    monkeypatch.setattr("carveracontroller.main.threading.Thread", _HeldThread)
+    root = _host(tmp_path)
+    Makera.on_job_start_event(root, _event())
+    Makera.on_job_start_event(root, _event(phase=JOB_START_STARTING, reason=JOB_START_REASON_TIME_LIMIT, seconds_left=0))
+
+    _HeldThread.started[0].run()
+    _HeldThread.started[1].run()
+
+    root.load_gcode_file.assert_called_once()
+    root.controller.send_job_start_ready.assert_not_called()
+
+
+def test_disconnecting_forgets_the_hold(tmp_path, app):
+    root = _host(tmp_path)
+    Makera.on_job_start_event(root, _event(not_ready=(THIRD,)))
+
+    root._job_start.clear()
+    Makera._close_job_start_countdown(root)
+
+    assert not root._job_start_popup.showing
+
+
+# -- Controller ---------------------------------------------------------------
+
+
+def _controller(monkeypatch):
+    c = Controller(CNC(), callback=None, identity=ControllerIdentity(id=DEMO, name="Demo"))
+    sent = []
+    c.stream = SimpleNamespace(send=lambda frame: sent.append(frame))
+    c._hello = SimpleNamespace(identified=True, machine_holds_starts=True)
+    monkeypatch.setattr("carveracontroller.Controller.App", None)
+    return c, sent
+
+
+def _event_message(payload):
+    return ParsedMessage(MessageKind.EVENT, payload=payload)
+
+
+def test_controller_hands_a_job_start_event_to_the_ui(monkeypatch):
+    from tests.unit.test_job_start_wire import job_start_payload
+
+    c, _ = _controller(monkeypatch)
+    handed = []
+    c._notify_job_start = handed.append
+
+    c._handle_protocol_message(_event_message(job_start_payload(start_id=9)))
+
+    assert c.last_job_start_event is not None
+    assert c.last_job_start_event.start_id == 9
+    assert [e.start_id for e in handed] == [9]
+
+
+def test_controller_passes_play_started_size_and_checksum_on(monkeypatch):
+    c, _ = _controller(monkeypatch)
+    published = []
+    c._notify_file_published = lambda *a: published.append(a)
+    payload = bytes([EVENT_KIND_PLAY_STARTED, len(PATH)]) + PATH.encode() + len(CONTENT).to_bytes(4, "big")
+    payload += bytes([1]) + MD5
+
+    c._handle_protocol_message(_event_message(payload))
+
+    assert published == [(PATH, MD5, len(CONTENT), True)]
+
+
+def test_controller_with_old_play_started_passes_no_size(monkeypatch):
+    c, _ = _controller(monkeypatch)
+    published = []
+    c._notify_file_published = lambda *a: published.append(a)
+
+    c._handle_protocol_message(_event_message(bytes([EVENT_KIND_PLAY_STARTED, len(PATH)]) + PATH.encode()))
+
+    assert published == [(PATH, b"", None, True)]
+
+
+def test_send_job_start_ready_sends_the_ready_frame(monkeypatch):
+    c, sent = _controller(monkeypatch)
+    assert c.send_job_start_ready(0x0102) is True
+    assert sent == [build_frame(0x6C, bytes([0x01, 0x02]))]
+
+
+def test_send_job_start_ready_needs_an_identified_link(monkeypatch):
+    c, sent = _controller(monkeypatch)
+    c._hello = SimpleNamespace(identified=False, machine_holds_starts=False)
+    assert c.send_job_start_ready(1) is False
+    c._hello = None
+    assert c.send_job_start_ready(1) is False
+    assert sent == []
+
+
+def test_start_now_sends_the_start_now_command(monkeypatch):
+    c, _ = _controller(monkeypatch)
+    c.executeCommand = MagicMock()
+    c.startNowCommand()
+    c.executeCommand.assert_called_once_with("start-now\n")
+
+
+def test_refusal_during_a_hold_is_shown_but_is_no_alarm(monkeypatch):
+    c, _ = _controller(monkeypatch)
+    CNC.vars["alarm_message"] = ""
+    c.parseLine(JOB_START_REFUSAL)
+    logged = []
+    while not c.log.empty():
+        logged.append(c.log.get_nowait())
+    assert (Controller.MSG_ERROR, JOB_START_REFUSAL) in logged
+    assert CNC.vars["alarm_message"] == ""
+
+
+def test_old_firmware_never_holds_a_start(monkeypatch):
+    c, _ = _controller(monkeypatch)
+    c._hello = HelloNegotiator(identity=ControllerIdentity(id=DEMO, name="Demo"), link=0)
+    c._hello.on_valid_frame(0.0)
+    c._on_hello_ack(bytes([HELLO_PROTOCOL_VERSION, HELLO_ACCEPTED, 0]))  # three bytes: no features
+    assert c._status_subscribed()
+    assert c.machine_holds_starts is False
+
+
+# -- resume at a line ---------------------------------------------------------
+
+
+@pytest.fixture
+def resume_controller(monkeypatch):
+    c, _ = _controller(monkeypatch)
+    c._get_line_position_from_gcode_viewer = lambda _line: (None, None, None, None)
+    c.executeCommand = MagicMock()
+    scheduled = []
+    monkeypatch.setattr(
+        "carveracontroller.Controller.Clock", SimpleNamespace(schedule_once=lambda cb, *a: scheduled.append(cb))
+    )
+    lines = ["G21\n", "G90\n", "G0 X1\n", "G1 X2 F300\n", "G1 X3\n"]
+    return c, scheduled, lines
+
+
+def _sent(c):
+    return [call.args[0] for call in c.executeCommand.call_args_list]
+
+
+def _tick(scheduled):
+    pending = list(scheduled)
+    scheduled.clear()
+    for cb in pending:
+        cb(0.1)
+
+
+def test_resume_at_line_waits_through_the_hold(resume_controller):
+    """buffer M600 and play go out; the machine holds the start (state
+    stays Idle, waiting events arrive) and the rest waits. Once the job
+    starts and pauses on M600, the rest is sent."""
+    c, scheduled, lines = resume_controller
+    CNC.vars["state"] = "Idle"
+    c.playStartLineCommand("job.nc", 4, lines=lines)
+    sent = _sent(c)
+    assert sent[0] == "buffer M600\n"
+    assert sent[-1].startswith("play")
+
+    for seconds in (30, 29, 28):
+        c._on_job_start(_event(seconds_left=seconds, starter_id=DEMO, not_ready=(PC,)))
+        _tick(scheduled)
+    assert len(_sent(c)) == len(sent)
+
+    c._on_job_start(_event(phase=JOB_START_STARTING, reason=JOB_START_REASON_ALL_READY, not_ready=()))
+    CNC.vars["state"] = "Pause"
+    _tick(scheduled)
+
+    after = _sent(c)[len(sent) :]
+    assert after[0].startswith("goto")
+    assert after[-1] == "resume"
+
+
+def test_a_cancelled_start_ends_the_resume_wait(resume_controller):
+    """The machine drops the buffered lines when a held start is cancelled
+    and never pauses. The rest of the resume must never be sent, even if a
+    later job pauses."""
+    c, scheduled, lines = resume_controller
+    CNC.vars["state"] = "Idle"
+    c.playStartLineCommand("job.nc", 4, lines=lines)
+    count = len(_sent(c))
+
+    c._on_job_start(_event(phase=JOB_START_CANCELLED, reason=JOB_START_REASON_ABORT, seconds_left=0))
+    CNC.vars["state"] = "Pause"
+    _tick(scheduled)
+    _tick(scheduled)
+
+    assert len(_sent(c)) == count
+    assert scheduled == []

@@ -29,9 +29,21 @@ import re
 
 _REFUSAL = re.compile(r"error:\s*(refused|transfer refused)\b", re.IGNORECASE)
 
+# The reply to a command the machine refuses while it holds a job's start
+# for the other controllers to load the file. Not an alarm and not a lost
+# connection: the command is simply not run, and the hold ends within its
+# time limit.
+JOB_START_REFUSAL = "error:Refused -- a job is about to start"
+
 
 def is_control_refusal(text: str) -> bool:
     """True for the control gate's own refusal text (above), and nothing
     else that merely contains the word "error" -- an alarm, or a different
     error reply, must not be mistaken for this one specific reply."""
     return bool(text) and _REFUSAL.match(text.strip()) is not None
+
+
+def is_job_start_refusal(text: str) -> bool:
+    """True for the machine's refusal of a command while it holds a job's
+    start (JOB_START_REFUSAL)."""
+    return bool(text) and text.strip().lower() == JOB_START_REFUSAL.lower()
