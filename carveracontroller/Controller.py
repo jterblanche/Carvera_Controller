@@ -2746,9 +2746,27 @@ class Controller:
         self.pausing = False
 
     def resumeStream(self):
+        self._dispatch_frames_from_transfer()
         self.paused = False
         self.pausing = False
         self._stream_io_parked = False
+
+    def _dispatch_frames_from_transfer(self):
+        """Hand every frame a file transfer read while it had the link, but
+        that was not part of the transfer (a status report, a published
+        event or console line, a reply), to its normal handler, in the order
+        it arrived. Called from resumeStream() before streamIO reads again,
+        so these come before anything that arrived after the transfer, and
+        nothing a handler sends can land in the middle of a transfer."""
+        take = getattr(getattr(self.stream, "modem", None), "take_other_frames", None)
+        if take is None:
+            return
+        for packet in take():
+            try:
+                for message in self.comms.feed_packet(packet):
+                    self._handle_protocol_message(message)
+            except Exception:
+                logger.exception("Could not handle a frame received during a file transfer")
 
     def _handle_protocol_message(self, message):
         """Dispatch a ParsedMessage from the active communication protocol."""
