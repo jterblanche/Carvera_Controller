@@ -2036,6 +2036,7 @@ class Controller:
         self.relayed_tool_table = {}
         self.last_published_file_path = ""
         self.last_published_checksum = b""
+        self.last_job_start_event = None
         self.clearRun()
 
     def _join_stream_io(self):
@@ -2189,6 +2190,7 @@ class Controller:
         self.relayed_tool_table = {}
         self.last_published_file_path = ""
         self.last_published_checksum = b""
+        self.last_job_start_event = None
         CNC.vars["state"] = NOT_CONNECTED
         CNC.vars["color"] = STATECOLOR[CNC.vars["state"]]
 
@@ -2226,6 +2228,7 @@ class Controller:
         self.relayed_tool_table = {}
         self.last_published_file_path = ""
         self.last_published_checksum = b""
+        self.last_job_start_event = None
         # Set a flag to indicate this was a manual disconnection
         self._manual_disconnect = True
         CNC.vars["state"] = NOT_CONNECTED
@@ -3222,6 +3225,7 @@ class Controller:
         self.relayed_tool_table = {}
         self.last_published_file_path = ""
         self.last_published_checksum = b""
+        self.last_job_start_event = None
         if self.stream is not None:
             try:
                 self.stream.close()
