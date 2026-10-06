@@ -1771,7 +1771,9 @@ class Controller:
         else:
             # Not paused yet, check again in 0.1 seconds
             Clock.schedule_once(
-                partial(self._wait_for_pause_and_continue_cmd_list_execution, remaining_commands, generation=generation),
+                partial(
+                    self._wait_for_pause_and_continue_cmd_list_execution, remaining_commands, generation=generation
+                ),
                 0.1,
             )
 

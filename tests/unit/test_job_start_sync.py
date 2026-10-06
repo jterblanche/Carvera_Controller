@@ -55,6 +55,7 @@ THIRD = 0x3333
 PATH = "/sd/gcodes/air-test-long.nc"
 CONTENT = b"G21\nG90\nG0 X0 Y0\nG1 X10 F500\n"
 MD5 = hashlib.md5(CONTENT).digest()
+SIZE = len(CONTENT)
 
 
 def _event(
@@ -65,7 +66,7 @@ def _event(
     starter_id=PC,
     not_ready=(DEMO,),
     path=PATH,
-    size=len(CONTENT),
+    size=SIZE,
     checksum=MD5,
 ):
     return JobStartEvent(
@@ -489,7 +490,9 @@ def test_a_fetch_still_running_when_the_job_starts_draws_but_sends_no_ready(tmp_
     monkeypatch.setattr("carveracontroller.main.threading.Thread", _HeldThread)
     root = _host(tmp_path)
     Makera.on_job_start_event(root, _event())
-    Makera.on_job_start_event(root, _event(phase=JOB_START_STARTING, reason=JOB_START_REASON_TIME_LIMIT, seconds_left=0))
+    Makera.on_job_start_event(
+        root, _event(phase=JOB_START_STARTING, reason=JOB_START_REASON_TIME_LIMIT, seconds_left=0)
+    )
 
     _HeldThread.started[0].run()
     _HeldThread.started[1].run()
@@ -637,7 +640,7 @@ def test_resume_at_line_waits_through_the_hold(resume_controller):
     CNC.vars["state"] = "Idle"
     c.playStartLineCommand("job.nc", 4, lines=lines)
     sent = _sent(c)
-    assert sent[0] == "buffer M600\n"
+    assert sent[0] == "buffer M600"
     assert sent[-1].startswith("play")
 
     for seconds in (30, 29, 28):

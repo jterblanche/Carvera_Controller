@@ -375,19 +375,19 @@ from .protocols.handshake import (
     JOB_START_WAITING,
 )
 from .ui import widget_helpers
-from .ui.PlayProgressBar import (
-    next_tool_change_after_line,
-    play_percent_from_line,
-    seconds_from_start,
-    seconds_until_target,
-    tool_change_markers_to_percents,
-)
 from .ui.job_start_popup import (
     JobStartPopup,
     cancelled_text,
     countdown_text,
     not_loaded_text,
     started_without_text,
+)
+from .ui.PlayProgressBar import (
+    next_tool_change_after_line,
+    play_percent_from_line,
+    seconds_from_start,
+    seconds_until_target,
+    tool_change_markers_to_percents,
 )
 from .ui.popups.adv_calibrate import AdvCalibratePopup
 from .ui.popups.set_position import (
@@ -6806,9 +6806,7 @@ class Makera(RelativeLayout):
         field's flag, on firmware that reports it)."""
         app = App.get_running_app()
         reports_flag = bool(
-            app is not None
-            and app.is_community_firmware
-            and app.fw_version_digitized >= Utils.digitize_v("2.1.0")
+            app is not None and app.is_community_firmware and app.fw_version_digitized >= Utils.digitize_v("2.1.0")
         )
         return bool(player_flag(CNC.vars.get("is_playing", 0), reports_flag))
 

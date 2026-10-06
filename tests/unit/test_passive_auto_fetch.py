@@ -134,6 +134,7 @@ def test_worker_thread_never_touches_kivy_properties_inline(monkeypatch, tmp_pat
     root = _passive_host(tmp_path)
     root.doDownload = MagicMock(return_value=1)
     root.load_gcode_file = MagicMock()
+    root._auto_fetch_in_progress = True  # as _check_passive_fetch sets it
 
     scheduled = []
     monkeypatch.setattr("carveracontroller.main.Clock.schedule_once", lambda cb, *a, **kw: scheduled.append(cb))

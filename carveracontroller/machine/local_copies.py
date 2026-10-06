@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import os
 import threading
+from collections.abc import Callable
 
 # The most files remembered. The oldest is forgotten first. A lookup stats
 # every remembered file of the right size and hashes the ones it has not
@@ -41,7 +42,7 @@ def file_md5(path: str) -> str:
 class LocalCopyStore:
     """Local paths of job files, looked up by size and MD5."""
 
-    def __init__(self, md5=file_md5, max_remembered: int = MAX_REMEMBERED) -> None:
+    def __init__(self, md5: Callable[[str], str] = file_md5, max_remembered: int = MAX_REMEMBERED) -> None:
         self._md5 = md5
         self._max = max_remembered
         self._lock = threading.Lock()

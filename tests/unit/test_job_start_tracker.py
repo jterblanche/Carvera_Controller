@@ -20,17 +20,17 @@ OTHER = 0x3333
 
 
 def _event(start_id=7, phase=JOB_START_WAITING, reason=JOB_START_REASON_WAITING, seconds_left=30, **kw):
-    fields = dict(
-        path="/sd/gcodes/part.nc",
-        size=6,
-        checksum=b"\x01" * 16,
-        start_id=start_id,
-        phase=phase,
-        reason=reason,
-        seconds_left=seconds_left,
-        starter_id=STARTER,
-        not_ready_ids=(ME,),
-    )
+    fields = {
+        "path": "/sd/gcodes/part.nc",
+        "size": 6,
+        "checksum": b"\x01" * 16,
+        "start_id": start_id,
+        "phase": phase,
+        "reason": reason,
+        "seconds_left": seconds_left,
+        "starter_id": STARTER,
+        "not_ready_ids": (ME,),
+    }
     fields.update(kw)
     return JobStartEvent(**fields)
 
@@ -90,7 +90,10 @@ def test_ready_for_a_start_no_longer_held_is_not_sent():
 
 
 def test_starting_and_cancelled_end_the_hold():
-    for phase, reason in ((JOB_START_STARTING, JOB_START_REASON_ALL_READY), (JOB_START_CANCELLED, JOB_START_REASON_ABORT)):
+    for phase, reason in (
+        (JOB_START_STARTING, JOB_START_REASON_ALL_READY),
+        (JOB_START_CANCELLED, JOB_START_REASON_ABORT),
+    ):
         t = JobStartTracker(own_id=ME)
         t.on_event(_event(), now=0.0)
         assert t.on_event(_event(phase=phase, reason=reason, seconds_left=0), now=1.0) is JobStartAction.NONE
