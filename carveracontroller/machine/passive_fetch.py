@@ -10,6 +10,14 @@ download already does. If play starts before the machine goes idle, the
 controller shows progress, time and position only (from the published
 status, which needs no file) and fetches once the machine is idle again.
 
+"Idle" here means the player has stopped, not just the state word: the
+firmware reports Idle whenever its motion queue is empty, which also
+happens mid-job (a tool change, a probe, the start-of-job routine). Where
+the status report carries the player's playing flag (the fourth value of
+its P: field), a fetch is released only after SETTLE_SAMPLES consecutive
+observations of Idle with the flag at 0. Where it does not, the state
+word decides on its own, on the first Idle report.
+
 Pure decision logic, no I/O: the caller (main.py) owns actually fetching
 the file, drawing it, and reading the machine's current Idle-ness from its
 own status -- this only tracks *which* path is owed a fetch and *when* it
@@ -35,6 +43,27 @@ RETRY_BACKOFF_S = 10.0
 # from the machine, not the same stuck one.
 MAX_FETCH_ATTEMPTS = 3
 
+# Consecutive due_fetch calls that must see the machine Idle with the
+# player stopped before a fetch is released, when the firmware reports the
+# player flag. More than one, because the call made as the
+# upload-finished/play-started event arrives sees the status report taken
+# before the event. The count restarts at every event, so at least one
+# report taken after the event has to agree.
+SETTLE_SAMPLES = 2
+
+
+def player_flag(is_playing: int, reports_flag: bool) -> bool | None:
+    """The player's playing flag as due_fetch takes it. `is_playing` is the
+    parsed fourth value of the status report's P: field, which reads 0 both
+    when the player is stopped and when the field is absent. `reports_flag`
+    says whether this firmware is known to report the field. A 1 can only
+    come from firmware that reports it, so it always means playing; a 0
+    means stopped only when the firmware reports the field, and otherwise
+    says nothing (None)."""
+    if is_playing == 1:
+        return True
+    return False if reports_flag else None
+
 
 @dataclass
 class PassiveFetchTracker:
@@ -55,6 +84,7 @@ class PassiveFetchTracker:
     _retry_after: float | None = field(default=None, init=False, repr=False)
     _failing_path: str | None = field(default=None, init=False, repr=False)
     _fail_count: int = field(default=0, init=False, repr=False)
+    _settled_samples: int = field(default=0, init=False, repr=False)
 
     @property
     def pending_path(self) -> str | None:
@@ -66,24 +96,36 @@ class PassiveFetchTracker:
         A blank path is ignored (malformed event, nothing to fetch); a path
         already loaded is not re-queued. Always treated as a fresh ask, so
         it resets any backoff/attempt count a previous failed fetch of this
-        (or another) path had built up."""
+        (or another) path had built up, and the count of settled
+        observations (SETTLE_SAMPLES)."""
         if path and path != self._loaded_path:
             self._pending_path = path
+            self._settled_samples = 0
             self._retry_after = None
             self._failing_path = None
             self._fail_count = 0
 
-    def due_fetch(self, is_idle: bool, now: float | None = None) -> str | None:
+    def due_fetch(self, is_idle: bool, now: float | None = None, playing: bool | None = None) -> str | None:
         """Call whenever the machine's Idle-ness is (re)observed, e.g. on
         every status update. Returns the path to fetch right now, clearing
         the pending request -- or None if nothing is pending, the machine
-        is not idle, or a previous failure's backoff has not elapsed yet
+        is not settled, or a previous failure's backoff has not elapsed yet
         (``now``, required to check backoff; omit only when nothing can be
         backing off, e.g. in tests that never call ``note_fetch_failed``).
+        ``playing`` is the player flag from the same status report (see
+        ``player_flag``), or None when the firmware does not report it.
+        With a flag, the machine is settled once SETTLE_SAMPLES consecutive
+        calls since the last published event saw it Idle and not playing;
+        without one, on any call that sees it Idle.
         The caller should call ``mark_loaded`` once the fetch actually
         completes, or ``note_fetch_failed`` if it does not -- never nothing,
         or a slow fetch could be retriggered while still in flight."""
-        if not is_idle or self._pending_path is None:
+        if playing is None:
+            settled = is_idle
+        else:
+            self._settled_samples = self._settled_samples + 1 if is_idle and not playing else 0
+            settled = self._settled_samples >= SETTLE_SAMPLES
+        if not settled or self._pending_path is None:
             return None
         if self._retry_after is not None and (now is None or now < self._retry_after):
             return None
