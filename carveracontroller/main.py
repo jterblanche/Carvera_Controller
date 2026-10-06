@@ -7630,7 +7630,7 @@ class Makera(RelativeLayout):
         Clock.schedule_once(self.progressFinish, 0)
         Clock.schedule_once(partial(self.show_message_popup, message, False), 0)
 
-    # --------------------------------------------------------------`---------
+    # -----------------------------------------------------------------------
     def _open_decompress_progress(self, text, *args):
         """Open the "Decompressing" popup, but only while the decompress
         wait is still running.
