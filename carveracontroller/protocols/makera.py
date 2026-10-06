@@ -26,6 +26,7 @@ from .framing import (
     PTYPE_HEARTBEAT,
     PTYPE_HELLO,
     PTYPE_HELLO_ACK,
+    PTYPE_JOB_START_READY,
     PTYPE_LOAD_ERROR,
     PTYPE_LOAD_FINISH,
     PTYPE_LOAD_INFO,
@@ -44,8 +45,11 @@ from .messages import MessageKind, ParsedMessage
 HELLO_PROTOCOL_VERSION = 1
 
 
-def encode_hello(controller_id: int, name: bytes, link: int) -> bytes:
-    """Build a hello (0x60) frame: protocol_version(1) + id(8) + name_len(1) + name + link(1)."""
+def encode_hello(controller_id: int, name: bytes, link: int, features: int | None = None) -> bytes:
+    """Build a hello (0x60) frame: protocol_version(1) + id(8) + name_len(1)
+    + name + link(1), then features(1) when ``features`` is given (see
+    HELLO_FEATURE_JOB_START_WAIT in protocols/handshake.py). Firmware that
+    does not know the features byte ignores it."""
     if len(name) > 31:
         raise ValueError("hello name must be <= 31 bytes")
     payload = (
@@ -55,7 +59,15 @@ def encode_hello(controller_id: int, name: bytes, link: int) -> bytes:
         + name
         + bytes([link & 0xFF])
     )
+    if features is not None:
+        payload += bytes([features & 0xFF])
     return build_frame(PTYPE_HELLO, payload)
+
+
+def encode_job_start_ready(start_id: int) -> bytes:
+    """Build a job-start ready (0x6C) frame: start_id(2, BE), copied from
+    the job-start event it answers."""
+    return build_frame(PTYPE_JOB_START_READY, (start_id & 0xFFFF).to_bytes(2, "big"))
 
 
 def encode_client_list_request() -> bytes:
