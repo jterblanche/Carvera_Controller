@@ -1688,6 +1688,21 @@ def tool_confirm_button_text(*, has_control, control_holder_id, control_holder_n
     return tr._("Confirm and take control from {name}").format(name=name)
 
 
+class ApplyReadback:
+    """Settings whose config-set the machine acknowledged, waiting for
+    /sd/config.txt to be read back to confirm the card holds them.
+
+    ``sent`` lists the keys written. ``refused`` is the text naming the
+    settings in the same Apply that the machine refused, or None when it
+    accepted them all. ``reason`` says why the read-back failed, when it
+    does."""
+
+    def __init__(self, sent, refused=None):
+        self.sent = list(sent)
+        self.refused = refused
+        self.reason = None
+
+
 class ConfigPopup(ModalView):
     # Why machine settings can't be applied from here right now, shown beside
     # the Apply button; empty while they can. See
@@ -3016,6 +3031,8 @@ class Makera(RelativeLayout):
     downloading_size = 0
     downloading_file = ""
     downloading_config = False
+    # The Apply waiting on its config.txt read-back (ApplyReadback), if any.
+    _apply_readback = None
 
     setting_list = {}
     setting_type_list = {}
@@ -5490,6 +5507,7 @@ class Makera(RelativeLayout):
     # -----------------------------------------------------------------------
     def finishLoadConfig(self, success, *args):
         self.downloading_config = False
+        readback, self._apply_readback = self._apply_readback, None
         if success:
             try:
                 self.setting_list.clear()
@@ -5542,18 +5560,24 @@ class Makera(RelativeLayout):
                 self.config_loaded = False
                 self._config_apply_failed = True
                 self.controller.log.put((Controller.MSG_ERROR, tr._("Failed to load config file: {}").format(e)))
+                success = False
+                if readback is not None:
+                    readback.reason = str(e)
             finally:
                 self.config_loading = False
         else:
             self.config_loading = False
             self._config_download_failures += 1
-            self.controller.log.put((Controller.MSG_ERROR, tr._("Download config file error")))
+            if readback is None:
+                self.controller.log.put((Controller.MSG_ERROR, tr._("Download config file error")))
             if self._config_download_failures >= MAX_CONFIG_DOWNLOAD_ATTEMPTS:
                 logger.error(
                     "Giving up config download after %s failed attempts",
                     self._config_download_failures,
                 )
             # self.controller.close()
+        if readback is not None:
+            self._report_apply_readback(readback, success)
 
         # Preserve selected file only when reconnecting to the same machine.
         # finishLoadConfig() can be called on reconnect; resume-at-line depends on
@@ -5745,6 +5769,9 @@ class Makera(RelativeLayout):
             md5_failed = bool(
                 getattr(getattr(getattr(self.controller, "stream", None), "modem", None), "download_md5_failed", False)
             )
+            readback = self._apply_readback if apply_config else None
+            if readback is not None:
+                readback.reason = self._readback_failure_reason(md5_failed)
             if apply_config:
                 Clock.schedule_once(partial(self.finishLoadConfig, False), 0.1)
                 error_msg = (
@@ -5755,7 +5782,8 @@ class Makera(RelativeLayout):
                     if md5_failed
                     else tr._("Download config file error!")
                 )
-                Clock.schedule_once(partial(self.show_message_popup, error_msg, False), 0.2)
+                if readback is None:
+                    Clock.schedule_once(partial(self.show_message_popup, error_msg, False), 0.2)
             else:
                 error_msg = (
                     tr._(
@@ -9087,15 +9115,82 @@ class Makera(RelativeLayout):
                 # snapshot must too, or the next Apply would see a change
                 # that was already applied and resend it.
                 self.config_popup._widget_snapshot[(widget.section, widget.key)] = widget.value
+        refused = None
         if failures:
             reasons = "\n".join(f"{key}: {reason}" for key, reason in failures)
-            self.message_popup.lb_content.text = tr._(
-                "Could not apply the following settings; reverted to the current value:\n{reasons}"
-            ).format(reasons=reasons)
-        else:
-            self.message_popup.lb_content.text = tr._("Settings applied, need machine reset to take effect !")
+            refused = tr._("Could not apply the following settings; reverted to the current value:\n{reasons}").format(
+                reasons=reasons
+            )
+        sent = [key for key in pending if key not in failed_keys]
+        if sent:
+            # The result is shown once config.txt has been read back
+            # (_report_apply_readback).
+            self._start_apply_readback(ApplyReadback(sent, refused))
+            return
+        self.message_popup.lb_content.text = refused
         self.message_popup.open()
         self.download_config_file()
+
+    def _start_apply_readback(self, readback):
+        """Read /sd/config.txt back to confirm the settings in ``readback``.
+        finishLoadConfig reports the outcome through _report_apply_readback.
+        The modem's last transfer error is cleared first, so a reason left
+        by an earlier transfer is not given for this one."""
+        readback.reason = None
+        modem = getattr(getattr(self.controller, "stream", None), "modem", None)
+        if modem is not None:
+            modem.last_file_error = None
+        self._apply_readback = readback
+        self.download_config_file()
+
+    def _readback_failure_reason(self, md5_failed):
+        """Why reading config.txt back failed, in words for the settings
+        page: the machine's own reason when the transfer recorded one (a
+        refusal, a cancel with a message, a stall), else what is known."""
+        if md5_failed:
+            return tr._("the file arrived damaged (its MD5 hash did not match)")
+        modem = getattr(getattr(self.controller, "stream", None), "modem", None)
+        reason = getattr(modem, "last_file_error", None)
+        if reason:
+            return str(reason)
+        return tr._("the machine did not send the file")
+
+    def _report_apply_readback(self, readback, read_back):
+        """Runs on the Kivy main thread, from finishLoadConfig, once the
+        read-back after Apply has ended. When config.txt was read, the page
+        now shows what the card holds and the Apply result is shown as it
+        is. When it was not, the settings were sent and acknowledged but
+        are not confirmed: say so, without calling them applied, and offer
+        to read config.txt again."""
+        if read_back:
+            self.message_popup.lb_content.text = readback.refused or tr._(
+                "Settings applied, need machine reset to take effect !"
+            )
+            self.message_popup.open()
+            return
+        reason = readback.reason or tr._("the machine did not send the file")
+        self.controller.log.put(
+            (
+                Controller.MSG_ERROR,
+                tr._("Settings sent but not confirmed: could not read config.txt back ({reason})").format(
+                    reason=reason
+                ),
+            )
+        )
+        text = tr._(
+            "Sent to the machine, but could not be confirmed: {keys}\n\n"
+            "Reading config.txt back from the machine failed: {reason}\n\n"
+            "Do not rely on the new value until it is confirmed. "
+            "Check again reads config.txt from the machine once more."
+        ).format(keys=", ".join(readback.sent), reason=reason)
+        if readback.refused:
+            text = readback.refused + "\n\n" + text
+        self.confirm_popup.lb_title.text = tr._("Settings not confirmed")
+        self.confirm_popup.lb_content.text = text
+        self.confirm_popup.confirm_text = tr._("Check again")
+        self.confirm_popup.confirm = partial(self._start_apply_readback, readback)
+        self.confirm_popup.cancel = None
+        self.confirm_popup.open(self)
 
     def apply_controller_setting_changes(self):
         if self.controller_setting_change_list.get("ui_density_override") or self.controller_setting_change_list.get(
