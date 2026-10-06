@@ -505,11 +505,12 @@ def test_job_download_still_opens_gcode_viewer(monkeypatch, tmp_path):
     root = _download_host(tmp_path, downloading_config=False)
     root.controller.stream.download.side_effect = _complete_download
     monkeypatch.setattr("carveracontroller.main.App.get_running_app", lambda: None)
-    # The toolpath load is now handed to Kivy's Clock rather than run inline
-    # (see test_manual_download_defers_toolpath_load_to_main_thread below);
-    # running the callback immediately here keeps this test's own focus on
+    # The open is handed to Kivy's Clock, which starts a worker thread for
+    # the load (see test_manual_download_hands_the_open_to_the_main_thread
+    # below); running both immediately here keeps this test's own focus on
     # "the job still gets opened", not on the threading mechanics.
     monkeypatch.setattr("carveracontroller.main.Clock.schedule_once", lambda cb, *args, **kwargs: cb())
+    monkeypatch.setattr("carveracontroller.main.threading.Thread", _ImmediateThread)
 
     local_path = str(tmp_path / "job.nc")
     Makera.doDownload(root, "/sd/gcodes/job.nc", local_path, show_progress=False)
@@ -520,13 +521,12 @@ def test_job_download_still_opens_gcode_viewer(monkeypatch, tmp_path):
     root.update_recent_remote_dir_list.assert_called_once_with("/sd/gcodes")
 
 
-def test_manual_download_defers_toolpath_load_to_main_thread(monkeypatch, tmp_path):
+def test_manual_download_hands_the_open_to_the_main_thread(monkeypatch, tmp_path):
     """check_and_download() (the file browser's manual download-and-open)
     starts doDownload() on a worker thread with the default open_after=True.
-    That branch used to call load_gcode_file() -- which draws the toolpath --
-    straight from that worker thread. load_gcode_file and the thumbnail
-    ingest must instead be deferred to the main thread via
-    Clock.schedule_once."""
+    Once the download has succeeded, doDownload hands the open to the main
+    thread via Clock.schedule_once, and that loads the file on a worker
+    thread of its own (tests/unit/test_downloaded_file_open.py covers why)."""
     root = _download_host(tmp_path, downloading_config=False)
     root.controller.stream.download.side_effect = _complete_download
     monkeypatch.setattr("carveracontroller.main.App.get_running_app", lambda: None)
@@ -534,13 +534,10 @@ def test_manual_download_defers_toolpath_load_to_main_thread(monkeypatch, tmp_pa
     scheduled = []
     monkeypatch.setattr("carveracontroller.main.Clock.schedule_once", lambda cb, *a, **kw: scheduled.append(cb))
 
-    main_thread_id = threading.get_ident()
-
-    def _load(_path):
-        if threading.get_ident() != main_thread_id:
-            raise RuntimeError("Cannot change graphics instruction outside the main Kivy thread")
-
-    root.load_gcode_file = MagicMock(side_effect=_load)
+    loaded_on = []
+    root.load_gcode_file = MagicMock(side_effect=lambda _path: loaded_on.append(threading.get_ident()))
+    thumbnail_done = threading.Event()
+    root._ingest_machine_gcode_thumbnail = MagicMock(side_effect=lambda *_: thumbnail_done.set())
 
     local_path = str(tmp_path / "job.nc")
     errors = []
@@ -556,14 +553,16 @@ def test_manual_download_defers_toolpath_load_to_main_thread(monkeypatch, tmp_pa
     worker.join(timeout=5)
 
     assert not errors, f"worker thread raised: {errors!r}"
-    root.load_gcode_file.assert_not_called()  # not run inline on the worker thread
+    root.load_gcode_file.assert_not_called()  # not run inline on the download thread
 
     finish_calls = [cb for cb in scheduled if getattr(cb, "args", None) == ("/sd/gcodes/job.nc", local_path)]
     assert len(finish_calls) == 1
     finish_calls[0]()  # the caller (Kivy's Clock) runs this on the main thread, like this test thread
 
+    assert thumbnail_done.wait(5)
     root.load_gcode_file.assert_called_once_with(local_path)
     root._ingest_machine_gcode_thumbnail.assert_called_once_with("/sd/gcodes/job.nc", local_path)
+    assert loaded_on[0] != threading.get_ident()  # loaded off the main thread
 
 
 def test_machine_config_download_still_applies_settings(monkeypatch, tmp_path):
