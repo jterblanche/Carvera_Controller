@@ -6630,14 +6630,34 @@ class Makera(RelativeLayout):
         Called both right after a publish (on_passive_file_published) and
         on every status update (updateStatus) -- the machine going idle is
         what actually releases a fetch that arrived while a job was still
-        playing (see machine/passive_fetch.py)."""
-        if self._auto_fetch_in_progress:
+        playing (see machine/passive_fetch.py).
+
+        Nothing starts while this controller's own upload, download or
+        load command (a listing, delete, rename, ...) has the link: the
+        machine runs one of these at a time, and a download sent in the
+        middle of another one ends both. The fetch stays pending and starts
+        on the first status update after the link is free."""
+        if self._auto_fetch_in_progress or self._link_busy_for_passive_fetch():
             return
         path = self._passive_fetch.due_fetch(is_idle, now=time.monotonic())
         if path is None:
             return
         self._auto_fetch_in_progress = True
         threading.Thread(target=self._auto_fetch_played_file, args=(path,), daemon=True).start()
+
+    def _link_busy_for_passive_fetch(self):
+        """True while this controller's own file transfer or load command
+        is using the link: an upload from the moment it is requested
+        (sendNUM) to the end of the machine unpacking a compressed one
+        (decompstatus), a download, or any load command still waiting for
+        its reply (loadNUM)."""
+        return bool(
+            self.uploading
+            or self.downloading
+            or self.decompstatus
+            or self.controller.sendNUM != 0
+            or self.controller.loadNUM != 0
+        )
 
     def _auto_fetch_played_file(self, remote_path):
         """Background download of a passively-observed job file, reusing

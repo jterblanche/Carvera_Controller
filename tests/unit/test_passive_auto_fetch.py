@@ -69,6 +69,9 @@ def _passive_host(tmp_path):
     root.temp_dir = str(tmp_path)
     root._passive_fetch = PassiveFetchTracker()
     root._auto_fetch_in_progress = False
+    # Nothing of this controller's own is using the link, so a due fetch
+    # starts (see Makera._link_busy_for_passive_fetch).
+    root.controller = SimpleNamespace(has_control=False, sendNUM=0, loadNUM=0)
     return root
 
 

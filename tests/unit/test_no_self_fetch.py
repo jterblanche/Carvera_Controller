@@ -1,4 +1,6 @@
-"""A controller never auto-fetches a file it has just uploaded itself.
+"""A controller never auto-fetches a file it has just uploaded itself, and
+never starts a passive auto-fetch while its own transfer or listing is
+using the link.
 
 The machine announces every finished upload to every identified client,
 the uploader included. The uploader must recognise that announcement as
@@ -23,6 +25,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from carveracontroller.Controller import LOAD_DIR, SEND_FILE
 from carveracontroller.machine.passive_fetch import PassiveFetchTracker
 from carveracontroller.main import Makera
 
@@ -211,3 +214,60 @@ def test_a_remembered_digest_does_not_outlive_the_connection(tmp_path, app):
     Makera.on_passive_file_published(root, "/sd/gcodes/job.nc")
 
     root.doDownload.assert_called_once()
+
+
+# -- no auto-fetch while this controller's own transfer or listing runs ---
+
+
+def _set_uploading(root):
+    root.uploading = True
+
+
+def _set_downloading(root):
+    root.downloading = True
+
+
+def _set_decompressing(root):
+    root.decompstatus = True
+
+
+def _set_sending_file(root):
+    root.controller.sendNUM = SEND_FILE
+
+
+def _set_listing(root):
+    root.controller.loadNUM = LOAD_DIR
+
+
+@pytest.mark.parametrize(
+    "make_busy",
+    [_set_uploading, _set_downloading, _set_decompressing, _set_sending_file, _set_listing],
+    ids=["uploading", "downloading", "decompressing", "upload-starting", "listing"],
+)
+def test_fetch_waits_for_own_transfer_or_listing_then_runs(tmp_path, app, make_busy):
+    """Another controller's upload is announced while this controller's
+    own transfer or listing has the link. The fetch does not start then;
+    it stays owed and starts on the first idle status update after the
+    link is free."""
+    root = _host(tmp_path)
+    make_busy(root)
+
+    Makera.on_passive_file_published(root, "/sd/gcodes/theirs.nc", hashlib.md5(b"theirs").digest())
+
+    root.doDownload.assert_not_called()
+    assert root._passive_fetch.pending_path == "/sd/gcodes/theirs.nc"
+
+    # A status update while still busy does not start it either.
+    Makera._check_passive_fetch(root, is_idle=True)
+    root.doDownload.assert_not_called()
+
+    root.uploading = False
+    root.downloading = False
+    root.decompstatus = False
+    root.controller.sendNUM = 0
+    root.controller.loadNUM = 0
+    Makera._check_passive_fetch(root, is_idle=True)
+
+    root.doDownload.assert_called_once()
+    assert root.doDownload.call_args.args[0] == "/sd/gcodes/theirs.nc"
+    assert root._passive_fetch.pending_path is None
