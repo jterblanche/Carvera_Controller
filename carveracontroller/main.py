@@ -6443,7 +6443,12 @@ class Makera(RelativeLayout):
         button is disabled while another controller holds control in
         multi-user mode (see refresh_settings_apply_button). Nothing else is
         disabled or greyed out, and nothing prompts — control simply follows
-        whoever the machine says last acted."""
+        whoever the machine says last acted.
+
+        Once the hello ack has reported it, the text also names the machine's
+        running mode ("You have control · multi-user"): the two modes treat
+        another controller's commands differently, taking control over in
+        single-user mode and refusing them in multi-user mode."""
         own_id = self.identity.id if getattr(self, "identity", None) is not None else None
         if holder_id == 0:
             text = tr._("No one has control")
@@ -6451,6 +6456,9 @@ class Makera(RelativeLayout):
             text = tr._("You have control")
         else:
             text = tr._("{name} has control").format(name=holder_name or tr._("Another controller"))
+        if self.controller.control_mode_reported:
+            mode = tr._("multi-user") if self.controller.multi_user_mode else tr._("single-user")
+            text = tr._("{control} · {mode}").format(control=text, mode=mode)
         self.control_holder_text = text
         self.status_drop_down.can_release_control = self.controller.can_release_control
         self.refresh_settings_apply_button()
