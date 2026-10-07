@@ -2913,6 +2913,14 @@ class Controller:
         return self._status_subscribed() and self.control_mode == HELLO_MODE_MULTI_USER
 
     @property
+    def control_mode_reported(self):
+        """True once an accepted hello ack has reported the machine's running
+        mode, single-user or multi-user (see multi_user_mode). False while
+        the handshake is unresolved and always on old firmware, which has no
+        modes at all."""
+        return self._status_subscribed()
+
+    @property
     def can_write_machine_settings(self):
         """False only while a config write from here would be refused: on a
         machine in multi-user mode, while another controller holds control.

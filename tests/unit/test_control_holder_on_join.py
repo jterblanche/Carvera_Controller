@@ -177,6 +177,8 @@ def test_joining_while_another_controller_holds_control_shows_it_without_any_eve
 # controller starts every connection already holding the machine's "nobody"
 # encoding (0 / ""), so the first client list after identifying must still
 # reach the screen when it says nobody holds control, or the line stays blank.
+# FakeMachine acks in single-user mode unless told otherwise, so the line
+# ends with that mode.
 
 
 class _ScreenClock:
@@ -239,7 +241,7 @@ def test_joining_while_nobody_holds_control_shows_no_one_has_control(machine, co
     m = machine(mode="new", client_list_entries=[(OTHER_ID, "Office PC", 0, False)])
     controller.open(CONN_WIFI, m.address())
 
-    assert m.wait_until(_line_reads(root, clock, "No one has control"), timeout=2.0)
+    assert m.wait_until(_line_reads(root, clock, "No one has control · single-user"), timeout=2.0)
 
 
 def test_joining_while_another_controller_holds_control_names_it_on_screen(machine, controller, screen):
@@ -247,7 +249,7 @@ def test_joining_while_another_controller_holds_control_names_it_on_screen(machi
     m = machine(mode="new", client_list_entries=[(OTHER_ID, "Office PC", 0, True)])
     controller.open(CONN_WIFI, m.address())
 
-    assert m.wait_until(_line_reads(root, clock, "Office PC has control"), timeout=2.0)
+    assert m.wait_until(_line_reads(root, clock, "Office PC has control · single-user"), timeout=2.0)
 
 
 def test_reconnecting_while_nobody_holds_control_shows_the_line_again(machine, controller, screen):
@@ -257,7 +259,7 @@ def test_reconnecting_while_nobody_holds_control_shows_the_line_again(machine, c
     root, clock = screen
     first = machine(mode="new", client_list_entries=[(OTHER_ID, "Office PC", 0, False)])
     controller.open(CONN_WIFI, first.address())
-    assert first.wait_until(_line_reads(root, clock, "No one has control"), timeout=2.0)
+    assert first.wait_until(_line_reads(root, clock, "No one has control · single-user"), timeout=2.0)
 
     controller.close(allow_reconnect=False)
     clock.run_pending()
@@ -265,7 +267,7 @@ def test_reconnecting_while_nobody_holds_control_shows_the_line_again(machine, c
     second = machine(mode="new", client_list_entries=[(OTHER_ID, "Office PC", 0, False)])
     controller.open(CONN_WIFI, second.address())
 
-    assert second.wait_until(_line_reads(root, clock, "No one has control"), timeout=2.0)
+    assert second.wait_until(_line_reads(root, clock, "No one has control · single-user"), timeout=2.0)
 
 
 def test_routine_client_list_refresh_does_not_renotify_the_screen(machine, controller, screen):
@@ -275,7 +277,7 @@ def test_routine_client_list_refresh_does_not_renotify_the_screen(machine, contr
     root, clock = screen
     m = machine(mode="new", client_list_entries=[(OTHER_ID, "Office PC", 0, False)])
     controller.open(CONN_WIFI, m.address())
-    assert m.wait_until(_line_reads(root, clock, "No one has control"), timeout=2.0)
+    assert m.wait_until(_line_reads(root, clock, "No one has control · single-user"), timeout=2.0)
     spy = _spy_on_control_changed(controller)
 
     m.send_client_presence_event(0x1111222233334444, b"Shop Laptop", joined=True)
@@ -285,7 +287,7 @@ def test_routine_client_list_refresh_does_not_renotify_the_screen(machine, contr
     time.sleep(0.2)
     clock.run_pending()
     spy.assert_not_called()
-    assert root.control_holder_text == "No one has control"
+    assert root.control_holder_text == "No one has control · single-user"
 
 
 def test_old_firmware_leaves_the_control_line_hidden(machine, controller, screen):
