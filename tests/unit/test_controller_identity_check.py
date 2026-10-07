@@ -119,6 +119,9 @@ def test_presence_check_is_answered_from_the_network_thread(machines, controller
     m = machines(mode="new")
     controller.open(CONN_WIFI, m.address())
     assert m.wait_until(lambda: controller._hello is not None and controller._hello.identified, timeout=3.0)
+    # The first client list, asked for on identify, reaches the screen
+    # through the clock; let it land before the clock is watched.
+    assert m.wait_until(lambda: controller._control_holder_shown, timeout=2.0)
     senders = []
     real_send_wire = controller._send_wire
 
