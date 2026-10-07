@@ -37,7 +37,7 @@ CONFIG_SET_REPLY_TIMEOUT_S = 3.0
 # regardless of how many automatic attempts have already been spent.
 # Since these queries route through Controller._send_automatic_command
 # (Controller.queryVersion / queryModel), the very first one or two calls
-# can sit queued for up to ACK_TIMEOUT_S (machine/hello.py, ~1s worst case,
+# can sit queued for up to ACK_TIMEOUT_S (machine/hello.py, ~3s worst case,
 # ~70ms typically) if the identify handshake hasn't resolved yet; each
 # still counts as one attempt here, and is sent once the handshake
 # resolves, so this does not change how many times a value is asked for,
