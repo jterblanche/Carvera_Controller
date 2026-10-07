@@ -6877,6 +6877,9 @@ class Makera(RelativeLayout):
         local_path = os.path.join(self.temp_dir, os.path.basename(path))
         if ok and self._local_copies.matches(local_path, size, checksum):
             self._job_start_late = None
+            # The job's file is drawn: no other file queued before it may
+            # replace it.
+            self._passive_fetch.mark_loaded(path)
             if self._job_start.prepared(start_id):
                 self.controller.send_job_start_ready(start_id)
             return
@@ -7159,7 +7162,7 @@ class Makera(RelativeLayout):
         Everything that touches Kivy -- the selected-file properties and
         loading the toolpath -- is handed to the main thread via
         Clock.schedule_once in _finish_auto_fetch_played_file, and only
-        once the download has actually succeeded. mark_loaded is called
+        once the download has actually succeeded. mark_fetched is called
         from there too: a failed download instead calls
         note_fetch_failed(), which re-queues the path for a later idle
         status tick -- backed off (machine/passive_fetch.py's
@@ -7208,7 +7211,7 @@ class Makera(RelativeLayout):
         def drawn(ok):
             self._passive_fetch_finished()
             if ok:
-                self._passive_fetch.mark_loaded(remote_path)
+                self._passive_fetch.mark_fetched(remote_path)
             else:
                 self._passive_fetch.note_fetch_failed(remote_path, time.monotonic())
             if on_done is not None:

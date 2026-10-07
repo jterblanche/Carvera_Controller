@@ -367,3 +367,34 @@ def test_forget_loaded_lets_a_later_announcement_queue_a_fetch():
     t.forget_loaded("/sd/a.nc")
     t.note_published_file("/sd/a.nc")
     assert t.pending_path == "/sd/a.nc"
+
+
+def test_a_file_announced_during_a_fetch_stays_queued_once_it_is_drawn():
+    t = passive_fetch.PassiveFetchTracker()
+    t.note_published_file("/sd/a.nc")
+    assert t.due_fetch(is_idle=True) == "/sd/a.nc"
+    t.note_published_file("/sd/b.nc")
+    t.mark_fetched("/sd/a.nc")
+    assert t.pending_path == "/sd/b.nc"
+    t.note_published_file("/sd/a.nc")
+    assert t.pending_path == "/sd/b.nc"
+
+
+def test_a_fetch_drawn_with_nothing_newer_leaves_nothing_queued():
+    t = passive_fetch.PassiveFetchTracker()
+    t.note_published_file("/sd/a.nc")
+    assert t.due_fetch(is_idle=True) == "/sd/a.nc"
+    t.mark_fetched("/sd/a.nc")
+    assert t.pending_path is None
+    t.note_published_file("/sd/a.nc")
+    assert t.pending_path is None
+
+
+def test_a_failed_fetch_does_not_replace_a_file_announced_meanwhile():
+    t = passive_fetch.PassiveFetchTracker()
+    t.note_published_file("/sd/a.nc")
+    assert t.due_fetch(is_idle=True) == "/sd/a.nc"
+    t.note_published_file("/sd/b.nc")
+    t.note_fetch_failed("/sd/a.nc", now=0.0)
+    assert t.pending_path == "/sd/b.nc"
+    assert t.due_fetch(is_idle=True, now=0.0) == "/sd/b.nc"

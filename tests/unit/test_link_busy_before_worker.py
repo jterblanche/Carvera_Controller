@@ -51,7 +51,15 @@ def threads(monkeypatch):
     _DeferredThread.started = []
     monkeypatch.setattr("carveracontroller.main.threading.Thread", _DeferredThread)
     monkeypatch.setattr("carveracontroller.main.Clock.schedule_once", lambda *a, **kw: None)
-    running = SimpleNamespace(selected_remote_filename="", selected_local_filename="", state="Idle")
+    running = SimpleNamespace(
+        selected_remote_filename="",
+        selected_local_filename="",
+        state="Idle",
+        # Firmware that does not report the player flag: the state word
+        # alone releases a fetch, on the first Idle report.
+        is_community_firmware=False,
+        fw_version_digitized=0,
+    )
     monkeypatch.setattr("carveracontroller.main.App.get_running_app", lambda: running)
     return _DeferredThread.started
 

@@ -149,6 +149,10 @@ class PassiveFetchTracker:
         -- and, after ``MAX_FETCH_ATTEMPTS`` consecutive failures for this
         same path, stops re-queuing it at all, until a fresh
         ``note_published_file`` (for this path or another) asks again."""
+        if self._pending_path not in (None, path):
+            # A newer file was announced while this fetch ran; that one is
+            # what the machine has now, so it stays queued instead.
+            return
         if path == self._failing_path:
             self._fail_count += 1
         else:
@@ -172,6 +176,16 @@ class PassiveFetchTracker:
         self._retry_after = None
         self._failing_path = None
         self._fail_count = 0
+
+    def mark_fetched(self, path: str) -> None:
+        """Call once a fetch started via ``due_fetch`` has `path` loaded and
+        drawn. Like ``mark_loaded``, except that a different file announced
+        while the fetch ran (and so queued after ``due_fetch`` released
+        this one) stays queued: it is newer than `path`."""
+        if self._pending_path in (None, path):
+            self.mark_loaded(path)
+        else:
+            self._loaded_path = path
 
     def forget_loaded(self, path: str) -> None:
         """Call when `path` is no longer drawn (its drawing was removed, or
