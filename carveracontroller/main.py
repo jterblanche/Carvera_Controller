@@ -364,7 +364,7 @@ from .GcodeViewer import (
 from .machine.busy_state import machine_is_busy
 from .machine.clients import row_display_text, rows_for_display
 from .machine.identity import load_or_create_identity, set_name
-from .machine.job_start import JobStartAction, JobStartTracker
+from .machine.job_start import JobStartAction, JobStartTracker, may_cancel_held_start
 from .machine.local_copies import LocalCopyStore
 from .machine.passive_fetch import PassiveFetchTracker, player_flag, published_upload_path
 from .protocols.handshake import (
@@ -6961,8 +6961,10 @@ class Makera(RelativeLayout):
     def _show_job_start_countdown(self, *args):
         """Show or refresh the countdown, on every controller, or while the
         machine is still computing the file's MD5, that it is checking the
-        file. Only the controller that started the job gets Start now and
-        Cancel."""
+        file. Only the controller that started the job gets Start now;
+        every controller the machine accepts an abort from gets Cancel
+        (_may_cancel_held_start), worked out again on every refresh, since
+        control can change hands during the hold."""
         event = self._job_start.event
         if event is None:
             self._close_job_start_countdown()
@@ -6972,8 +6974,11 @@ class Makera(RelativeLayout):
                 on_start_now=self.controller.startNowCommand, on_cancel=self.controller.abortCommand
             )
         is_starter = self._job_start.is_starter
+        can_cancel = self._may_cancel_held_start()
         if self._job_start.hashing:
-            self._job_start_popup.update(checking_text(event.path, is_starter), show_buttons=is_starter)
+            self._job_start_popup.update(
+                checking_text(event.path, is_starter, can_cancel), show_start_now=is_starter, show_cancel=can_cancel
+            )
             if self._job_start_clock is None:
                 self._job_start_clock = Clock.schedule_interval(self._tick_job_start_countdown, 1.0)
             return
@@ -6982,11 +6987,26 @@ class Makera(RelativeLayout):
         if self.identity.id in event.not_ready_ids:
             names.insert(0, tr._("this controller"))
         self._job_start_popup.update(
-            countdown_text(event.path, self._job_start.seconds_left(time.monotonic()), names, is_starter),
-            show_buttons=is_starter,
+            countdown_text(event.path, self._job_start.seconds_left(time.monotonic()), names, is_starter, can_cancel),
+            show_start_now=is_starter,
+            show_cancel=can_cancel,
         )
         if self._job_start_clock is None:
             self._job_start_clock = Clock.schedule_interval(self._tick_job_start_countdown, 1.0)
+
+    def _may_cancel_held_start(self):
+        """Whether the machine accepts abort from this controller during
+        the held start (machine/job_start.py's may_cancel_held_start). The
+        passive rights are the machine's multi_client.passive_rights as
+        last read from its config.txt."""
+        controller = self.controller
+        return may_cancel_held_start(
+            is_starter=self._job_start.is_starter,
+            multi_user=controller.multi_user_mode,
+            has_control=controller.has_control,
+            control_held=controller.control_holder_id != 0,
+            passive_rights=self.setting_list.get("multi_client.passive_rights"),
+        )
 
     def _tick_job_start_countdown(self, *args):
         """Count down between events, which the machine does not send while

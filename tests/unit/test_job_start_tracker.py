@@ -9,6 +9,7 @@ from carveracontroller.machine.job_start import (
     STALE_AFTER_LIMIT_S,
     JobStartAction,
     JobStartTracker,
+    may_cancel_held_start,
 )
 from carveracontroller.protocols.handshake import (
     JOB_START_CANCELLED,
@@ -240,3 +241,48 @@ def test_a_hashing_hold_whose_events_stop_is_dropped():
     t.on_event(_hashing(), now=100.0)
     assert not t.stale(100.0 + STALE_AFTER_LIMIT_S)
     assert t.stale(100.0 + STALE_AFTER_LIMIT_S + 1)
+
+
+# -- who may cancel ------------------------------------------------------------
+
+
+def _may(**kw):
+    fields = {
+        "is_starter": False,
+        "multi_user": True,
+        "has_control": False,
+        "control_held": True,
+        "passive_rights": "watch_only",
+    }
+    fields.update(kw)
+    return may_cancel_held_start(**fields)
+
+
+def test_the_starter_may_cancel():
+    assert _may(is_starter=True)
+
+
+def test_the_holder_may_cancel():
+    assert _may(has_control=True)
+
+
+def test_a_watch_only_controller_without_control_may_not_cancel():
+    assert not _may()
+
+
+def test_passive_rights_that_include_stop_may_cancel():
+    assert _may(passive_rights="watch_stop")
+    assert _may(passive_rights="watch_stop_upload")
+
+
+def test_rights_as_the_machine_reads_them():
+    """Absent means the machine's default, watch_stop_upload; a value it
+    does not know means watch_only."""
+    assert _may(passive_rights=None)
+    assert not _may(passive_rights="Watch_Stop")
+    assert not _may(passive_rights="")
+
+
+def test_anyone_may_cancel_while_nobody_holds_control_or_in_single_user_mode():
+    assert _may(control_held=False)
+    assert _may(multi_user=False)

@@ -88,12 +88,14 @@ class _FakePopup:
     def __init__(self):
         self.showing = False
         self.texts = []
-        self.buttons = []
+        self.buttons = []  # whether Start now was shown, per update
+        self.cancels = []  # whether Cancel was shown, per update
 
-    def update(self, text, show_buttons):
+    def update(self, text, show_start_now, show_cancel):
         self.showing = True
         self.texts.append(text)
-        self.buttons.append(show_buttons)
+        self.buttons.append(show_start_now)
+        self.cancels.append(show_cancel)
 
     def close(self):
         self.showing = False
@@ -142,7 +144,10 @@ def app(monkeypatch):
     return running
 
 
-def _host(tmp_path, own_id=DEMO, has_control=False):
+def _host(tmp_path, own_id=DEMO, has_control=False, multi_user=True, holder=PC, rights="watch_only"):
+    """A stand-in app. By default the machine is in multi-user mode, the
+    starter (PC) holds control, and a controller without control may only
+    watch, so only the starter may cancel a held start."""
     root = Makera.__new__(Makera)
     root.temp_dir = str(tmp_path / "cache")
     os.makedirs(root.temp_dir, exist_ok=True)
@@ -155,6 +160,8 @@ def _host(tmp_path, own_id=DEMO, has_control=False):
     root._job_start_clock = None
     root.controller = SimpleNamespace(
         has_control=has_control,
+        multi_user_mode=multi_user,
+        control_holder_id=holder,
         sendNUM=0,
         loadNUM=0,
         connected_clients=(
@@ -180,6 +187,7 @@ def _host(tmp_path, own_id=DEMO, has_control=False):
     root._last_loaded_file_key = None
     root._job_start_late = None
     root._job_without_toolpath = None
+    root.setting_list = {} if rights is None else {"multi_client.passive_rights": rights}
     return root
 
 
@@ -569,6 +577,7 @@ def test_the_starter_gets_start_now_and_cancel(tmp_path, app):
 
     popup = root._job_start_popup
     assert popup.buttons == [True]
+    assert popup.cancels == [True]
     assert "Demo" in popup.texts[-1]
     root.controller.send_job_start_ready.assert_not_called()
     root.doDownload.assert_not_called()
@@ -667,6 +676,105 @@ def test_a_fetch_failing_after_the_job_started_shows_it_without_toolpath(tmp_pat
     root.controller.send_job_start_ready.assert_not_called()
     assert root._job_without_toolpath == PATH
     assert root._passive_fetch.pending_path == PATH
+
+
+# -- who may cancel a held start ----------------------------------------------
+
+
+@pytest.mark.parametrize("hashing", [True, False], ids=["hashing", "waiting"])
+@pytest.mark.parametrize(
+    ("host_kw", "start_now", "cancel"),
+    [
+        pytest.param({"own_id": PC, "has_control": True}, True, True, id="starter"),
+        pytest.param({"rights": "watch_only"}, False, False, id="watch_only"),
+        pytest.param({"rights": "watch_stop"}, False, True, id="watch_stop"),
+        pytest.param({"rights": "watch_stop_upload"}, False, True, id="watch_stop_upload"),
+        # The machine's own default when the setting is absent.
+        pytest.param({"rights": None}, False, True, id="rights_unset"),
+        # The machine takes any value it does not know as watch_only.
+        pytest.param({"rights": "watch_everything"}, False, False, id="rights_unknown"),
+        # Nobody holds control: an abort from anyone is accepted, and takes it.
+        pytest.param({"holder": 0, "rights": "watch_only"}, False, True, id="control_free"),
+        # Single-user mode: passive rights do not apply; the abort is
+        # accepted from any controller, and takes control.
+        pytest.param({"multi_user": False, "rights": "watch_only"}, False, True, id="single_user"),
+        # Holding control without having started the job (it changed hands).
+        pytest.param({"has_control": True, "holder": DEMO, "rights": "watch_only"}, False, True, id="holder"),
+    ],
+)
+def test_cancel_is_shown_to_every_controller_allowed_to_stop(tmp_path, app, hashing, host_kw, start_now, cancel):
+    """Cancel sends abort, which the machine accepts from the controller
+    that started the job and from any controller its rules let stop a job:
+    the holder, anyone while nobody holds control or in single-user mode,
+    and in multi-user mode a controller without control whose passive
+    rights include stop. Start now stays with the starter."""
+    root = _host(tmp_path, **host_kw)
+    event = _hashing(not_ready=(THIRD,)) if hashing else _event(not_ready=(THIRD,))
+
+    Makera.on_job_start_event(root, event)
+
+    popup = root._job_start_popup
+    assert popup.buttons == [start_now]
+    assert popup.cancels == [cancel]
+    text = popup.texts[-1]
+    if start_now:
+        assert "Start now" in text
+    else:
+        assert "Start now" not in text
+    assert ("Cancel" in text) is cancel
+
+
+def test_the_popup_shows_cancel_alone_or_after_start_now():
+    """The real popup: a lone Cancel fills the row; with Start now, Start
+    now is on the left; with neither, the row is hidden."""
+    from carveracontroller.ui.job_start_popup import JobStartPopup
+
+    popup = JobStartPopup(on_start_now=MagicMock(), on_cancel=MagicMock())
+    popup.showing = True  # never opened in a test
+
+    popup.update("text", show_start_now=False, show_cancel=True)
+    assert popup.buttons.children == [popup.btn_cancel]
+    assert popup.buttons.opacity == 1
+    assert not popup.buttons.disabled
+
+    popup.update("text", show_start_now=True, show_cancel=True)
+    assert list(reversed(popup.buttons.children)) == [popup.btn_start_now, popup.btn_cancel]
+
+    popup.update("text", show_start_now=False, show_cancel=False)
+    assert popup.buttons.children == []
+    assert popup.buttons.opacity == 0
+    assert popup.buttons.disabled
+
+
+@pytest.mark.parametrize("hashing", [True, False], ids=["hashing", "waiting"])
+def test_cancel_from_a_controller_allowed_to_stop_sends_abort(tmp_path, app, monkeypatch, hashing):
+    _PopupWithButtons.made = []
+    monkeypatch.setattr("carveracontroller.main.JobStartPopup", _PopupWithButtons)
+    root = _host(tmp_path, rights="watch_stop")
+    root._job_start_popup = None
+
+    Makera.on_job_start_event(root, _hashing(not_ready=(THIRD,)) if hashing else _event(not_ready=(THIRD,)))
+
+    popup = _PopupWithButtons.made[0]
+    assert popup.cancels == [True]
+    popup.on_cancel()
+    root.controller.abortCommand.assert_called_once_with()
+    root.controller.startNowCommand.assert_not_called()
+
+
+def test_cancel_follows_a_change_of_control_during_the_hold(tmp_path, app):
+    """The buttons are worked out again on every refresh: a controller
+    that takes control while the start is held gets Cancel."""
+    root = _host(tmp_path, rights="watch_only")
+    Makera.on_job_start_event(root, _event(not_ready=(THIRD,)))
+    assert root._job_start_popup.cancels == [False]
+
+    root.controller.control_holder_id = DEMO
+    root.controller.has_control = True
+    Makera._tick_job_start_countdown(root)
+
+    assert root._job_start_popup.cancels[-1] is True
+    assert root._job_start_popup.buttons[-1] is False
 
 
 # -- the machine checking the file first ---------------------------------------

@@ -58,6 +58,29 @@ MIN_SECONDS_LEFT_TO_RETRY = 3
 # running on the machine, and a stalled download is ended after 10 s.
 STALE_AFTER_LIMIT_S = 15.0
 
+# The machine's multi_client.passive_rights values that let a controller
+# without control stop a job, and the value the machine uses when the
+# setting is absent. Any other value counts as watch_only on the machine.
+PASSIVE_RIGHTS_WITH_STOP = ("watch_stop", "watch_stop_upload")
+DEFAULT_PASSIVE_RIGHTS = "watch_stop_upload"
+
+
+def may_cancel_held_start(
+    *, is_starter: bool, multi_user: bool, has_control: bool, control_held: bool, passive_rights: str | None
+) -> bool:
+    """Whether the machine accepts ``abort`` from this controller while it
+    holds a job's start, so whether to offer Cancel. The starter may, and
+    so may the controller holding control. Otherwise it is the machine's
+    control rule: in single-user mode, or while nobody holds control, any
+    controller's abort is accepted (and takes control); in multi-user mode
+    with someone else holding control, only if the passive rights
+    (``passive_rights``, the machine's multi_client.passive_rights setting,
+    None when absent) include stop."""
+    if is_starter or has_control or not multi_user or not control_held:
+        return True
+    rights = DEFAULT_PASSIVE_RIGHTS if passive_rights is None else passive_rights.strip()
+    return rights in PASSIVE_RIGHTS_WITH_STOP
+
 
 class JobStartAction(Enum):
     """What a waiting event asks of this controller."""
