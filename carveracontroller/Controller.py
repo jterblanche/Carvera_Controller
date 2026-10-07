@@ -233,6 +233,13 @@ class Controller:
         # Single-user until an ack says otherwise -- the same starting point
         # as control_holder_id/control_holder_name above.
         self.control_mode: int = HELLO_MODE_SINGLE_USER
+        # Whether the screen has been told who holds control on this
+        # connection yet. Cleared on every identify, set by
+        # _on_control_changed. A connection starts at 0 / "" above, which is
+        # also what a client list says when nobody holds control, so the
+        # first client list on a connection must be applied even when it
+        # agrees with that starting state (see _on_client_list).
+        self._control_holder_shown: bool = False
         # The most recent tool-table summary relayed by another identified
         # client (protocols/relay.py) — tool_number -> a short display
         # text. Lets a passive controller show a sensible tool name at a
@@ -2968,6 +2975,7 @@ class Controller:
         if not was_resolved and negotiator.resolved:
             self._flush_pending_sends()
         if newly_identified:
+            self._control_holder_shown = False
             if self.stream is not None:
                 self._send_raw(encode_client_list_request())
             return
@@ -2992,12 +3000,19 @@ class Controller:
         never gets a control-changed event for it, so this is the only way
         it learns who already holds control -- derived here and, when it
         differs from what this controller already believes, applied through
-        _on_control_changed, exactly as a control-changed event would. A
-        list that agrees with the current state changes nothing."""
+        _on_control_changed, exactly as a control-changed event would. The
+        first list on a connection is always applied, even when it agrees
+        with the starting "nobody" state, so the screen shows "No one has
+        control" rather than nothing. A later list that agrees with the
+        current state changes nothing."""
         self.connected_clients = decode_client_list(payload)
         self._notify_client_list_updated(self.connected_clients)
         holder_id, holder_name = holder_from_client_list(self.connected_clients)
-        if holder_id != self.control_holder_id or holder_name != self.control_holder_name:
+        if (
+            not self._control_holder_shown
+            or holder_id != self.control_holder_id
+            or holder_name != self.control_holder_name
+        ):
             self._on_control_changed(holder_id, holder_name)
 
     def _on_control_changed(self, holder_id, holder_name):
@@ -3011,6 +3026,7 @@ class Controller:
         sends, only from what the machine actually publishes back."""
         self.control_holder_id = holder_id
         self.control_holder_name = holder_name
+        self._control_holder_shown = True
         self._notify_control_changed(holder_id, holder_name)
 
     def _on_client_presence(self, event):
