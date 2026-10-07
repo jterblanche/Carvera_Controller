@@ -840,3 +840,51 @@ def test_a_cancelled_start_ends_the_resume_wait(resume_controller):
 
     assert len(_sent(c)) == count
     assert scheduled == []
+
+
+# -- operator actions held during a job-start fetch ---------------------------
+
+
+@pytest.mark.parametrize("download_works", [True, False])
+def test_an_operator_action_held_during_a_job_start_fetch_runs_after_it(tmp_path, app, monkeypatch, download_works):
+    """The operator asks for a listing while the fetch for a held start is
+    downloading: it waits, and runs once the fetch has ended, whether the
+    download worked or not."""
+    _HeldThread.started = []
+    monkeypatch.setattr("carveracontroller.main.threading.Thread", _HeldThread)
+    root = _host(tmp_path)
+    root.progressStart = MagicMock()
+    root.progressFinish = MagicMock()
+    if not download_works:
+        root.doDownload = _download_results(None)
+    action = MagicMock()
+
+    Makera.on_job_start_event(root, _event())
+    assert Makera._hold_for_passive_fetch(root, action) is True
+    action.assert_not_called()
+
+    _HeldThread.started[0].run()  # the download
+    if download_works:
+        _HeldThread.started[1].run()  # the drawing
+
+    action.assert_called_once()
+    assert root._auto_fetch_in_progress is False
+    assert root._held_for_passive_fetch == ()
+    if download_works:
+        root.controller.send_job_start_ready.assert_called_once_with(7)
+    else:
+        root.controller.send_job_start_ready.assert_not_called()
+
+
+def test_a_job_start_fetch_waits_for_a_held_operator_action(tmp_path, app, monkeypatch):
+    _HeldThread.started = []
+    monkeypatch.setattr("carveracontroller.main.threading.Thread", _HeldThread)
+    root = _host(tmp_path)
+    root._held_for_passive_fetch = (MagicMock(),)
+
+    Makera.on_job_start_event(root, _event())
+    assert _HeldThread.started == []
+
+    root._held_for_passive_fetch = ()
+    Makera.on_job_start_event(root, _event(seconds_left=29))
+    assert len(_HeldThread.started) == 1
