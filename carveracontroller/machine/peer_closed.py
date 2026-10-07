@@ -10,9 +10,12 @@ gone in different ways, because the two transports don't fail the same way:
     value, so WIFIStream keeps it as one rather than wrapping it in this
     exception — see the WiFi branch in Controller.streamIO.
   - USB: there is no equivalent "still open, nothing to read" vs "closed"
-    return value. A gone device (unplugged, or the OS reclaiming the port)
-    fails the read or write itself, as a ``serial.SerialException``.
-    USBStream catches that and raises this instead, so Controller.streamIO
+    return value. A failing port fails the read or write itself, as a
+    ``serial.SerialException``. When pyserial's error says the device has
+    gone away (unplugged, machine powered off), USBStream tears the port
+    down quietly instead, an ordinary disconnect that the app's
+    connection-lost check reports (see ``USBStream.is_device_gone``). For
+    any other read or write failure it raises this, so Controller.streamIO
     has one common signal to catch regardless of which transport raised
     it.
 """
