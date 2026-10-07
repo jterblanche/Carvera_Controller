@@ -9785,6 +9785,47 @@ class Makera(RelativeLayout):
         self.load_page(0)
 
     # -----------------------------------------------------------------------
+    def _decompress_over(self, lzpath, filepath):
+        """Decompress the QuickLZ file `lzpath` and put the result at
+        `filepath`, the compressed file being opened, but only once the
+        result is complete and has passed both checksums. Until then it is
+        written to a hidden file in the same folder, so the replace is a
+        single rename, and on any failure only that file is removed: the
+        file the user opened stays exactly as it was.
+
+        Returns False on failure, after scheduling _end_failed_load with the
+        reason. Called from load_gcode_file's worker thread."""
+        folder, filename = os.path.split(os.path.abspath(filepath))
+        handle, partial_path = tempfile.mkstemp(prefix="." + filename + ".", suffix=".tmp", dir=folder)
+        os.close(handle)
+        try:
+            if not self.decompress_file(lzpath, partial_path):
+                message = (
+                    tr._("This file is compressed and could not be decompressed. It may be damaged.")
+                    + "\n%s" % filepath
+                )
+                Clock.schedule_once(partial(self._end_failed_load, message=message), 0)
+                return False
+            if not self._verify_deferred_download_md5(partial_path):
+                # The checksum check has already scheduled its own message.
+                Clock.schedule_once(self._end_failed_load, 0)
+                return False
+            # mkstemp creates the file readable by its owner only; keep the
+            # permissions the user's file had.
+            try:
+                shutil.copymode(filepath, partial_path)
+            except OSError:
+                pass
+            os.replace(partial_path, filepath)
+            return True
+        finally:
+            if os.path.exists(partial_path):
+                try:
+                    os.remove(partial_path)
+                except OSError:
+                    logger.warning("Could not remove partial decompress output %s", partial_path)
+
+    # -----------------------------------------------------------------------
     def load_gcode_file(self, filepath):
         self.load_event.set()
         self.upcoming_tool = 0
@@ -9812,16 +9853,7 @@ class Makera(RelativeLayout):
                     os.makedirs(os.path.dirname(lzpath))
                 lzpath = lzpath + ".lz"
                 shutil.copyfile(filepath, lzpath)
-                if not self.decompress_file(lzpath, filepath):
-                    message = (
-                        tr._("This file is compressed and could not be decompressed. It may be damaged.")
-                        + "\n%s" % filepath
-                    )
-                    Clock.schedule_once(partial(self._end_failed_load, message=message), 0)
-                    return
-                if not self._verify_deferred_download_md5(filepath):
-                    # The checksum check has already scheduled its own message.
-                    Clock.schedule_once(self._end_failed_load, 0)
+                if not self._decompress_over(lzpath, filepath):
                     return
 
             # Load all lines from the file
