@@ -20,6 +20,7 @@ import pytest
 
 from carveracontroller.CNC import CNC
 from carveracontroller.Controller import CONN_WIFI, Controller
+from carveracontroller.machine.hello import ACK_TIMEOUT_S
 from carveracontroller.machine.identity import ControllerIdentity
 from carveracontroller.protocols.framing import PTYPE_RELAY
 from carveracontroller.protocols.relay import encode_tool_table_relay
@@ -82,7 +83,9 @@ def test_send_tool_table_relay_held_back_before_subscribed():
 def test_send_tool_table_relay_held_back_on_old_firmware(machine, controller):
     m = machine(mode="old")
     controller.open(CONN_WIFI, m.address())
-    assert m.wait_until(lambda: controller._hello is not None and controller._hello.resolved)
+    assert m.wait_until(
+        lambda: controller._hello is not None and controller._hello.resolved, timeout=ACK_TIMEOUT_S + 2.0
+    )
     assert controller._status_subscribed() is False
 
     assert controller.send_tool_table_relay({1: "T1"}) is False

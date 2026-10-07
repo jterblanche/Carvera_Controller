@@ -13,6 +13,13 @@ from dataclasses import dataclass
 HELLO_ACCEPTED = 0
 HELLO_REJECTED_CAP = 1
 HELLO_REJECTED_OLD_CONTROLLER = 2
+# Another controller with this id is connected and answered the machine's
+# presence check. It keeps its connection; this one is refused and must not
+# retry.
+HELLO_REJECTED_IDENTITY_CONNECTED = 3
+# The machine is checking another hello (one at a time) and has not looked
+# at this one. Send the same hello again on the same connection shortly.
+HELLO_BUSY = 4
 
 # hello ack `mode` values: whether the machine hands control to whoever last
 # acted (single-user) or keeps it with the holder until they release it or

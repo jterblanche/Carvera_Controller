@@ -17,20 +17,36 @@ from enum import Enum, auto
 
 from ..protocols.handshake import (
     HELLO_ACCEPTED,
+    HELLO_BUSY,
     HELLO_FEATURE_JOB_START_WAIT,
     HELLO_MODE_SINGLE_USER,
+    HELLO_REJECTED_IDENTITY_CONNECTED,
     HelloAck,
 )
 from ..protocols.makera import HELLO_PROTOCOL_VERSION, encode_hello
 from .identity import ControllerIdentity
 
-# Controller-side wait for an accepted hello ack before falling back to
-# legacy (pre-identify) behaviour. This is the controller's own decision,
-# distinct from the machine's own hello window (below): an accepted ack
-# measures about 70 ms round trip in practice, so 1.0 s is ample margin
-# without visibly slowing every connect to firmware that never answers at
-# all.
-ACK_TIMEOUT_S = 1.0
+# Controller-side wait for a hello ack before falling back to legacy
+# (pre-identify) behaviour. This is the controller's own decision, distinct
+# from the machine's own hello window (below). An ack normally measures about
+# 70 ms round trip, but when this id is already connected from a different
+# launch the machine holds the hello for up to 2 s while it asks the other
+# connection whether it is still there, so the wait is 3 s. Firmware that
+# never answers hello at all is the only case that waits the full time.
+ACK_TIMEOUT_S = 3.0
+
+# How long after the last hello a still-unidentified controller on a live
+# link sends it again, in case that hello or its ack was lost.
+REHELLO_INTERVAL_S = 1.0
+
+# Result 4 ("busy"): the machine checks one hello at a time and has not
+# looked at this one. The same hello goes again this long after each busy
+# answer, without telling the user, until the machine answers otherwise or
+# BUSY_GIVE_UP_S has passed since the first busy answer, when the controller
+# gives up and says the machine is busy. Read at call time, so tests can
+# shorten them.
+BUSY_RETRY_S = 1.0
+BUSY_GIVE_UP_S = 30.0
 
 # How long a machine that understands hello is expected to still be
 # listening for one after a client connects, before it gives up and treats
@@ -74,7 +90,7 @@ HELLO_WINDOW_S = 5.0
 #     slow end seen so far.
 #   - an accepted hello ack alone (a strict subset of "any valid frame",
 #     since the ack is itself carried in one) measures ~70 ms round trip in
-#     practice, the basis ACK_TIMEOUT_S's 1.0 s was chosen against.
+#     practice when the machine does not hold the hello.
 #   - the protocol detector (protocols/detector.py) has already spent up to
 #     PROBE_ATTEMPTS * (PROBE_WAIT_S send-wait + PROBE_WAIT_S read-timeout)
 #     = 0.6 s *before* this negotiator even exists, probing for a plaintext
@@ -133,14 +149,15 @@ class HelloNegotiator:
     # link, rather than inventing a second unjustified number.
     open_timeout_s: float | None = None
     # When the *first* hello was sent. The ack-wait deadline is anchored
-    # here and never moves — see _last_hello_sent_at below for why that
-    # matters.
+    # here (_ack_wait_from) and moves only when the hello is sent again
+    # after a busy answer — see _last_hello_sent_at below for why a re-hello
+    # must not move it.
     _first_hello_sent_at: float | None = field(default=None, init=False, repr=False)
     # When the most recent hello (first or re-hello) was sent. Deliberately
     # a separate field from _first_hello_sent_at: if re-hello (on_status_reply)
     # refreshed the same timestamp poll() times out against, a steady stream
-    # of status replies would keep re-triggering it and the 1.0s fallback
-    # would never actually fire against old firmware.
+    # of status replies would keep re-triggering it and the ack-wait
+    # fallback would never actually fire against old firmware.
     _last_hello_sent_at: float | None = field(default=None, init=False, repr=False)
     _resolution: Resolution | None = field(default=None, init=False)
     _identified: bool = field(default=False, init=False)
@@ -153,6 +170,19 @@ class HelloNegotiator:
     # The features byte of the last accepted ack (0 from firmware that sends
     # a three-byte ack, and before any ack); see machine_holds_starts.
     _ack_features: int = field(default=0, init=False, repr=False)
+    # When the ack wait runs from: the first hello, then each hello re-sent
+    # after a busy answer (the machine answers that one afresh).
+    _ack_wait_from: float | None = field(default=None, init=False, repr=False)
+    # When the machine's hello window runs from, for re-hello: the first
+    # hello, then each busy answer (the machine restarts its window then).
+    _window_from: float | None = field(default=None, init=False, repr=False)
+    # The first busy answer of the current run of them, and when the hello is
+    # next due again because of one (None when no retry is pending).
+    _busy_since: float | None = field(default=None, init=False, repr=False)
+    _busy_retry_at: float | None = field(default=None, init=False, repr=False)
+    # The hello-ack result that ended this connection, once one has; see
+    # ``refusal``.
+    _refusal: int | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.open_timeout_s is None:
@@ -175,6 +205,16 @@ class HelloNegotiator:
     @property
     def mode(self) -> int:
         return self._mode
+
+    @property
+    def refusal(self) -> int | None:
+        """The hello-ack result the machine refused this controller with, or
+        HELLO_BUSY when it stayed busy for BUSY_GIVE_UP_S. None while not
+        refused. Results 1 and 2 count only while the handshake is
+        unresolved, as before; result 3 counts whenever this controller is
+        not identified, because the machine has refused it even if the ack
+        wait already ran out."""
+        return self._refusal
 
     @property
     def machine_holds_starts(self) -> bool:
@@ -217,10 +257,24 @@ class HelloNegotiator:
         """
         if not self.applicable or self._identified or self._last_hello_sent_at is None:
             return None
-        if self._first_hello_sent_at is not None and now - self._first_hello_sent_at >= HELLO_WINDOW_S:
+        if self._refusal is not None or self._busy_retry_at is not None:
             return None
-        if now - self._last_hello_sent_at < ACK_TIMEOUT_S:
+        if self._window_from is not None and now - self._window_from >= HELLO_WINDOW_S:
             return None
+        if now - self._last_hello_sent_at < REHELLO_INTERVAL_S:
+            return None
+        return self._send_hello(now, first=False)
+
+    def due_hello(self, now: float) -> bytes | None:
+        """Call periodically. Returns the same hello again once BUSY_RETRY_S
+        has passed since a busy answer (result 4); None otherwise. Each busy
+        answer gives one retry."""
+        if self._busy_retry_at is None or self._identified or self._refusal is not None:
+            return None
+        if now < self._busy_retry_at:
+            return None
+        self._busy_retry_at = None
+        self._ack_wait_from = now
         return self._send_hello(now, first=False)
 
     def poll(self, now: float) -> bool:
@@ -229,9 +283,11 @@ class HelloNegotiator:
 
         Two independent deadlines, checked in order:
           - the ack-wait deadline (ACK_TIMEOUT_S), measured from the first
-            hello sent, once a valid frame has made that possible. A
-            re-hello triggered by a live status reply cannot push this
-            deadline back — see _last_hello_sent_at above.
+            hello sent, once a valid frame has made that possible, or from
+            the hello last sent again after a busy answer. A re-hello
+            triggered by a live status reply cannot push this deadline
+            back — see _last_hello_sent_at above. It does not run while a
+            retry after a busy answer is pending.
           - the open-wait deadline (``open_timeout_s``, OPEN_TIMEOUT_S
             unless the caller overrode it), measured from connection open,
             for the case the first one can never even start: no valid frame
@@ -241,8 +297,12 @@ class HelloNegotiator:
         """
         if self._resolution is not None:
             return False
-        if self._first_hello_sent_at is not None:
-            if now - self._first_hello_sent_at >= ACK_TIMEOUT_S:
+        if self._busy_retry_at is not None:
+            # Waiting to send the hello again after a busy answer: the
+            # machine is answering, so this is not old firmware.
+            return False
+        if self._ack_wait_from is not None:
+            if now - self._ack_wait_from >= ACK_TIMEOUT_S:
                 self._resolution = Resolution.FALLBACK
                 return True
             return False
@@ -255,7 +315,7 @@ class HelloNegotiator:
             return True
         return False
 
-    def on_hello_ack(self, ack: HelloAck) -> bool:
+    def on_hello_ack(self, ack: HelloAck, now: float | None = None) -> bool:
         """Process a received hello ack. Returns True iff this ack newly
         identifies this controller — False for a duplicate ack on a link
         that was already identified, so a caller using this to trigger a
@@ -263,7 +323,13 @@ class HelloNegotiator:
         on every re-ack.
 
         An ack with an unrecognised ``protocol_version`` is ignored — the
-        sender is treated as unidentified.
+        sender is treated as unidentified. ``now`` times a busy answer's
+        retry; without it, the time of the last hello sent is used.
+
+        A busy answer (result 4) resolves nothing: the same hello is due
+        again BUSY_RETRY_S later (see ``due_hello``), until BUSY_GIVE_UP_S
+        after the first busy answer, when this gives up with ``refusal`` set
+        to HELLO_BUSY.
         """
         if ack.protocol_version != HELLO_PROTOCOL_VERSION:
             return False
@@ -272,22 +338,50 @@ class HelloNegotiator:
             self._identified = True
             self._mode = ack.mode
             self._ack_features = ack.features
+            self._busy_since = None
+            self._busy_retry_at = None
             if self._resolution is None:
                 self._resolution = Resolution.IDENTIFIED
             return not was_identified
+        if self._identified or self._refusal is not None:
+            return False
+        if ack.result == HELLO_BUSY:
+            if now is None:
+                now = self._last_hello_sent_at or 0.0
+            if self._busy_since is None:
+                self._busy_since = now
+            if now - self._busy_since >= BUSY_GIVE_UP_S:
+                self._refuse(HELLO_BUSY)
+                return False
+            self._busy_retry_at = now + BUSY_RETRY_S
+            self._window_from = now
+            return False
+        if self._resolution is None:
+            self._refuse(ack.result)
+        elif ack.result == HELLO_REJECTED_IDENTITY_CONNECTED:
+            self._refusal = ack.result
+        return False
+
+    def _refuse(self, result: int) -> None:
+        self._refusal = result
+        self._busy_retry_at = None
         if self._resolution is None:
             self._resolution = Resolution.REJECTED
-        return False
 
     def _send_hello(self, now: float, first: bool) -> bytes:
         if first:
             self._first_hello_sent_at = now
+            self._ack_wait_from = now
+            self._window_from = now
         self._last_hello_sent_at = now
         # Always says this controller takes part in the job-start wait:
-        # firmware without the wait ignores the byte.
+        # firmware without the wait ignores the byte. The launch part is the
+        # same in every hello of this start; firmware without the identity
+        # check ignores it.
         return encode_hello(
             self.identity.id,
             self.identity.name.encode("utf-8"),
             self.link,
             features=HELLO_FEATURE_JOB_START_WAIT,
+            launch=self.identity.launch,
         )

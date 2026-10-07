@@ -364,7 +364,7 @@ from .GcodeViewer import (
 from .machine.busy_state import machine_is_busy
 from .machine.clients import row_display_text, rows_for_display
 from .machine.computer_part import computer_part_for_this_process, new_launch_part
-from .machine.identity import load_identity, set_name
+from .machine.identity import load_identity, set_name, with_id
 from .machine.job_start import JobStartAction, JobStartTracker
 from .machine.local_copies import LocalCopyStore
 from .machine.passive_fetch import PassiveFetchTracker, player_flag, published_upload_path
@@ -6484,14 +6484,55 @@ class Makera(RelativeLayout):
         self.show_message_popup(tr._("Cannot connect, machine is busy or not available."), False)
 
     def show_hello_rejected_popup(self, reason, *args):
+        if reason == "duplicate":
+            self._refresh_after_inline_close()
+            self.show_duplicate_identity_popup()
+            return
         if reason == "cap":
             message = tr._("This machine already has the maximum number of controllers connected.")
+        elif reason == "busy":
+            message = tr._("The machine is busy and could not accept this controller. Try connecting again shortly.")
         else:
             message = tr._(
                 "An older controller is connected to this machine. Multiple controllers aren't available until it disconnects."
             )
         self._refresh_after_inline_close()
         self.show_message_popup(message, False)
+
+    def show_duplicate_identity_popup(self):
+        # The machine refused this controller because another one with the
+        # same identity is connected and answered it: almost always a
+        # computer cloned from another. That one keeps its connection.
+        popup = self.confirm_popup
+        popup.reset_layout_defaults()
+        popup.lb_title.text = tr._("Controller identity already in use")
+        popup.lb_content.text = tr._(
+            "Another controller with this computer's identity is already connected. "
+            "This usually means this computer was cloned from another one. "
+            "Close the other copy, or make this a separate controller."
+        )
+        popup.confirm_text = tr._("Make this a separate controller")
+        popup.confirm = self.make_separate_controller
+        popup.cancel = None
+        popup.open(self)
+
+    def make_separate_controller(self, *args):
+        # Adds a random value, kept outside the settings, to this computer's
+        # identity, so it is told apart from the computer it was cloned from
+        # from now on, then connects again.
+        try:
+            self._computer_part = self._computer_part.made_separate()
+        except OSError as e:
+            logger.error(f"Could not make this a separate controller: {e}")
+            self.show_message_popup(
+                tr._("Could not give this controller its own identity: the folder it is kept in cannot be written."),
+                False,
+            )
+            return
+        self.identity = with_id(self.identity, self._computer_part.id)
+        self.controller.identity = self.identity
+        self._job_start.own_id = self.identity.id
+        self.reconnect_last_connection(quiet=False)
 
     def show_peer_closed_popup(self, *args):
         # Shown for a link that was working and then wasn't (see

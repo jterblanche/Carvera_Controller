@@ -14,7 +14,7 @@ import pytest
 import carveracontroller.Controller as controller_module
 from carveracontroller.CNC import CNC
 from carveracontroller.Controller import CONN_USB, CONN_WIFI, Controller
-from carveracontroller.machine.hello import OPEN_TIMEOUT_S, Resolution
+from carveracontroller.machine.hello import ACK_TIMEOUT_S, OPEN_TIMEOUT_S, Resolution
 from carveracontroller.machine.identity import ControllerIdentity
 from carveracontroller.machine.peer_closed import PeerClosedError
 from carveracontroller.protocols.framing import (
@@ -128,7 +128,7 @@ def test_hello_sent_exactly_once(machine, controller):
 
 
 def test_nothing_but_realtime_and_hello_before_ack_then_unwrapped_fallback(machine, controller):
-    """Old firmware never acks. Before the 1.0s fallback window elapses,
+    """Old firmware never acks. Before the ack-wait fallback elapses,
     the machine must see nothing but realtime (0xA1) and hello (0x60)
     frames; the attempted command must then arrive unwrapped, exactly as
     today, once fallback resolves."""
@@ -138,12 +138,12 @@ def test_nothing_but_realtime_and_hello_before_ack_then_unwrapped_fallback(machi
 
     assert m.wait_until(lambda: len(m.hellos_received) >= 1)
 
-    time.sleep(0.5)  # well inside the 1.0s ack window
+    time.sleep(0.5)  # well inside the ack window (ACK_TIMEOUT_S)
     seen_types = {t for t, _ in m.frames_received}
     assert seen_types <= {PTYPE_CTRL_SINGLE, PTYPE_HELLO}
     assert m.frames_of_type(PTYPE_CTRL_MULTI) == []
 
-    assert m.wait_until(lambda: m.frames_of_type(PTYPE_CTRL_MULTI) != [], timeout=2.0)
+    assert m.wait_until(lambda: m.frames_of_type(PTYPE_CTRL_MULTI) != [], timeout=ACK_TIMEOUT_S + 1.0)
     (sent,) = m.frames_of_type(PTYPE_CTRL_MULTI)
     assert sent == b"version"
 
@@ -162,7 +162,7 @@ def test_no_reply_message_not_logged_against_old_firmware(machine, controller):
     controller.open(CONN_WIFI, m.address())
 
     assert m.wait_until(lambda: len(m.hellos_received) >= 1)
-    time.sleep(1.3)  # past ACK_TIMEOUT_S (1.0s): ack-wait fallback has fired
+    time.sleep(ACK_TIMEOUT_S + 0.3)  # past ACK_TIMEOUT_S: ack-wait fallback has fired
 
     assert controller._hello.resolution is Resolution.FALLBACK
     messages = _drain_log_messages(controller)
@@ -173,7 +173,7 @@ def test_re_hello_continues_then_stays_bounded_against_old_firmware(machine, con
     """Regression for a real bug: re-hello and the ack-timeout timer used
     to share one timestamp, so a steady stream of status replies (exactly
     what old firmware still sends for ordinary polling) could keep
-    deferring the 1.0s fallback indefinitely. Running well past that point
+    deferring the ack-wait fallback indefinitely. Running for a while
     proves re-hello keeps happening (the controller doesn't just give up
     after falling back) but stays bounded (roughly once per second, not on
     every status reply) against firmware that never acks at all."""
@@ -185,7 +185,7 @@ def test_re_hello_continues_then_stays_bounded_against_old_firmware(machine, con
     time.sleep(2.2)
 
     count = len(m.hellos_received)
-    assert count >= 2, "re-hello must still happen past the 1.0s fallback, within the machine's hello window"
+    assert count >= 2, "re-hello must still happen while unidentified, within the machine's hello window"
     assert count <= 5, "re-hello must stay roughly once per second, not fire on every status reply"
 
 

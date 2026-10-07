@@ -23,6 +23,7 @@ import pytest
 
 from carveracontroller.CNC import CNC
 from carveracontroller.Controller import CONN_WIFI, Controller
+from carveracontroller.machine.hello import ACK_TIMEOUT_S
 from carveracontroller.machine.identity import ControllerIdentity
 from carveracontroller.protocols.framing import PTYPE_CTRL_MULTI, PTYPE_CTRL_RELEASE, PTYPE_FILE_START
 from carveracontroller.protocols.handshake import HELLO_MODE_MULTI_USER, HELLO_MODE_SINGLE_USER
@@ -100,7 +101,9 @@ def test_old_firmware_never_reports_a_mode_and_stays_single_user(machine, contro
     passive state already applies to has_control applies here too."""
     m = machine(mode="old")
     controller.open(CONN_WIFI, m.address())
-    assert m.wait_until(lambda: controller._hello is not None and controller._hello.resolved)
+    assert m.wait_until(
+        lambda: controller._hello is not None and controller._hello.resolved, timeout=ACK_TIMEOUT_S + 2.0
+    )
 
     assert controller.control_mode == HELLO_MODE_SINGLE_USER
     assert controller.multi_user_mode is False
@@ -276,6 +279,8 @@ def test_machine_settings_are_writable_in_single_user_mode_while_another_control
 def test_machine_settings_are_writable_against_old_firmware(machine, controller):
     m = machine(mode="old")
     controller.open(CONN_WIFI, m.address())
-    assert m.wait_until(lambda: controller._hello is not None and controller._hello.resolved)
+    assert m.wait_until(
+        lambda: controller._hello is not None and controller._hello.resolved, timeout=ACK_TIMEOUT_S + 2.0
+    )
 
     assert controller.can_write_machine_settings is True

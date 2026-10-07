@@ -212,7 +212,7 @@ def test_duplicate_accepted_ack_does_not_report_newly_identified():
 
 
 def test_re_hello_continues_past_the_ack_timeout_within_the_hello_window():
-    """Re-hello must keep going after the controller's own 1.0s fallback —
+    """Re-hello must keep going after the controller's own ack-wait fallback —
     that timer is the controller's own decision to stop *waiting*, not the
     machine's. The machine may still be listening for a hello until its own
     window passes."""
@@ -221,8 +221,9 @@ def test_re_hello_continues_past_the_ack_timeout_within_the_hello_window():
     negotiator.poll(now=ACK_TIMEOUT_S)  # functional fallback already happened
     assert negotiator.resolution is Resolution.FALLBACK
 
-    frame = negotiator.on_status_reply(now=2 * ACK_TIMEOUT_S)
+    frame = negotiator.on_status_reply(now=ACK_TIMEOUT_S + 1.0)
 
+    assert ACK_TIMEOUT_S + 1.0 < HELLO_WINDOW_S
     assert frame is not None
     assert frame[4] == 0x60
 
@@ -241,7 +242,7 @@ def test_repeated_status_replies_do_not_delay_fallback():
     """A status reply arriving right at the ack-timeout boundary triggers a
     re-hello (on_status_reply) — that resend must not push back poll()'s
     fallback deadline, or a steady stream of status replies from old
-    firmware would defer the 1.0s fallback indefinitely."""
+    firmware would defer the ack-wait fallback indefinitely."""
     negotiator = HelloNegotiator(identity=IDENTITY, link=LINK_WIFI)
     negotiator.on_valid_frame(now=0.0)
 
@@ -254,7 +255,7 @@ def test_repeated_status_replies_do_not_delay_fallback():
 
 def test_late_ack_after_fallback_still_identifies():
     """A lost-then-retried ack can identify the controller even after the
-    1.0s window already forced a functional fallback."""
+    ack-wait window already forced a functional fallback."""
     negotiator = HelloNegotiator(identity=IDENTITY, link=LINK_WIFI)
     negotiator.on_valid_frame(now=0.0)
     negotiator.poll(now=ACK_TIMEOUT_S)
