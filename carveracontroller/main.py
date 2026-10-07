@@ -363,7 +363,8 @@ from .GcodeViewer import (
 )
 from .machine.busy_state import machine_is_busy
 from .machine.clients import row_display_text, rows_for_display
-from .machine.identity import load_or_create_identity, set_name
+from .machine.computer_part import computer_part_for_this_process, new_launch_part
+from .machine.identity import load_identity, set_name
 from .machine.job_start import JobStartAction, JobStartTracker
 from .machine.local_copies import LocalCopyStore
 from .machine.passive_fetch import PassiveFetchTracker, player_flag, published_upload_path
@@ -438,8 +439,8 @@ def load_halt_translations(tr: translation.Lang):
 
 class _KivyConfigIdentityStore:
     """Adapts machine.identity's IdentityStore protocol onto Kivy's Config,
-    so the controller's random id and display name persist in the same
-    config.ini every other setting lives in."""
+    so the controller's display name persists in the same config.ini every
+    other setting lives in."""
 
     def get(self, key):
         if not Config.has_option("carvera", key):
@@ -451,6 +452,21 @@ class _KivyConfigIdentityStore:
     def set(self, key, value):
         Config.set("carvera", key, value)
         Config.write()
+
+    def remove(self, key):
+        if Config.has_option("carvera", key):
+            Config.remove_option("carvera", key)
+            Config.write()
+
+
+def build_controller_identity(store):
+    """This start's identity: the computer part (from the operating system,
+    the OS user and the copy slot; never stored in the settings), a new
+    launch part, and the display name from the settings. Returns the
+    identity and the computer part, which holds the copy slot for as long as
+    the app runs."""
+    part = computer_part_for_this_process()
+    return load_identity(store, part.id, new_launch_part()), part
 
 
 def app_base_path():
@@ -3192,7 +3208,7 @@ class Makera(RelativeLayout):
 
         self.cnc = CNC()
         self.wcs_names = self.cnc.getWCSNames()
-        self.identity = load_or_create_identity(_KivyConfigIdentityStore())
+        self.identity, self._computer_part = build_controller_identity(_KivyConfigIdentityStore())
         self.controller = Controller(
             self.cnc,
             self.execCallback,
@@ -9677,7 +9693,9 @@ class Makera(RelativeLayout):
             # set_name trims to the handshake's 31-byte limit and re-persists
             # the (possibly trimmed) value, so Config and the identity object
             # agree even if the settings panel accepted a longer name.
-            self.identity = set_name(_KivyConfigIdentityStore(), self.controller_setting_change_list["controller_name"])
+            self.identity = set_name(
+                _KivyConfigIdentityStore(), self.controller_setting_change_list["controller_name"], self.identity
+            )
             self.controller.identity = self.identity
             App.get_running_app().title = with_controller_name(
                 tr._("Carvera Controller Community") + " v" + __version__, self.identity.name

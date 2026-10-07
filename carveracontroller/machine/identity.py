@@ -1,26 +1,31 @@
-"""Controller identity: a stable random id and a display name.
+"""Controller identity: the id, the display name and the launch part.
 
 Sent in the hello handshake so the machine and other controllers can
-recognise this one. Kivy-free: persistence is done through the
-``IdentityStore`` protocol, implemented by a thin adapter over whatever
-settings storage the application uses.
+recognise this one. The id is the computer part (machine/computer_part.py),
+worked out at every start and never kept in the settings; the launch part is
+chosen at every start. Only the display name is kept in the settings.
+Kivy-free: persistence is done through the ``IdentityStore`` protocol,
+implemented by a thin adapter over whatever settings storage the application
+uses.
 """
 
 from __future__ import annotations
 
 import secrets
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 MAX_NAME_BYTES = 31
 
+# Where older versions kept a random id; named here only to remove it.
 _KEY_ID = "controller_id"
 _KEY_NAME = "controller_name"
 
 
 def generate_id() -> int:
-    """A random 64-bit id. Collisions are not a practical concern at this scale."""
+    """A random 64-bit id, for a Controller built without an identity (tests,
+    tools). Collisions are not a practical concern at this scale."""
     return secrets.randbits(64)
 
 
@@ -53,8 +58,12 @@ def default_name() -> str:
 
 @dataclass(frozen=True)
 class ControllerIdentity:
+    """``launch`` is the launch part sent after the features byte in every
+    hello of this start, or None to send none."""
+
     id: int
     name: str
+    launch: int | None = None
 
     def __post_init__(self) -> None:
         trimmed = trim_name(self.name)
@@ -69,48 +78,36 @@ class IdentityStore(Protocol):
 
     def set(self, key: str, value: str) -> None: ...
 
+    def remove(self, key: str) -> None: ...
 
-def _load_or_generate_id(store: IdentityStore) -> int:
-    """Read the persisted id, generating and persisting a fresh one if it is
-    missing or not a valid 64-bit unsigned value.
 
-    The hello frame's id field is a fixed-width 8-byte unsigned integer
-    (protocols/makera.py's ``encode_hello``); a hand-edited or corrupted
-    config value that parses as an int but falls outside ``0 <= id < 2**64``
-    would otherwise raise every time a hello is built, rather than once
-    here.
+def load_identity(store: IdentityStore, computer_id: int, launch: int) -> ControllerIdentity:
+    """The identity for this start: the given computer part and launch part,
+    and the persisted display name (a default one is created and persisted
+    if there is none).
+
+    Removes the random id older versions kept in the settings, so a copied
+    settings file carries no id at all. Nothing else in the settings
+    changes.
     """
-    raw_id = store.get(_KEY_ID)
-    controller_id: int | None
-    try:
-        controller_id = int(raw_id) if raw_id else None
-    except ValueError:
-        controller_id = None
-    if controller_id is not None and not (0 <= controller_id < 2**64):
-        controller_id = None
-    if controller_id is None:
-        controller_id = generate_id()
-        store.set(_KEY_ID, str(controller_id))
-    return controller_id
-
-
-def load_or_create_identity(store: IdentityStore) -> ControllerIdentity:
-    """Load the persisted identity, creating and persisting a fresh one if absent."""
-    controller_id = _load_or_generate_id(store)
+    store.remove(_KEY_ID)
 
     raw_name = store.get(_KEY_NAME)
     name = raw_name if raw_name else default_name()
     if not raw_name:
         store.set(_KEY_NAME, name)
 
-    return ControllerIdentity(id=controller_id, name=name)
+    return ControllerIdentity(id=computer_id, name=name, launch=launch)
 
 
-def set_name(store: IdentityStore, name: str) -> ControllerIdentity:
-    """Update and persist the display name (trimmed to the wire limit)."""
+def set_name(store: IdentityStore, name: str, identity: ControllerIdentity) -> ControllerIdentity:
+    """Update and persist the display name (trimmed to the wire limit),
+    keeping the id and launch part."""
     trimmed = trim_name(name) or default_name()
     store.set(_KEY_NAME, trimmed)
+    return replace(identity, name=trimmed)
 
-    controller_id = _load_or_generate_id(store)
 
-    return ControllerIdentity(id=controller_id, name=trimmed)
+def with_id(identity: ControllerIdentity, new_id: int) -> ControllerIdentity:
+    """The same identity under another id (same name and launch part)."""
+    return replace(identity, id=new_id)
