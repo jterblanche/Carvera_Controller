@@ -31,6 +31,8 @@ from .framing import (
     PTYPE_LOAD_FINISH,
     PTYPE_LOAD_INFO,
     PTYPE_NORMAL_INFO,
+    PTYPE_PRESENCE_CHECK,
+    PTYPE_PRESENCE_REPLY,
     PTYPE_PUBLISHED_LINE,
     PTYPE_RELAY,
     build_frame,
@@ -62,6 +64,12 @@ def encode_hello(controller_id: int, name: bytes, link: int, features: int | Non
     if features is not None:
         payload += bytes([features & 0xFF])
     return build_frame(PTYPE_HELLO, payload)
+
+
+def encode_presence_reply(number: bytes) -> bytes:
+    """Build a presence reply (0x6E): number(4), copied unchanged from the
+    presence check (0x6D) it answers."""
+    return build_frame(PTYPE_PRESENCE_REPLY, number[:4])
 
 
 def encode_job_start_ready(start_id: int) -> bytes:
@@ -282,6 +290,8 @@ class MakeraProtocol(CommunicationProtocol):
             return [ParsedMessage(MessageKind.EVENT, payload=parsed.payload)]
         if parsed.ptype == PTYPE_RELAY:
             return self._decode_relay(parsed.payload)
+        if parsed.ptype == PTYPE_PRESENCE_CHECK:
+            return [ParsedMessage(MessageKind.PRESENCE_CHECK, payload=parsed.payload)]
 
         if parsed.ptype == PTYPE_LOAD_FINISH:
             return [ParsedMessage(MessageKind.LOAD_EOF)]

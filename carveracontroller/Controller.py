@@ -52,7 +52,7 @@ from .protocols import (
     encode_tool_table_relay,
 )
 from .protocols.handshake import JOB_START_CANCELLED, JobStartEvent, decode_job_start_event
-from .protocols.makera import encode_job_start_ready
+from .protocols.makera import encode_job_start_ready, encode_presence_reply
 from .USBBulkStream import USBBulkStream, is_usb_bulk_address
 from .USBStream import USBStream
 from .WIFIStream import WIFIStream
@@ -2842,6 +2842,9 @@ class Controller:
         if message.kind == MessageKind.RELAY:
             self._on_relay(message.payload)
             return
+        if message.kind == MessageKind.PRESENCE_CHECK:
+            self._answer_presence_check(message.payload)
+            return
 
         text = message.text or ""
         if message.kind == MessageKind.LOAD_CHUNK:
@@ -3032,6 +3035,16 @@ class Controller:
             reason = "cap" if ack.result == HELLO_REJECTED_CAP else "old_controller"
             self._close_inline()
             self._notify_hello_rejected(reason)
+
+    def _answer_presence_check(self, payload):
+        """Answer the machine's "are you still there" (0x6D) at once, with
+        its number, on this link. Called on the thread that read it, never
+        through the screen, so a busy screen cannot make a live controller
+        look gone. Unconditional: a running controller is always there. A
+        check too short to carry its number is dropped."""
+        if len(payload) < 4 or self.stream is None:
+            return
+        self._send_raw(encode_presence_reply(payload[:4]))
 
     def _on_client_list(self, payload):
         """A client-list reply (requested on identify, and again on every
