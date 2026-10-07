@@ -8,9 +8,11 @@ control -- or while nobody did -- showed no "who has control" line until
 the next control-changed event, whoever held control at the time. This
 covers _on_client_list deriving the holder from the list and, when it
 disagrees with the current state, applying it through _on_control_changed
-exactly as a control-changed event would -- and never doing so when the
-list already agrees, so no spurious UI update fires on every routine
-client-list refresh.
+exactly as a control-changed event would -- and never doing so when a
+later list already agrees, so no spurious UI update fires on every routine
+client-list refresh. The first list on a connection is applied even when it
+agrees with the starting "nobody" state, so the screen shows "No one has
+control" instead of a blank line.
 
 The unit tests call Controller._on_client_list directly with a hand-built
 client-list-reply payload, the same wire layout
@@ -25,13 +27,19 @@ the decoder.
 
 from __future__ import annotations
 
+import threading
+import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+import carveracontroller.Controller as controller_module
 from carveracontroller.CNC import CNC
 from carveracontroller.Controller import CONN_WIFI, Controller
+from carveracontroller.machine.hello import ACK_TIMEOUT_S
 from carveracontroller.machine.identity import ControllerIdentity
+from carveracontroller.main import Makera
 from tests.unit.fake_machine import FakeMachine
 
 IDENTITY = ControllerIdentity(id=0x0102030405060708, name="Test PC")
@@ -160,3 +168,137 @@ def test_joining_while_another_controller_holds_control_shows_it_without_any_eve
     assert m.wait_until(lambda: controller.control_holder_id == OTHER_ID, timeout=2.0)
     assert controller.control_holder_name == "Office PC"
     assert controller.has_control is False
+
+
+# -- the control line a joining controller shows ------------------------------
+#
+# The tests above check the controller's own state. What the user sees is
+# Makera.control_holder_text, set only by Makera.update_control_holder, which
+# runs only when Controller._on_control_changed notifies the screen. A
+# controller starts every connection already holding the machine's "nobody"
+# encoding (0 / ""), so the first client list after identifying must still
+# reach the screen when it says nobody holds control, or the line stays blank.
+# FakeMachine acks in single-user mode unless told otherwise, so the line
+# ends with that mode.
+
+
+class _ScreenClock:
+    """Stands in for Kivy's Clock inside Controller: collects the callbacks
+    the streamIO thread schedules, so the test thread can run them in order,
+    the way Kivy's main loop would."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._pending = []
+
+    def schedule_once(self, callback, timeout=0):
+        with self._lock:
+            self._pending.append(callback)
+
+    def run_pending(self):
+        with self._lock:
+            pending, self._pending = self._pending, []
+        for callback in pending:
+            callback(0)
+
+
+def _screen(controller_):
+    """A Makera holding only what update_control_holder touches."""
+    root = Makera.__new__(Makera)
+    root.controller = controller_
+    root.identity = IDENTITY
+    root.status_drop_down = MagicMock()
+    root.refresh_settings_apply_button = MagicMock()
+    root.update_connected_controllers = MagicMock()
+    root.announce_client_presence = MagicMock()
+    return root
+
+
+@pytest.fixture
+def screen(controller):
+    """The screen a running app shows, wired to `controller` through the
+    same App/Clock calls Controller makes in the real app."""
+    root = _screen(controller)
+    clock = _ScreenClock()
+    app = SimpleNamespace(root=root)
+    with (
+        patch.object(controller_module, "App") as app_cls,
+        patch.object(controller_module, "Clock", clock),
+    ):
+        app_cls.get_running_app.return_value = app
+        yield root, clock
+
+
+def _line_reads(root, clock, text):
+    def predicate():
+        clock.run_pending()
+        return root.control_holder_text == text
+
+    return predicate
+
+
+def test_joining_while_nobody_holds_control_shows_no_one_has_control(machine, controller, screen):
+    root, clock = screen
+    m = machine(mode="new", client_list_entries=[(OTHER_ID, "Office PC", 0, False)])
+    controller.open(CONN_WIFI, m.address())
+
+    assert m.wait_until(_line_reads(root, clock, "No one has control · single-user"), timeout=2.0)
+
+
+def test_joining_while_another_controller_holds_control_names_it_on_screen(machine, controller, screen):
+    root, clock = screen
+    m = machine(mode="new", client_list_entries=[(OTHER_ID, "Office PC", 0, True)])
+    controller.open(CONN_WIFI, m.address())
+
+    assert m.wait_until(_line_reads(root, clock, "Office PC has control · single-user"), timeout=2.0)
+
+
+def test_reconnecting_while_nobody_holds_control_shows_the_line_again(machine, controller, screen):
+    # A reconnect blanks the line (Makera.updateStatus on NOT_CONNECTED) and
+    # resets the controller to 0 / "", so the new connection's first client
+    # list agrees with that state. It must still reach the screen.
+    root, clock = screen
+    first = machine(mode="new", client_list_entries=[(OTHER_ID, "Office PC", 0, False)])
+    controller.open(CONN_WIFI, first.address())
+    assert first.wait_until(_line_reads(root, clock, "No one has control · single-user"), timeout=2.0)
+
+    controller.close(allow_reconnect=False)
+    clock.run_pending()
+    root.control_holder_text = ""
+    second = machine(mode="new", client_list_entries=[(OTHER_ID, "Office PC", 0, False)])
+    controller.open(CONN_WIFI, second.address())
+
+    assert second.wait_until(_line_reads(root, clock, "No one has control · single-user"), timeout=2.0)
+
+
+def test_routine_client_list_refresh_does_not_renotify_the_screen(machine, controller, screen):
+    # Only the first client list on a connection is applied regardless; a
+    # later one that agrees (sent after every client-joined/left event)
+    # changes nothing on screen.
+    root, clock = screen
+    m = machine(mode="new", client_list_entries=[(OTHER_ID, "Office PC", 0, False)])
+    controller.open(CONN_WIFI, m.address())
+    assert m.wait_until(_line_reads(root, clock, "No one has control · single-user"), timeout=2.0)
+    spy = _spy_on_control_changed(controller)
+
+    m.send_client_presence_event(0x1111222233334444, b"Shop Laptop", joined=True)
+
+    assert m.wait_until(lambda: m.client_list_requests >= 2, timeout=2.0)
+    assert m.wait_until(lambda: len(controller.connected_clients) == 1, timeout=2.0)
+    time.sleep(0.2)
+    clock.run_pending()
+    spy.assert_not_called()
+    assert root.control_holder_text == "No one has control · single-user"
+
+
+def test_old_firmware_leaves_the_control_line_hidden(machine, controller, screen):
+    root, clock = screen
+    m = machine(mode="old")
+    controller.open(CONN_WIFI, m.address())
+
+    assert m.wait_until(
+        lambda: controller._hello is not None and controller._hello.resolved, timeout=ACK_TIMEOUT_S + 2.0
+    )
+    time.sleep(0.2)
+    clock.run_pending()
+    assert root.control_holder_text == ""

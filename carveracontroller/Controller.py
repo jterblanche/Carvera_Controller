@@ -20,8 +20,8 @@ from functools import partial
 
 from . import Utils
 from .CNC import CMDPAT, CNC, LASER_TOOL_NUMBER, PARENPAT, SEMIPAT, ZPROBE_TOOL_NUMBER
-from .machine.clients import holder_from_client_list
-from .machine.control_refusal import is_control_refusal
+from .machine.clients import entries_with_holder, holder_from_client_list
+from .machine.control_refusal import is_control_refusal, is_job_start_refusal
 from .machine.heartbeat import heartbeat_due
 from .machine.hello import HelloNegotiator, Resolution
 from .machine.identity import ControllerIdentity, default_name, generate_id
@@ -51,6 +51,14 @@ from .protocols import (
     encode_relay,
     encode_tool_table_relay,
 )
+from .protocols.handshake import (
+    HELLO_BUSY,
+    HELLO_REJECTED_IDENTITY_CONNECTED,
+    JOB_START_CANCELLED,
+    JobStartEvent,
+    decode_job_start_event,
+)
+from .protocols.makera import encode_job_start_ready, encode_presence_reply
 from .USBBulkStream import USBBulkStream, is_usb_bulk_address
 from .USBStream import USBStream
 from .WIFIStream import WIFIStream
@@ -176,6 +184,10 @@ class Controller:
     JOG_MODE_CONTINUOUS = 1
 
     stop = threading.Event()
+    # Counts resume-at-line starts: a wait for the pause belongs to the
+    # value it started with, and stops once the value moves on (a cancelled
+    # start, or a newer resume). See playStartLineCommand.
+    _resume_generation = 0
     usb_stream = None
     usb_bulk_stream = None
     wifi_stream = None
@@ -215,7 +227,9 @@ class Controller:
         # command) or 1 (file transfer start), matching the automatic-
         # command wrapper's `kind` field.
         self._reset_pending_sends()
-        # The other controllers currently connected, from the last client-list reply.
+        # The other controllers currently connected, from the last client-list
+        # reply, with each entry's has_control kept in step with control-changed
+        # events (see _on_control_changed).
         self.connected_clients: tuple[ClientEntry, ...] = ()
         # Who holds control right now: kept in step with the last
         # control-changed event (the machine's `0x68` event frame, kind 5)
@@ -233,6 +247,13 @@ class Controller:
         # Single-user until an ack says otherwise -- the same starting point
         # as control_holder_id/control_holder_name above.
         self.control_mode: int = HELLO_MODE_SINGLE_USER
+        # Whether the screen has been told who holds control on this
+        # connection yet. Cleared on every identify, set by
+        # _on_control_changed. A connection starts at 0 / "" above, which is
+        # also what a client list says when nobody holds control, so the
+        # first client list on a connection must be applied even when it
+        # agrees with that starting state (see _on_client_list).
+        self._control_holder_shown: bool = False
         # The most recent tool-table summary relayed by another identified
         # client (protocols/relay.py) — tool_number -> a short display
         # text. Lets a passive controller show a sensible tool name at a
@@ -251,6 +272,9 @@ class Controller:
         # test-visibility reason as last_published_file_path above; reset
         # alongside it.
         self.last_published_checksum: bytes = b""
+        # The most recent job-start event (0x68 kind 8), for the same
+        # test-visibility reason; reset alongside them.
+        self.last_job_start_event: JobStartEvent | None = None
         # Whether another controller joining or leaving the machine is
         # announced to the user. A user setting, pushed in by the UI; on by
         # default, so the user learns the behaviour exists. See
@@ -1732,6 +1756,13 @@ class Controller:
         # Some times the machine seems to have a race condition when pausing before executing the next queued command
         # and the next command after M600 is run while the machine isn't fully paused, causing it to fail.
         # To avoid this problem we wait for the machine state to change to pause before executing the commands after "play"
+        # A machine that holds the start until the other controllers are
+        # ready keeps the buffered M600 queued through the hold, so the
+        # pause can come up to its time limit later; the wait below has no
+        # time limit of its own. A cancelled start drops the buffered lines
+        # and never pauses, and ends this wait (see _on_job_start).
+        self._resume_generation += 1
+        generation = self._resume_generation
         play_index = None
         for i, cmd in enumerate(commands):
             self.executeCommand(self.escape(cmd))
@@ -1741,16 +1772,25 @@ class Controller:
 
         if play_index is not None and play_index < len(commands) - 1:
             remaining_commands = commands[play_index + 1 :]
-            self._wait_for_pause_and_continue_cmd_list_execution(remaining_commands)
+            self._wait_for_pause_and_continue_cmd_list_execution(remaining_commands, generation=generation)
 
-    def _wait_for_pause_and_continue_cmd_list_execution(self, remaining_commands, dt=None):
-        """Wait for machine to be paused, then execute remaining commands"""
+    def _wait_for_pause_and_continue_cmd_list_execution(self, remaining_commands, dt=None, generation=None):
+        """Wait for machine to be paused, then execute remaining commands.
+        Stops without sending them once `generation` is no longer the
+        current resume (its start was cancelled, or a newer resume began)."""
+        if generation is not None and generation != self._resume_generation:
+            return
         if CNC.vars.get("state") == "Pause":
             for cmd in remaining_commands:
                 self.executeCommand(self.escape(cmd))
         else:
             # Not paused yet, check again in 0.1 seconds
-            Clock.schedule_once(partial(self._wait_for_pause_and_continue_cmd_list_execution, remaining_commands), 0.1)
+            Clock.schedule_once(
+                partial(
+                    self._wait_for_pause_and_continue_cmd_list_execution, remaining_commands, generation=generation
+                ),
+                0.1,
+            )
 
     def abortCommand(self):
         self.executeCommand("abort\n")
@@ -2013,6 +2053,7 @@ class Controller:
         self.relayed_tool_table = {}
         self.last_published_file_path = ""
         self.last_published_checksum = b""
+        self.last_job_start_event = None
         self.clearRun()
 
     def _join_stream_io(self):
@@ -2166,6 +2207,7 @@ class Controller:
         self.relayed_tool_table = {}
         self.last_published_file_path = ""
         self.last_published_checksum = b""
+        self.last_job_start_event = None
         CNC.vars["state"] = NOT_CONNECTED
         CNC.vars["color"] = STATECOLOR[CNC.vars["state"]]
 
@@ -2203,6 +2245,7 @@ class Controller:
         self.relayed_tool_table = {}
         self.last_published_file_path = ""
         self.last_published_checksum = b""
+        self.last_job_start_event = None
         # Set a flag to indicate this was a manual disconnection
         self._manual_disconnect = True
         CNC.vars["state"] = NOT_CONNECTED
@@ -2703,7 +2746,7 @@ class Controller:
                     self._clear_continuous_jog_state()
             elif "error" in line.lower() or "alarm" in line.lower():
                 self.log.put((self.MSG_ERROR, line))
-                if line.upper().startswith("ERROR:"):
+                if line.upper().startswith("ERROR:") and not is_job_start_refusal(line):
                     msg = line[len("ERROR:") :].strip()
                     if msg:
                         CNC.vars["alarm_message"] = msg
@@ -2746,9 +2789,27 @@ class Controller:
         self.pausing = False
 
     def resumeStream(self):
+        self._dispatch_frames_from_transfer()
         self.paused = False
         self.pausing = False
         self._stream_io_parked = False
+
+    def _dispatch_frames_from_transfer(self):
+        """Hand every frame a file transfer read while it had the link, but
+        that was not part of the transfer (a status report, a published
+        event or console line, a reply), to its normal handler, in the order
+        it arrived. Called from resumeStream() before streamIO reads again,
+        so these come before anything that arrived after the transfer, and
+        nothing a handler sends can land in the middle of a transfer."""
+        take = getattr(getattr(self.stream, "modem", None), "take_other_frames", None)
+        if take is None:
+            return
+        for packet in take():
+            try:
+                for message in self.comms.feed_packet(packet):
+                    self._handle_protocol_message(message)
+            except Exception:
+                logger.exception("Could not handle a frame received during a file transfer")
 
     def _handle_protocol_message(self, message):
         """Dispatch a ParsedMessage from the active communication protocol."""
@@ -2786,11 +2847,18 @@ class Controller:
                 return
             started = decode_play_started_event(message.payload)
             if started is not None:
-                self._on_file_published(started.path)
+                self._on_file_published(started.path, started.checksum, size=started.size, played=True)
+                return
+            job_start = decode_job_start_event(message.payload)
+            if job_start is not None:
+                self._on_job_start(job_start)
                 return
             return
         if message.kind == MessageKind.RELAY:
             self._on_relay(message.payload)
+            return
+        if message.kind == MessageKind.PRESENCE_CHECK:
+            self._answer_presence_check(message.payload)
             return
 
         text = message.text or ""
@@ -2858,6 +2926,11 @@ class Controller:
             frame = negotiator.on_valid_frame(now)
             if frame is not None:
                 self._send_raw(frame)
+        # The same hello again, about a second after the machine answered
+        # that it was busy checking another one (hello-ack result 4).
+        retry = negotiator.due_hello(now)
+        if retry is not None:
+            self._send_raw(retry)
         if negotiator.resolved:
             return
         never_answered = not negotiator.frame_seen
@@ -2904,6 +2977,14 @@ class Controller:
         (old firmware, or the handshake still unresolved) — that firmware
         has no notion of a mode at all. See control_mode/_on_hello_ack."""
         return self._status_subscribed() and self.control_mode == HELLO_MODE_MULTI_USER
+
+    @property
+    def control_mode_reported(self):
+        """True once an accepted hello ack has reported the machine's running
+        mode, single-user or multi-user (see multi_user_mode). False while
+        the handshake is unresolved and always on old firmware, which has no
+        modes at all."""
+        return self._status_subscribed()
 
     @property
     def can_write_machine_settings(self):
@@ -2962,26 +3043,56 @@ class Controller:
         if ack is None:
             return
         was_resolved = negotiator.resolved
-        newly_identified = negotiator.on_hello_ack(ack)
+        was_refused = negotiator.refusal is not None
+        newly_identified = negotiator.on_hello_ack(ack, time.monotonic())
         if ack.result == HELLO_ACCEPTED:
             self.control_mode = negotiator.mode
         if not was_resolved and negotiator.resolved:
             self._flush_pending_sends()
         if newly_identified:
+            self._control_holder_shown = False
             if self.stream is not None:
                 self._send_raw(encode_client_list_request())
             return
-        if not was_resolved and negotiator.resolution is Resolution.REJECTED:
-            # The machine closes this link shortly after a rejected ack
-            # (cap reached, or an old controller already present) — it was
-            # never going to treat this as a peer. Close it ourselves now,
-            # without starting a reconnect loop against a machine that just
-            # refused us, so the user sees the rejection message rather
-            # than it being overwritten a moment later by a heartbeat-
-            # timeout "connection lost" popup and repeated failed retries.
-            reason = "cap" if ack.result == HELLO_REJECTED_CAP else "old_controller"
-            self._close_inline()
-            self._notify_hello_rejected(reason)
+        if not was_refused:
+            self._close_if_refused(negotiator)
+
+    def _close_if_refused(self, negotiator):
+        """Close the link and say why, once the machine has refused this
+        controller: cap reached, an old controller already present, this
+        identity already connected (result 3, even after the ack wait ran
+        out), or busy for too long (result 4 for BUSY_GIVE_UP_S).
+
+        The machine leaves a refused link unidentified (and closes it soon
+        for results 1 and 2) — it was never going to treat this as a peer.
+        Close it ourselves now, without starting a reconnect loop against a
+        machine that just refused us, so the user sees the rejection
+        message rather than it being overwritten a moment later by a
+        heartbeat-timeout "connection lost" popup and repeated failed
+        retries."""
+        refusal = negotiator.refusal
+        if refusal is None:
+            return
+        if refusal == HELLO_REJECTED_CAP:
+            reason = "cap"
+        elif refusal == HELLO_REJECTED_IDENTITY_CONNECTED:
+            reason = "duplicate"
+        elif refusal == HELLO_BUSY:
+            reason = "busy"
+        else:
+            reason = "old_controller"
+        self._close_inline()
+        self._notify_hello_rejected(reason)
+
+    def _answer_presence_check(self, payload):
+        """Answer the machine's "are you still there" (0x6D) at once, with
+        its number, on this link. Called on the thread that read it, never
+        through the screen, so a busy screen cannot make a live controller
+        look gone. Unconditional: a running controller is always there. A
+        check too short to carry its number is dropped."""
+        if len(payload) < 4 or self.stream is None:
+            return
+        self._send_raw(encode_presence_reply(payload[:4]))
 
     def _on_client_list(self, payload):
         """A client-list reply (requested on identify, and again on every
@@ -2992,12 +3103,19 @@ class Controller:
         never gets a control-changed event for it, so this is the only way
         it learns who already holds control -- derived here and, when it
         differs from what this controller already believes, applied through
-        _on_control_changed, exactly as a control-changed event would. A
-        list that agrees with the current state changes nothing."""
+        _on_control_changed, exactly as a control-changed event would. The
+        first list on a connection is always applied, even when it agrees
+        with the starting "nobody" state, so the screen shows "No one has
+        control" rather than nothing. A later list that agrees with the
+        current state changes nothing."""
         self.connected_clients = decode_client_list(payload)
         self._notify_client_list_updated(self.connected_clients)
         holder_id, holder_name = holder_from_client_list(self.connected_clients)
-        if holder_id != self.control_holder_id or holder_name != self.control_holder_name:
+        if (
+            not self._control_holder_shown
+            or holder_id != self.control_holder_id
+            or holder_name != self.control_holder_name
+        ):
             self._on_control_changed(holder_id, holder_name)
 
     def _on_control_changed(self, holder_id, holder_name):
@@ -3008,10 +3126,21 @@ class Controller:
         entries disagree with the current state (_on_client_list above).
         This is the only place control_holder_id/control_holder_name are
         set: this controller never guesses who holds control from its own
-        sends, only from what the machine actually publishes back."""
+        sends, only from what the machine actually publishes back.
+
+        connected_clients takes the new holder here too: the machine sends
+        no client list when control moves, so the has_control marks from
+        the last one would otherwise keep naming whoever held control at
+        the last join or leave. Nothing is requested from the machine for
+        this."""
         self.control_holder_id = holder_id
         self.control_holder_name = holder_name
+        self._control_holder_shown = True
         self._notify_control_changed(holder_id, holder_name)
+        marked = entries_with_holder(self.connected_clients, holder_id)
+        if marked != self.connected_clients:
+            self.connected_clients = marked
+            self._notify_client_list_updated(marked)
 
     def _on_client_presence(self, event):
         """A client-joined or client-left event (the machine's `0x68` event
@@ -3059,7 +3188,7 @@ class Controller:
         self.relayed_tool_table = table
         self._notify_relayed_tool_table(table)
 
-    def _on_file_published(self, path, checksum=b""):
+    def _on_file_published(self, path, checksum=b"", size=None, played=False):
         """An upload-finished or play-started event named `path`. Neither
         kind is distinguished further here -- both mean the same thing to a
         listener: a file a passive controller may not have itself is now on
@@ -3071,10 +3200,50 @@ class Controller:
         truth main.py reads elsewhere. `checksum` is the upload-finished
         event's own digest, or b"" for a play-started event (which never
         carries one) -- passed through so the listener can skip a fetch
-        whose local copy already matches, instead of deciding that here."""
+        whose local copy already matches, instead of deciding that here.
+
+        `played` is True for a play-started event, whose `size` and
+        `checksum` come from firmware that sends them (None and b""
+        otherwise); the listener uses them to draw a local copy with the
+        same content at once."""
         self.last_published_file_path = path
         self.last_published_checksum = checksum
-        self._notify_file_published(path, checksum)
+        self._notify_file_published(path, checksum, size, played)
+
+    def _on_job_start(self, event):
+        """A job-start event (0x68 kind 8): the machine is holding the start
+        of a job until the controllers that take part have loaded its file,
+        or that hold has just ended. Handed to the UI, which draws or
+        fetches the file, reports ready and shows the countdown (main.py's
+        on_job_start_event). A cancelled start also ends a resume-at-line
+        still waiting for its job to pause, so the rest of its commands are
+        never sent into a later job."""
+        self.last_job_start_event = event
+        if event.phase == JOB_START_CANCELLED:
+            self._resume_generation += 1
+        self._notify_job_start(event)
+
+    def send_job_start_ready(self, start_id):
+        """Tell the machine this controller no longer needs it to hold the
+        start `start_id` (frame 0x6C): its file is drawn, or this controller
+        has given up on it. Automatic traffic: no reply, never moves
+        control. Returns False without sending on a connection that is not
+        subscribed."""
+        if not self._status_subscribed() or self.stream is None:
+            return False
+        self._send_raw(encode_job_start_ready(start_id))
+        return True
+
+    @property
+    def machine_holds_starts(self):
+        """True once the machine's hello ack says it holds a job's start
+        until the controllers that take part are ready."""
+        negotiator = self._hello
+        return negotiator is not None and negotiator.machine_holds_starts
+
+    def startNowCommand(self):
+        """Start a held job at once."""
+        self.executeCommand("start-now\n")
 
     def _on_published_line(self, source_id, source_name, text):
         """A command's own text or its reply, published by the machine to
@@ -3137,6 +3306,7 @@ class Controller:
         self.relayed_tool_table = {}
         self.last_published_file_path = ""
         self.last_published_checksum = b""
+        self.last_job_start_event = None
         if self.stream is not None:
             try:
                 self.stream.close()
@@ -3256,7 +3426,7 @@ class Controller:
         if hasattr(root, "update_relayed_tool_table"):
             Clock.schedule_once(lambda dt, t=table: root.update_relayed_tool_table(t), 0)
 
-    def _notify_file_published(self, path, checksum=b""):
+    def _notify_file_published(self, path, checksum=b"", size=None, played=False):
         if App is None or Clock is None:
             return
         app = App.get_running_app()
@@ -3264,7 +3434,22 @@ class Controller:
             return
         root = app.root
         if hasattr(root, "on_passive_file_published"):
-            Clock.schedule_once(lambda dt, p=path, c=checksum: root.on_passive_file_published(p, c), 0)
+            Clock.schedule_once(
+                lambda dt, p=path, c=checksum, s=size, pl=played: root.on_passive_file_published(
+                    p, c, size=s, played=pl
+                ),
+                0,
+            )
+
+    def _notify_job_start(self, event):
+        if App is None or Clock is None:
+            return
+        app = App.get_running_app()
+        if app is None or getattr(app, "root", None) is None:
+            return
+        root = app.root
+        if hasattr(root, "on_job_start_event"):
+            Clock.schedule_once(lambda dt, e=event: root.on_job_start_event(e), 0)
 
     # ----------------------------------------------------------------------
     # thread performing I/O on serial line
@@ -3356,8 +3541,10 @@ class Controller:
                 self._advance_heartbeat(time.monotonic())
 
             except PeerClosedError:
-                # USB's version of the WiFi b"" case just above: the device
-                # itself is gone (unplugged, or the OS reclaimed the port).
+                # USB's version of the WiFi b"" case just above: a USB read
+                # or write failed in a way USBStream does not recognise as
+                # the device going away (an unplug is torn down quietly
+                # there, and left to the app's connection-lost check).
                 # Raised by USBStream.recv()/send() from a caught
                 # serial.SerialException, so it can arrive from either call
                 # in this same try block. Always treated as an established

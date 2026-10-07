@@ -14,6 +14,9 @@ import time
 # real Kivy config. Must be set BEFORE any Kivy import.
 _kivy_home = tempfile.mkdtemp(prefix="kivy_test_")
 os.environ["KIVY_HOME"] = _kivy_home
+# Likewise the controller identity's lock and fallback files, which the app
+# keeps in the user's state folder (on Linux).
+os.environ["XDG_STATE_HOME"] = os.path.join(_kivy_home, "state")
 os.environ.setdefault("KIVY_NO_FILELOG", "1")
 os.environ.setdefault("KIVY_LOG_MODE", "MIXED")
 os.environ.setdefault("KIVY_NO_CONSOLELOG", "0")

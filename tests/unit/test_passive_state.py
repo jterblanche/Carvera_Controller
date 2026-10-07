@@ -26,6 +26,7 @@ import pytest
 
 from carveracontroller.CNC import CNC
 from carveracontroller.Controller import CONN_WIFI, Controller
+from carveracontroller.machine.hello import ACK_TIMEOUT_S
 from carveracontroller.machine.identity import ControllerIdentity
 from carveracontroller.protocols.framing import PTYPE_AUTO_COMMAND, PTYPE_CTRL_MULTI
 from tests.unit.fake_machine import FakeMachine
@@ -203,7 +204,9 @@ def test_connect_time_writes_go_through_unchanged_on_old_firmware(machine, contr
     m = machine(mode="old")
     controller.open(CONN_WIFI, m.address())
 
-    assert m.wait_until(lambda: controller._hello is not None and controller._hello.resolved)
+    assert m.wait_until(
+        lambda: controller._hello is not None and controller._hello.resolved, timeout=ACK_TIMEOUT_S + 2.0
+    )
     assert controller._status_subscribed() is False
     assert controller.has_control is False  # never subscribed, so never "in control" either
 

@@ -13,6 +13,13 @@ from dataclasses import dataclass
 HELLO_ACCEPTED = 0
 HELLO_REJECTED_CAP = 1
 HELLO_REJECTED_OLD_CONTROLLER = 2
+# Another controller with this id is connected and answered the machine's
+# presence check. It keeps its connection; this one is refused and must not
+# retry.
+HELLO_REJECTED_IDENTITY_CONNECTED = 3
+# The machine is checking another hello (one at a time) and has not looked
+# at this one. Send the same hello again on the same connection shortly.
+HELLO_BUSY = 4
 
 # hello ack `mode` values: whether the machine hands control to whoever last
 # acted (single-user) or keeps it with the holder until they release it or
@@ -20,6 +27,13 @@ HELLO_REJECTED_OLD_CONTROLLER = 2
 # configured otherwise.
 HELLO_MODE_SINGLE_USER = 0
 HELLO_MODE_MULTI_USER = 1
+
+# The features byte, after `link` in the hello and after `mode` in the
+# hello ack. In the hello, bit 0 says this controller takes part in the
+# job-start wait. In the ack, bit 0 says the machine holds a job's start
+# until the controllers that take part are ready. Firmware without the wait
+# ignores the byte in the hello and sends a three-byte ack, read as 0.
+HELLO_FEATURE_JOB_START_WAIT = 0x01
 
 # Event (`0x68`) `kind` bytes this controller decodes. The machine defines
 # two more (3, job ended; 4, alarm/halt) that this controller does not act
@@ -29,6 +43,27 @@ EVENT_KIND_PLAY_STARTED = 2
 EVENT_KIND_CONTROL_CHANGED = 5
 EVENT_KIND_CLIENT_JOINED = 6
 EVENT_KIND_CLIENT_LEFT = 7
+EVENT_KIND_JOB_START = 8
+
+# Job-start event `phase` values. Hashing comes first, while the machine
+# computes the file's MD5: it carries the size but no checksum and no time
+# left, and the first waiting event that follows carries the MD5 and starts
+# the time limit. Starting or cancelled can also follow hashing directly,
+# then with no checksum.
+JOB_START_WAITING = 0
+JOB_START_STARTING = 1
+JOB_START_CANCELLED = 2
+JOB_START_HASHING = 3
+
+# Job-start event `reason` values: 0 with phase waiting; 1 to 3 with phase
+# starting; 4 to 6 with phase cancelled.
+JOB_START_REASON_WAITING = 0
+JOB_START_REASON_ALL_READY = 1
+JOB_START_REASON_TIME_LIMIT = 2
+JOB_START_REASON_START_NOW = 3
+JOB_START_REASON_ABORT = 4
+JOB_START_REASON_STARTER_LEFT = 5
+JOB_START_REASON_HALT = 6
 
 # hello / client-list-entry `link` values.
 LINK_WIFI = 0
@@ -42,13 +77,17 @@ class HelloAck:
     protocol_version: int
     result: int
     mode: int
+    features: int = 0
 
 
 def decode_hello_ack(payload: bytes) -> HelloAck | None:
-    """Decode a hello-ack payload. Returns None if it is too short to be valid."""
+    """Decode a hello-ack payload: protocol_version(1) + result(1) + mode(1)
+    + features(1, optional). Returns None if it is too short to be valid. A
+    three-byte ack, from firmware without the features byte, has features 0."""
     if len(payload) < 3:
         return None
-    return HelloAck(protocol_version=payload[0], result=payload[1], mode=payload[2])
+    features = payload[3] if len(payload) > 3 else 0
+    return HelloAck(protocol_version=payload[0], result=payload[1], mode=payload[2], features=features)
 
 
 @dataclass(frozen=True)
@@ -176,26 +215,122 @@ def decode_upload_finished_event(payload: bytes) -> UploadFinished | None:
 @dataclass(frozen=True)
 class PlayStarted:
     """One `0x68` event, kind `EVENT_KIND_PLAY_STARTED`: the machine just
-    started playing ``path``, from whichever client commanded it."""
+    started playing ``path``, from whichever client commanded it. ``size``
+    and ``checksum`` (the raw MD5, empty when the machine has none) let a
+    controller draw a local copy with the same content at once. Firmware
+    that sends only the path gives ``size`` None and an empty checksum."""
 
     path: str
+    size: int | None = None
+    checksum: bytes = b""
 
 
 def decode_play_started_event(payload: bytes) -> PlayStarted | None:
     """Decode one event (`0x68`) payload as play-started: kind(1) +
-    path_len(1) + path. Returns None if the first byte is not
+    path_len(1) + path, then, from firmware that sends them, size(4, BE) +
+    checksum_type(1: 0=none, 1=md5) + checksum(0 or 16 B), the same layout
+    as upload-finished. Returns None if the first byte is not
     ``EVENT_KIND_PLAY_STARTED``, or the payload is too short for its own
-    path -- dropped silently, same as every other decoder here."""
+    path or for a checksum it declares -- dropped silently, same as every
+    other decoder here."""
     if len(payload) < 1 + 1:
         return None
     if payload[0] != EVENT_KIND_PLAY_STARTED:
         return None
+    decoded = _decode_file_part(payload, size_optional=True)
+    if decoded is None:
+        return None
+    path, size, checksum, _ = decoded
+    return PlayStarted(path=path, size=size, checksum=checksum)
+
+
+@dataclass(frozen=True)
+class JobStartEvent:
+    """One `0x68` event, kind `EVENT_KIND_JOB_START`: the machine is holding
+    the start of a job until the controllers that take part are ready
+    (``phase`` hashing while it computes the file's MD5, then waiting), or
+    the hold has just ended (starting or cancelled, with the ``reason``). ``path``, ``size`` and ``checksum`` name the file,
+    as play-started will. ``start_id`` (never 0) is what a ready frame
+    answers; ``seconds_left`` is the time to the machine's limit while
+    waiting; ``starter_id`` is the controller that started the job, and
+    ``not_ready_ids`` the controllers the machine is still waiting for."""
+
+    path: str
+    size: int
+    checksum: bytes
+    start_id: int
+    phase: int
+    reason: int
+    seconds_left: int
+    starter_id: int
+    not_ready_ids: tuple[int, ...]
+
+
+def decode_job_start_event(payload: bytes) -> JobStartEvent | None:
+    """Decode one event (`0x68`) payload as a job-start event: the
+    upload-finished layout after the kind byte (path_len, path, size,
+    checksum_type, checksum), then start_id(2, BE) + phase(1) + reason(1) +
+    seconds_left(1) + starter_id(8, BE) + not_ready_count(1) +
+    not_ready_ids(8 each, BE). Returns None for another kind, a payload cut
+    short, or a start_id of 0."""
+    if len(payload) < 1 + 1 or payload[0] != EVENT_KIND_JOB_START:
+        return None
+    decoded = _decode_file_part(payload, size_optional=False)
+    if decoded is None:
+        return None
+    path, size, checksum, offset = decoded
+    if size is None or offset + 14 > len(payload):
+        return None
+    start_id = int.from_bytes(payload[offset : offset + 2], "big")
+    phase = payload[offset + 2]
+    reason = payload[offset + 3]
+    seconds_left = payload[offset + 4]
+    starter_id = int.from_bytes(payload[offset + 5 : offset + 13], "big")
+    count = payload[offset + 13]
+    offset += 14
+    if start_id == 0 or offset + 8 * count > len(payload):
+        return None
+    not_ready = tuple(int.from_bytes(payload[offset + 8 * i : offset + 8 * i + 8], "big") for i in range(count))
+    return JobStartEvent(
+        path=path,
+        size=size,
+        checksum=checksum,
+        start_id=start_id,
+        phase=phase,
+        reason=reason,
+        seconds_left=seconds_left,
+        starter_id=starter_id,
+        not_ready_ids=not_ready,
+    )
+
+
+def _decode_file_part(payload: bytes, size_optional: bool) -> tuple[str, int | None, bytes, int] | None:
+    """The path_len(1) + path + size(4, BE) + checksum_type(1) + checksum(0
+    or 16 B) that follows the kind byte of the upload-finished, play-started
+    and job-start events. Returns (path, size, checksum, offset just past
+    it), or None if the payload is too short. With ``size_optional``, a
+    payload too short to hold the size and checksum type after the path
+    gives size None and no checksum (play-started from firmware that sends
+    only the path)."""
     path_len = payload[1]
     offset = 2
     if offset + path_len > len(payload):
         return None
     path = payload[offset : offset + path_len].decode("utf-8", errors="replace")
-    return PlayStarted(path=path)
+    offset += path_len
+    if offset + 4 + 1 > len(payload):
+        if size_optional:
+            return path, None, b"", offset
+        return None
+    size = int.from_bytes(payload[offset : offset + 4], "big")
+    offset += 4
+    checksum_type = payload[offset]
+    offset += 1
+    checksum_len = 16 if checksum_type == 1 else 0
+    if offset + checksum_len > len(payload):
+        return None
+    checksum = payload[offset : offset + checksum_len]
+    return path, size, checksum, offset + checksum_len
 
 
 @dataclass(frozen=True)

@@ -26,10 +26,13 @@ from .framing import (
     PTYPE_HEARTBEAT,
     PTYPE_HELLO,
     PTYPE_HELLO_ACK,
+    PTYPE_JOB_START_READY,
     PTYPE_LOAD_ERROR,
     PTYPE_LOAD_FINISH,
     PTYPE_LOAD_INFO,
     PTYPE_NORMAL_INFO,
+    PTYPE_PRESENCE_CHECK,
+    PTYPE_PRESENCE_REPLY,
     PTYPE_PUBLISHED_LINE,
     PTYPE_RELAY,
     build_frame,
@@ -44,8 +47,15 @@ from .messages import MessageKind, ParsedMessage
 HELLO_PROTOCOL_VERSION = 1
 
 
-def encode_hello(controller_id: int, name: bytes, link: int) -> bytes:
-    """Build a hello (0x60) frame: protocol_version(1) + id(8) + name_len(1) + name + link(1)."""
+def encode_hello(
+    controller_id: int, name: bytes, link: int, features: int | None = None, launch: int | None = None
+) -> bytes:
+    """Build a hello (0x60) frame: protocol_version(1) + id(8) + name_len(1)
+    + name + link(1), then features(1) when ``features`` or ``launch`` is
+    given (see HELLO_FEATURE_JOB_START_WAIT in protocols/handshake.py), then
+    launch(8, big-endian) when ``launch`` is given. The launch part is only
+    read after a features byte, so one is sent (0) for a launch part without
+    features. Firmware that does not know either ignores the bytes."""
     if len(name) > 31:
         raise ValueError("hello name must be <= 31 bytes")
     payload = (
@@ -55,7 +65,23 @@ def encode_hello(controller_id: int, name: bytes, link: int) -> bytes:
         + name
         + bytes([link & 0xFF])
     )
+    if features is not None or launch is not None:
+        payload += bytes([(features or 0) & 0xFF])
+    if launch is not None:
+        payload += (launch & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "big")
     return build_frame(PTYPE_HELLO, payload)
+
+
+def encode_presence_reply(number: bytes) -> bytes:
+    """Build a presence reply (0x6E): number(4), copied unchanged from the
+    presence check (0x6D) it answers."""
+    return build_frame(PTYPE_PRESENCE_REPLY, number[:4])
+
+
+def encode_job_start_ready(start_id: int) -> bytes:
+    """Build a job-start ready (0x6C) frame: start_id(2, BE), copied from
+    the job-start event it answers."""
+    return build_frame(PTYPE_JOB_START_READY, (start_id & 0xFFFF).to_bytes(2, "big"))
 
 
 def encode_client_list_request() -> bytes:
@@ -227,9 +253,21 @@ class MakeraProtocol(CommunicationProtocol):
 
         return []
 
+    def feed_packet(self, packet: bytes) -> list[ParsedMessage]:
+        """Parse one frame body (length, type, payload and CRC, without the
+        header and footer) that a file transfer took off the link while it
+        was reading it itself. The byte-by-byte frame state used by feed()
+        is left as it is; text still being assembled (a reply line, a
+        published line) continues across both."""
+        return self._messages_from_packet(packet)
+
     def _dispatch_packet(self) -> list[ParsedMessage]:
-        parsed = validate_packet_data(self._packet_data)
+        packet = bytes(self._packet_data)
         self._packet_data.clear()
+        return self._messages_from_packet(packet)
+
+    def _messages_from_packet(self, packet: bytes) -> list[ParsedMessage]:
+        parsed = validate_packet_data(packet)
         if parsed is None:
             return []
         # Any complete, CRC-valid frame — regardless of type — proves the
@@ -258,6 +296,8 @@ class MakeraProtocol(CommunicationProtocol):
             return [ParsedMessage(MessageKind.EVENT, payload=parsed.payload)]
         if parsed.ptype == PTYPE_RELAY:
             return self._decode_relay(parsed.payload)
+        if parsed.ptype == PTYPE_PRESENCE_CHECK:
+            return [ParsedMessage(MessageKind.PRESENCE_CHECK, payload=parsed.payload)]
 
         if parsed.ptype == PTYPE_LOAD_FINISH:
             return [ParsedMessage(MessageKind.LOAD_EOF)]

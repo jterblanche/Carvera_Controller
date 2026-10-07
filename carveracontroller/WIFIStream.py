@@ -123,9 +123,31 @@ class WIFIStream:
 
     # ----------------------------------------------------------------------
     def send(self, data):
+        # socket.send() can take just part of data. A frame cut short is
+        # lost: the machine drops a Makera frame that fails its checksum,
+        # and a Smoothie line runs into whatever is sent next. So keep
+        # sending until the whole frame is written.
+        sent = 0
+        try:
+            while sent < len(data):
+                sent += self.socket.send(data[sent:])
+        except OSError as exc:
+            if sent == 0:
+                # Nothing written: the byte stream is still in step.
+                raise
+            # Part of the frame is on the wire and the rest never will be,
+            # so nothing sent after it would be read correctly. Shut the
+            # socket down: the reader then gets b"" and reports the link
+            # lost, as when the machine closes it.
+            try:
+                self.socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            raise ConnectionError(f"WiFi link failed: sent {sent} of {len(data)} bytes of a frame ({exc})") from exc
         if self.log_sent_receive:
-            logger.debug(f"SENT: {data}")
-        self.socket.send(data)
+            # One line per frame, once all of it is written, holding exactly
+            # the bytes written.
+            logger.debug("SENT: %r", data)
 
     # ----------------------------------------------------------------------
     def recv(self):

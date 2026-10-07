@@ -25,6 +25,10 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from carveracontroller import Utils
+from carveracontroller.CNC import CNC
+from carveracontroller.machine.job_start import JobStartTracker
+from carveracontroller.machine.local_copies import LocalCopyStore
 from carveracontroller.machine.passive_fetch import (
     MAX_FETCH_ATTEMPTS,
     RETRY_BACKOFF_S,
@@ -69,8 +73,11 @@ def _passive_host(tmp_path):
     root.temp_dir = str(tmp_path)
     root._passive_fetch = PassiveFetchTracker()
     root._auto_fetch_in_progress = False
-    root._last_upload_checksum_path = None
-    root._last_upload_checksum = b""
+    root._local_copies = LocalCopyStore()
+    root._job_start = JobStartTracker(own_id=1)
+    # Nothing of this controller's own is using the link, so a due fetch
+    # starts (see Makera._link_busy_for_passive_fetch).
+    root.controller = SimpleNamespace(has_control=False, sendNUM=0, loadNUM=0)
     return root
 
 
@@ -110,7 +117,8 @@ def test_mark_loaded_not_called_when_main_thread_load_raises(monkeypatch, tmp_pa
     root.doDownload = MagicMock(return_value=1)
     root.load_gcode_file = MagicMock(side_effect=ValueError("bad gcode"))
     root._passive_fetch.mark_loaded = MagicMock(wraps=root._passive_fetch.mark_loaded)
-    monkeypatch.setattr("carveracontroller.main.Clock.schedule_once", lambda cb, *a, **kw: cb())
+    monkeypatch.setattr("carveracontroller.main.Clock.schedule_once", lambda cb, *a, **kw: cb(0))
+    monkeypatch.setattr("carveracontroller.main.threading.Thread", _ImmediateThread)
     monkeypatch.setattr("carveracontroller.main.App.get_running_app", lambda: None)
 
     Makera._auto_fetch_played_file(root, "/sd/job.nc")
@@ -128,6 +136,7 @@ def test_worker_thread_never_touches_kivy_properties_inline(monkeypatch, tmp_pat
     root = _passive_host(tmp_path)
     root.doDownload = MagicMock(return_value=1)
     root.load_gcode_file = MagicMock()
+    root._auto_fetch_in_progress = True  # as _check_passive_fetch sets it
 
     scheduled = []
     monkeypatch.setattr("carveracontroller.main.Clock.schedule_once", lambda cb, *a, **kw: scheduled.append(cb))
@@ -161,7 +170,15 @@ def test_worker_thread_never_touches_kivy_properties_inline(monkeypatch, tmp_pat
 
     assert app.selected_remote_filename == "/sd/job.nc"
     assert app.selected_local_filename == os.path.join(str(tmp_path), "job.nc")
+    # The drawing itself runs on its own worker thread, which hands its
+    # completion back to the main thread.
+    for _ in range(100):
+        if len(scheduled) == 2:
+            break
+        threading.Event().wait(0.05)
     root.load_gcode_file.assert_called_once_with(os.path.join(str(tmp_path), "job.nc"))
+    assert root._auto_fetch_in_progress is True  # until the drawing is done
+    scheduled[1](0)
     assert root._auto_fetch_in_progress is False
 
 
@@ -253,6 +270,41 @@ def test_check_passive_fetch_does_not_overlap_a_fetch_already_in_flight(monkeypa
     assert started == []  # never started a second worker thread
     # The path is still owed -- a fetch under way is not the same as loaded.
     assert root._passive_fetch.pending_path == "/sd/job.nc"
+
+
+def _status_with_player_flag(monkeypatch, is_playing):
+    """Firmware that reports the player flag, with the given flag in the
+    latest status report."""
+    app = SimpleNamespace(is_community_firmware=True, fw_version_digitized=Utils.digitize_v("2.2.0"))
+    monkeypatch.setattr("carveracontroller.main.App.get_running_app", lambda: app)
+    monkeypatch.setitem(CNC.vars, "is_playing", is_playing)
+
+
+def test_an_idle_report_mid_job_does_not_start_a_fetch(monkeypatch, tmp_path):
+    """The firmware reports Idle whenever its motion queue is empty, also
+    while the player is playing (tool change, probe, start-of-job routine).
+    The player flag in the same report keeps the fetch waiting."""
+    root = _passive_host(tmp_path)
+    root._passive_fetch.note_published_file("/sd/job.nc")
+    started = []
+    monkeypatch.setattr(
+        "carveracontroller.main.threading.Thread",
+        lambda target=None, args=(), **kwargs: started.append(args) or MagicMock(),
+    )
+    _status_with_player_flag(monkeypatch, 1)
+
+    for _ in range(5):
+        Makera._check_passive_fetch(root, is_idle=True)
+
+    assert started == []
+    assert root._passive_fetch.pending_path == "/sd/job.nc"
+
+    # The job ends: the player flag drops to 0 and the fetch is released.
+    monkeypatch.setitem(CNC.vars, "is_playing", 0)
+    for _ in range(3):
+        Makera._check_passive_fetch(root, is_idle=True)
+
+    assert started == [("/sd/job.nc",)]
 
 
 def test_on_passive_file_published_blanks_a_stale_selection(monkeypatch, tmp_path):
