@@ -9670,16 +9670,23 @@ class Makera(RelativeLayout):
         self.gcode_cannot_visualise = True
 
     # ------------------------------------------------------------------------
-    def _end_failed_load(self, *args):
+    def _end_failed_load(self, *args, message=None):
         """Clear loading_file on the main thread for a load_gcode_file that
         stopped without reaching load_end. load_start, which sets it, runs
         through the same Clock and was scheduled first, so a failure that
         happens before load_start has run cannot be undone by it.
 
         The file did not load, so it is also no longer the loaded file for
-        resume at line: self.lines may still hold an earlier copy of it."""
+        resume at line: self.lines may still hold an earlier copy of it.
+
+        Closes the progress popup the open path showed (it cannot be closed
+        by hand: Cancel is disabled until the first batch is drawn) and, if
+        `message` is given, tells the user why the file did not open."""
         self.loading_file = False
         self._last_loaded_file_key = None
+        self.progress_popup.dismiss()
+        if message:
+            self.show_message_popup(message, False)
 
     # ------------------------------------------------------------------------
     def load_error(self, error_msg, *args):
@@ -9806,9 +9813,14 @@ class Makera(RelativeLayout):
                 lzpath = lzpath + ".lz"
                 shutil.copyfile(filepath, lzpath)
                 if not self.decompress_file(lzpath, filepath):
-                    Clock.schedule_once(self._end_failed_load, 0)
+                    message = (
+                        tr._("This file is compressed and could not be decompressed. It may be damaged.")
+                        + "\n%s" % filepath
+                    )
+                    Clock.schedule_once(partial(self._end_failed_load, message=message), 0)
                     return
                 if not self._verify_deferred_download_md5(filepath):
+                    # The checksum check has already scheduled its own message.
                     Clock.schedule_once(self._end_failed_load, 0)
                     return
 
