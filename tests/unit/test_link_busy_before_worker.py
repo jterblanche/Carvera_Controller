@@ -11,6 +11,7 @@ until the worker returns, however it ends.
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 from types import SimpleNamespace
@@ -67,6 +68,7 @@ def threads(monkeypatch):
 def _host(tmp_path):
     root = Makera.__new__(Makera)
     root.temp_dir = str(tmp_path / "cache")
+    os.makedirs(root.temp_dir, exist_ok=True)
     root._passive_fetch = PassiveFetchTracker()
     root._local_copies = LocalCopyStore()
     root._job_start = JobStartTracker(own_id=1)
@@ -89,8 +91,11 @@ def _host(tmp_path):
     )
     root.downloads = []
 
-    def download(remote_path, local_path, show_progress=True, open_after=True, automatic=False):
+    def download(remote_path, local_path, show_progress=True, open_after=True, automatic=False, **_kwargs):
         root.downloads.append((remote_path, automatic))
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        with open(local_path, "wb") as f:
+            f.write(b"G0 X1\n")
         return 1
 
     root.doDownload = download
@@ -156,7 +161,9 @@ def test_mark_is_cleared_when_the_worker_raises(tmp_path, threads):
         raise OSError("disk full")
 
     root.doDownload = broken_download
-    _save_to_computer(root, tmp_path)
+    # Opening from the machine runs doDownload itself on the worker, so the
+    # error ends the worker (saving to the computer catches its own errors).
+    _open_from_machine(root, tmp_path)
 
     with pytest.raises(OSError):
         threads[0].run_now()

@@ -256,7 +256,6 @@ class USBBulkStream:
         self.modem = XMODEM(self.getc, self.putc, "xmodem")
         self.log_sent_receive = log_sent_receive
         self.uses_framed_transfer = False
-        self._send_log_buffer = b""
         self._recv_log_buffer = b""
         self.dev = None
         self.ep_in = None
@@ -272,20 +271,9 @@ class USBBulkStream:
         if isinstance(data, str):
             data = data.encode("utf-8", errors="replace")
         self._write(data)
-        if not self.log_sent_receive:
-            return
-        if data == b"?":
-            logger.debug("SENT: ?")
-            return
-        self._send_log_buffer += data
-        while b"\n" in self._send_log_buffer:
-            idx = self._send_log_buffer.index(b"\n") + 1
-            line = self._send_log_buffer[:idx]
-            self._send_log_buffer = self._send_log_buffer[idx:]
-            logger.debug("SENT: %s", line.decode("utf-8", errors="replace").rstrip("\r\n"))
-        if len(self._send_log_buffer) > 4096:
-            logger.debug("SENT: <%d bytes (no newline)>", len(self._send_log_buffer))
-            self._send_log_buffer = b""
+        if self.log_sent_receive:
+            # One line per write, holding exactly the bytes just written.
+            logger.debug("SENT: %r", data)
 
     def recv(self):
         if self.dev is None or self._stop:
@@ -350,7 +338,6 @@ class USBBulkStream:
         except Exception:
             pass
         self.interface = None
-        self._send_log_buffer = b""
         self._recv_log_buffer = b""
         self.reset_input_buffer()
         return True
