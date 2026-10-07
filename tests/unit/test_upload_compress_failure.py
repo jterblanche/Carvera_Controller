@@ -22,6 +22,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from carveracontroller.Controller import SEND_FILE
+from carveracontroller.machine.local_copies import LocalCopyStore
 from carveracontroller.machine.passive_fetch import PassiveFetchTracker
 from carveracontroller.main import Makera
 
@@ -56,6 +57,8 @@ def _host(tmp_path, cache_dir):
     root.temp_dir = str(cache_dir)
     root.filetype = "lz"
     root._passive_fetch = PassiveFetchTracker()
+    # load_gcode_file and a finished upload remember the file as a local copy.
+    root._local_copies = LocalCopyStore()
     root._uploading_firmware = False
     root.uploading = False
     root.decompstatus = False

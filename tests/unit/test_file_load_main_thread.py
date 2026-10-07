@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 
 import carveracontroller.main as main_module
 from carveracontroller.CNC import CNC
+from carveracontroller.machine.local_copies import LocalCopyStore
 from carveracontroller.main import Makera
 
 LOAD_TIMEOUT_S = 30
@@ -81,6 +82,8 @@ def _load_host(monkeypatch, guard, scheduled):
 
     root = Makera.__new__(Makera)
     root.load_event = threading.Event()
+    # load_gcode_file and a finished upload remember the file as a local copy.
+    root._local_copies = LocalCopyStore()
     root.load_canceled = False
     root.cnc = CNC()
     root.gcode_viewer = SimpleNamespace(

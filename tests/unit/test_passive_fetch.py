@@ -4,11 +4,14 @@ select itself, versus just showing progress until the machine goes idle."""
 
 from __future__ import annotations
 
+import hashlib
+
 from carveracontroller.machine import passive_fetch
 from carveracontroller.machine.passive_fetch import (
     MAX_FETCH_ATTEMPTS,
     RETRY_BACKOFF_S,
     PassiveFetchTracker,
+    published_upload_path,
 )
 
 
@@ -238,3 +241,160 @@ def test_player_flag_trusts_zero_only_from_firmware_that_reports_the_flag():
     # Zero is also the value when the field is absent, so it says nothing
     # about firmware that may not report it.
     assert passive_fetch.player_flag(0, reports_flag=False) is None
+
+
+# -- this controller's own uploads ------------------------------------------
+
+
+def _md5(content):
+    return hashlib.md5(content).hexdigest()
+
+
+def test_own_upload_is_recognised_by_path_and_digest():
+    t = PassiveFetchTracker()
+    t.note_own_upload("/sd/gcodes/job.nc", _md5(b"mine"))
+    assert t.is_own_upload("/sd/gcodes/job.nc", hashlib.md5(b"mine").digest())
+    # Still this controller's file on a repeat of the same announcement.
+    assert t.is_own_upload("/sd/gcodes/job.nc", hashlib.md5(b"mine").digest())
+
+
+def test_own_upload_digest_is_compared_case_insensitively():
+    t = PassiveFetchTracker()
+    t.note_own_upload("/sd/job.nc", _md5(b"mine").upper())
+    assert t.is_own_upload("/sd/job.nc", hashlib.md5(b"mine").digest())
+
+
+def test_a_different_path_is_not_own_upload():
+    t = PassiveFetchTracker()
+    t.note_own_upload("/sd/gcodes/job.nc", _md5(b"mine"))
+    assert not t.is_own_upload("/sd/gcodes/other.nc", hashlib.md5(b"mine").digest())
+
+
+def test_an_event_without_a_digest_is_never_own_upload():
+    """A path match alone is not enough: play-started events carry no
+    digest, and one may come from another client playing the file."""
+    t = PassiveFetchTracker()
+    t.note_own_upload("/sd/job.nc", _md5(b"mine"))
+    assert not t.is_own_upload("/sd/job.nc", b"")
+
+
+def test_another_clients_upload_to_the_same_path_is_not_own_and_replaces_it():
+    """Different bytes under the same name: a new file. This controller's
+    record for that path is gone, since the card no longer holds its
+    file there."""
+    t = PassiveFetchTracker()
+    t.note_own_upload("/sd/job.nc", _md5(b"mine"))
+    assert not t.is_own_upload("/sd/job.nc", hashlib.md5(b"theirs").digest())
+    assert not t.is_own_upload("/sd/job.nc", hashlib.md5(b"mine").digest())
+
+
+def test_a_newer_own_upload_to_the_same_path_replaces_the_older_one():
+    t = PassiveFetchTracker()
+    t.note_own_upload("/sd/job.nc", _md5(b"first"))
+    t.note_own_upload("/sd/job.nc", _md5(b"second"))
+    assert t.is_own_upload("/sd/job.nc", hashlib.md5(b"second").digest())
+    assert not t.is_own_upload("/sd/job.nc", hashlib.md5(b"first").digest())
+
+
+def test_own_upload_drops_a_pending_fetch_of_the_same_path():
+    """A fetch of job.nc was still owed from another client's earlier
+    upload when this controller uploaded its own job.nc over it: the card
+    now holds this controller's file, so there is nothing to fetch."""
+    t = PassiveFetchTracker()
+    t.note_published_file("/sd/job.nc")
+    t.note_own_upload("/sd/job.nc", _md5(b"mine"))
+    assert t.is_own_upload("/sd/job.nc", hashlib.md5(b"mine").digest())
+    assert t.pending_path is None
+    assert t.due_fetch(is_idle=True) is None
+
+
+def test_own_upload_leaves_a_pending_fetch_of_another_path():
+    t = PassiveFetchTracker()
+    t.note_published_file("/sd/theirs.nc")
+    t.note_own_upload("/sd/job.nc", _md5(b"mine"))
+    assert t.is_own_upload("/sd/job.nc", hashlib.md5(b"mine").digest())
+    assert t.pending_path == "/sd/theirs.nc"
+
+
+def test_note_own_upload_ignores_a_blank_path_or_digest():
+    t = PassiveFetchTracker()
+    t.note_own_upload("", _md5(b"mine"))
+    t.note_own_upload("/sd/job.nc", "")
+    assert not t.is_own_upload("", hashlib.md5(b"mine").digest())
+    assert not t.is_own_upload("/sd/job.nc", hashlib.md5(b"mine").digest())
+
+
+def test_published_upload_path_matches_the_machines_announcement():
+    assert published_upload_path("/sd/gcodes/job.nc") == "/sd/gcodes/job.nc"
+    # A compressed upload is announced under its unpacked name.
+    assert published_upload_path("/sd/gcodes/job.nc.lz") == "/sd/gcodes/job.nc"
+    # Windows separators, as uploadCommand converts them.
+    assert published_upload_path("\\sd\\gcodes\\job.nc.lz") == "/sd/gcodes/job.nc"
+
+
+# -- digests announced for a path -------------------------------------------
+
+
+def test_checksum_for_remembers_the_last_announced_digest_per_path():
+    t = PassiveFetchTracker()
+    digest = hashlib.md5(b"job").digest()
+    assert t.checksum_for("/sd/job.nc", digest) == digest
+    # A play-started event for the same path carries none of its own.
+    assert t.checksum_for("/sd/job.nc", b"") == digest
+    assert t.checksum_for("/sd/other.nc", b"") == b""
+
+
+def test_checksum_for_takes_the_newest_digest():
+    t = PassiveFetchTracker()
+    t.checksum_for("/sd/job.nc", hashlib.md5(b"old").digest())
+    t.checksum_for("/sd/job.nc", hashlib.md5(b"new").digest())
+    assert t.checksum_for("/sd/job.nc", b"") == hashlib.md5(b"new").digest()
+
+
+def test_a_fresh_tracker_knows_no_digest_or_own_upload():
+    """One tracker per connection: nothing learnt on an earlier connection
+    carries over to the next."""
+    t = PassiveFetchTracker()
+    assert t.checksum_for("/sd/job.nc", b"") == b""
+    assert not t.is_own_upload("/sd/job.nc", hashlib.md5(b"mine").digest())
+
+
+def test_forget_loaded_lets_a_later_announcement_queue_a_fetch():
+    t = passive_fetch.PassiveFetchTracker()
+    t.mark_loaded("/sd/a.nc")
+    t.note_published_file("/sd/a.nc")
+    assert t.pending_path is None
+    t.forget_loaded("/sd/a.nc")
+    t.note_published_file("/sd/a.nc")
+    assert t.pending_path == "/sd/a.nc"
+
+
+def test_a_file_announced_during_a_fetch_stays_queued_once_it_is_drawn():
+    t = passive_fetch.PassiveFetchTracker()
+    t.note_published_file("/sd/a.nc")
+    assert t.due_fetch(is_idle=True) == "/sd/a.nc"
+    t.note_published_file("/sd/b.nc")
+    t.mark_fetched("/sd/a.nc")
+    assert t.pending_path == "/sd/b.nc"
+    t.note_published_file("/sd/a.nc")
+    assert t.pending_path == "/sd/b.nc"
+
+
+def test_a_fetch_drawn_with_nothing_newer_leaves_nothing_queued():
+    t = passive_fetch.PassiveFetchTracker()
+    t.note_published_file("/sd/a.nc")
+    assert t.due_fetch(is_idle=True) == "/sd/a.nc"
+    t.mark_fetched("/sd/a.nc")
+    assert t.pending_path is None
+    t.note_published_file("/sd/a.nc")
+    assert t.pending_path is None
+
+
+def test_a_failed_fetch_does_not_replace_a_file_announced_meanwhile():
+    t = passive_fetch.PassiveFetchTracker()
+    t.note_published_file("/sd/a.nc")
+    assert t.due_fetch(is_idle=True) == "/sd/a.nc"
+    t.note_published_file("/sd/b.nc")
+    t.note_fetch_failed("/sd/a.nc", now=0.0)
+    assert t.pending_path == "/sd/b.nc"
+    assert t.due_fetch(is_idle=True, now=0.0) == "/sd/b.nc"

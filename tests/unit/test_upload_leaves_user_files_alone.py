@@ -10,6 +10,7 @@ be called <name>.lz, beside the job or as the job itself, is left alone.
 
 from __future__ import annotations
 
+import hashlib
 import os
 
 import pytest
@@ -84,6 +85,21 @@ def test_successful_compressed_upload_still_keeps_a_cache_copy_of_the_job(tmp_pa
 
     assert (cache / "gcodes" / "job.nc").read_bytes() == job.read_bytes()
     assert (cache / "gcodes" / ".lz" / "job.nc.lz").exists()
+
+
+def test_compressed_upload_leaves_a_local_copy_that_can_be_found_by_content(tmp_path, scheduled):
+    """The copy made for compressing is removed after the upload; the cache
+    copy kept of the job is what a later job start of this file finds."""
+    folder, job = _user_folder(tmp_path)
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    root = _host(tmp_path, cache)
+
+    Makera.uploadLocalFile(root, str(job))
+
+    content = job.read_bytes()
+    found = root._local_copies.find(len(content), hashlib.md5(content).digest())
+    assert found == str(cache / "gcodes" / "job.nc")
 
 
 def test_failed_uncompressed_upload_of_a_file_named_lz_does_not_delete_it(tmp_path, scheduled):

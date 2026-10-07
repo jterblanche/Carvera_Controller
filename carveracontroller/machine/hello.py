@@ -15,7 +15,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
-from ..protocols.handshake import HELLO_ACCEPTED, HELLO_MODE_SINGLE_USER, HelloAck
+from ..protocols.handshake import (
+    HELLO_ACCEPTED,
+    HELLO_FEATURE_JOB_START_WAIT,
+    HELLO_MODE_SINGLE_USER,
+    HelloAck,
+)
 from ..protocols.makera import HELLO_PROTOCOL_VERSION, encode_hello
 from .identity import ControllerIdentity
 
@@ -145,6 +150,9 @@ class HelloNegotiator:
     # starting point as `identified`, and the only value old firmware (which
     # never sends an ack at all) ever has.
     _mode: int = field(default=HELLO_MODE_SINGLE_USER, init=False, repr=False)
+    # The features byte of the last accepted ack (0 from firmware that sends
+    # a three-byte ack, and before any ack); see machine_holds_starts.
+    _ack_features: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.open_timeout_s is None:
@@ -167,6 +175,13 @@ class HelloNegotiator:
     @property
     def mode(self) -> int:
         return self._mode
+
+    @property
+    def machine_holds_starts(self) -> bool:
+        """True once an accepted ack says the machine holds a job's start
+        until the controllers that take part are ready. False for firmware
+        without that wait, which never sends a job-start event."""
+        return self._identified and bool(self._ack_features & HELLO_FEATURE_JOB_START_WAIT)
 
     @property
     def frame_seen(self) -> bool:
@@ -256,6 +271,7 @@ class HelloNegotiator:
             was_identified = self._identified
             self._identified = True
             self._mode = ack.mode
+            self._ack_features = ack.features
             if self._resolution is None:
                 self._resolution = Resolution.IDENTIFIED
             return not was_identified
@@ -267,4 +283,11 @@ class HelloNegotiator:
         if first:
             self._first_hello_sent_at = now
         self._last_hello_sent_at = now
-        return encode_hello(self.identity.id, self.identity.name.encode("utf-8"), self.link)
+        # Always says this controller takes part in the job-start wait:
+        # firmware without the wait ignores the byte.
+        return encode_hello(
+            self.identity.id,
+            self.identity.name.encode("utf-8"),
+            self.link,
+            features=HELLO_FEATURE_JOB_START_WAIT,
+        )

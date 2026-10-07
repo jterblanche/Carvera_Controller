@@ -27,6 +27,8 @@ from unittest.mock import MagicMock
 
 from carveracontroller import Utils
 from carveracontroller.CNC import CNC
+from carveracontroller.machine.job_start import JobStartTracker
+from carveracontroller.machine.local_copies import LocalCopyStore
 from carveracontroller.machine.passive_fetch import (
     MAX_FETCH_ATTEMPTS,
     RETRY_BACKOFF_S,
@@ -71,8 +73,11 @@ def _passive_host(tmp_path):
     root.temp_dir = str(tmp_path)
     root._passive_fetch = PassiveFetchTracker()
     root._auto_fetch_in_progress = False
-    root._last_upload_checksum_path = None
-    root._last_upload_checksum = b""
+    root._local_copies = LocalCopyStore()
+    root._job_start = JobStartTracker(own_id=1)
+    # Nothing of this controller's own is using the link, so a due fetch
+    # starts (see Makera._link_busy_for_passive_fetch).
+    root.controller = SimpleNamespace(has_control=False, sendNUM=0, loadNUM=0)
     return root
 
 
@@ -112,7 +117,8 @@ def test_mark_loaded_not_called_when_main_thread_load_raises(monkeypatch, tmp_pa
     root.doDownload = MagicMock(return_value=1)
     root.load_gcode_file = MagicMock(side_effect=ValueError("bad gcode"))
     root._passive_fetch.mark_loaded = MagicMock(wraps=root._passive_fetch.mark_loaded)
-    monkeypatch.setattr("carveracontroller.main.Clock.schedule_once", lambda cb, *a, **kw: cb())
+    monkeypatch.setattr("carveracontroller.main.Clock.schedule_once", lambda cb, *a, **kw: cb(0))
+    monkeypatch.setattr("carveracontroller.main.threading.Thread", _ImmediateThread)
     monkeypatch.setattr("carveracontroller.main.App.get_running_app", lambda: None)
 
     Makera._auto_fetch_played_file(root, "/sd/job.nc")
@@ -130,6 +136,7 @@ def test_worker_thread_never_touches_kivy_properties_inline(monkeypatch, tmp_pat
     root = _passive_host(tmp_path)
     root.doDownload = MagicMock(return_value=1)
     root.load_gcode_file = MagicMock()
+    root._auto_fetch_in_progress = True  # as _check_passive_fetch sets it
 
     scheduled = []
     monkeypatch.setattr("carveracontroller.main.Clock.schedule_once", lambda cb, *a, **kw: scheduled.append(cb))
@@ -163,7 +170,15 @@ def test_worker_thread_never_touches_kivy_properties_inline(monkeypatch, tmp_pat
 
     assert app.selected_remote_filename == "/sd/job.nc"
     assert app.selected_local_filename == os.path.join(str(tmp_path), "job.nc")
+    # The drawing itself runs on its own worker thread, which hands its
+    # completion back to the main thread.
+    for _ in range(100):
+        if len(scheduled) == 2:
+            break
+        threading.Event().wait(0.05)
     root.load_gcode_file.assert_called_once_with(os.path.join(str(tmp_path), "job.nc"))
+    assert root._auto_fetch_in_progress is True  # until the drawing is done
+    scheduled[1](0)
     assert root._auto_fetch_in_progress is False
 
 

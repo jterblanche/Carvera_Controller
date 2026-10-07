@@ -21,7 +21,7 @@ from functools import partial
 from . import Utils
 from .CNC import CMDPAT, CNC, LASER_TOOL_NUMBER, PARENPAT, SEMIPAT, ZPROBE_TOOL_NUMBER
 from .machine.clients import entries_with_holder, holder_from_client_list
-from .machine.control_refusal import is_control_refusal
+from .machine.control_refusal import is_control_refusal, is_job_start_refusal
 from .machine.heartbeat import heartbeat_due
 from .machine.hello import HelloNegotiator, Resolution
 from .machine.identity import ControllerIdentity, default_name, generate_id
@@ -51,6 +51,8 @@ from .protocols import (
     encode_relay,
     encode_tool_table_relay,
 )
+from .protocols.handshake import JOB_START_CANCELLED, JobStartEvent, decode_job_start_event
+from .protocols.makera import encode_job_start_ready
 from .USBBulkStream import USBBulkStream, is_usb_bulk_address
 from .USBStream import USBStream
 from .WIFIStream import WIFIStream
@@ -176,6 +178,10 @@ class Controller:
     JOG_MODE_CONTINUOUS = 1
 
     stop = threading.Event()
+    # Counts resume-at-line starts: a wait for the pause belongs to the
+    # value it started with, and stops once the value moves on (a cancelled
+    # start, or a newer resume). See playStartLineCommand.
+    _resume_generation = 0
     usb_stream = None
     usb_bulk_stream = None
     wifi_stream = None
@@ -260,6 +266,9 @@ class Controller:
         # test-visibility reason as last_published_file_path above; reset
         # alongside it.
         self.last_published_checksum: bytes = b""
+        # The most recent job-start event (0x68 kind 8), for the same
+        # test-visibility reason; reset alongside them.
+        self.last_job_start_event: JobStartEvent | None = None
         # Whether another controller joining or leaving the machine is
         # announced to the user. A user setting, pushed in by the UI; on by
         # default, so the user learns the behaviour exists. See
@@ -1741,6 +1750,13 @@ class Controller:
         # Some times the machine seems to have a race condition when pausing before executing the next queued command
         # and the next command after M600 is run while the machine isn't fully paused, causing it to fail.
         # To avoid this problem we wait for the machine state to change to pause before executing the commands after "play"
+        # A machine that holds the start until the other controllers are
+        # ready keeps the buffered M600 queued through the hold, so the
+        # pause can come up to its time limit later; the wait below has no
+        # time limit of its own. A cancelled start drops the buffered lines
+        # and never pauses, and ends this wait (see _on_job_start).
+        self._resume_generation += 1
+        generation = self._resume_generation
         play_index = None
         for i, cmd in enumerate(commands):
             self.executeCommand(self.escape(cmd))
@@ -1750,16 +1766,25 @@ class Controller:
 
         if play_index is not None and play_index < len(commands) - 1:
             remaining_commands = commands[play_index + 1 :]
-            self._wait_for_pause_and_continue_cmd_list_execution(remaining_commands)
+            self._wait_for_pause_and_continue_cmd_list_execution(remaining_commands, generation=generation)
 
-    def _wait_for_pause_and_continue_cmd_list_execution(self, remaining_commands, dt=None):
-        """Wait for machine to be paused, then execute remaining commands"""
+    def _wait_for_pause_and_continue_cmd_list_execution(self, remaining_commands, dt=None, generation=None):
+        """Wait for machine to be paused, then execute remaining commands.
+        Stops without sending them once `generation` is no longer the
+        current resume (its start was cancelled, or a newer resume began)."""
+        if generation is not None and generation != self._resume_generation:
+            return
         if CNC.vars.get("state") == "Pause":
             for cmd in remaining_commands:
                 self.executeCommand(self.escape(cmd))
         else:
             # Not paused yet, check again in 0.1 seconds
-            Clock.schedule_once(partial(self._wait_for_pause_and_continue_cmd_list_execution, remaining_commands), 0.1)
+            Clock.schedule_once(
+                partial(
+                    self._wait_for_pause_and_continue_cmd_list_execution, remaining_commands, generation=generation
+                ),
+                0.1,
+            )
 
     def abortCommand(self):
         self.executeCommand("abort\n")
@@ -2022,6 +2047,7 @@ class Controller:
         self.relayed_tool_table = {}
         self.last_published_file_path = ""
         self.last_published_checksum = b""
+        self.last_job_start_event = None
         self.clearRun()
 
     def _join_stream_io(self):
@@ -2175,6 +2201,7 @@ class Controller:
         self.relayed_tool_table = {}
         self.last_published_file_path = ""
         self.last_published_checksum = b""
+        self.last_job_start_event = None
         CNC.vars["state"] = NOT_CONNECTED
         CNC.vars["color"] = STATECOLOR[CNC.vars["state"]]
 
@@ -2212,6 +2239,7 @@ class Controller:
         self.relayed_tool_table = {}
         self.last_published_file_path = ""
         self.last_published_checksum = b""
+        self.last_job_start_event = None
         # Set a flag to indicate this was a manual disconnection
         self._manual_disconnect = True
         CNC.vars["state"] = NOT_CONNECTED
@@ -2712,7 +2740,7 @@ class Controller:
                     self._clear_continuous_jog_state()
             elif "error" in line.lower() or "alarm" in line.lower():
                 self.log.put((self.MSG_ERROR, line))
-                if line.upper().startswith("ERROR:"):
+                if line.upper().startswith("ERROR:") and not is_job_start_refusal(line):
                     msg = line[len("ERROR:") :].strip()
                     if msg:
                         CNC.vars["alarm_message"] = msg
@@ -2813,7 +2841,11 @@ class Controller:
                 return
             started = decode_play_started_event(message.payload)
             if started is not None:
-                self._on_file_published(started.path)
+                self._on_file_published(started.path, started.checksum, size=started.size, played=True)
+                return
+            job_start = decode_job_start_event(message.payload)
+            if job_start is not None:
+                self._on_job_start(job_start)
                 return
             return
         if message.kind == MessageKind.RELAY:
@@ -3113,7 +3145,7 @@ class Controller:
         self.relayed_tool_table = table
         self._notify_relayed_tool_table(table)
 
-    def _on_file_published(self, path, checksum=b""):
+    def _on_file_published(self, path, checksum=b"", size=None, played=False):
         """An upload-finished or play-started event named `path`. Neither
         kind is distinguished further here -- both mean the same thing to a
         listener: a file a passive controller may not have itself is now on
@@ -3125,10 +3157,50 @@ class Controller:
         truth main.py reads elsewhere. `checksum` is the upload-finished
         event's own digest, or b"" for a play-started event (which never
         carries one) -- passed through so the listener can skip a fetch
-        whose local copy already matches, instead of deciding that here."""
+        whose local copy already matches, instead of deciding that here.
+
+        `played` is True for a play-started event, whose `size` and
+        `checksum` come from firmware that sends them (None and b""
+        otherwise); the listener uses them to draw a local copy with the
+        same content at once."""
         self.last_published_file_path = path
         self.last_published_checksum = checksum
-        self._notify_file_published(path, checksum)
+        self._notify_file_published(path, checksum, size, played)
+
+    def _on_job_start(self, event):
+        """A job-start event (0x68 kind 8): the machine is holding the start
+        of a job until the controllers that take part have loaded its file,
+        or that hold has just ended. Handed to the UI, which draws or
+        fetches the file, reports ready and shows the countdown (main.py's
+        on_job_start_event). A cancelled start also ends a resume-at-line
+        still waiting for its job to pause, so the rest of its commands are
+        never sent into a later job."""
+        self.last_job_start_event = event
+        if event.phase == JOB_START_CANCELLED:
+            self._resume_generation += 1
+        self._notify_job_start(event)
+
+    def send_job_start_ready(self, start_id):
+        """Tell the machine this controller no longer needs it to hold the
+        start `start_id` (frame 0x6C): its file is drawn, or this controller
+        has given up on it. Automatic traffic: no reply, never moves
+        control. Returns False without sending on a connection that is not
+        subscribed."""
+        if not self._status_subscribed() or self.stream is None:
+            return False
+        self._send_raw(encode_job_start_ready(start_id))
+        return True
+
+    @property
+    def machine_holds_starts(self):
+        """True once the machine's hello ack says it holds a job's start
+        until the controllers that take part are ready."""
+        negotiator = self._hello
+        return negotiator is not None and negotiator.machine_holds_starts
+
+    def startNowCommand(self):
+        """Start a held job at once."""
+        self.executeCommand("start-now\n")
 
     def _on_published_line(self, source_id, source_name, text):
         """A command's own text or its reply, published by the machine to
@@ -3191,6 +3263,7 @@ class Controller:
         self.relayed_tool_table = {}
         self.last_published_file_path = ""
         self.last_published_checksum = b""
+        self.last_job_start_event = None
         if self.stream is not None:
             try:
                 self.stream.close()
@@ -3310,7 +3383,7 @@ class Controller:
         if hasattr(root, "update_relayed_tool_table"):
             Clock.schedule_once(lambda dt, t=table: root.update_relayed_tool_table(t), 0)
 
-    def _notify_file_published(self, path, checksum=b""):
+    def _notify_file_published(self, path, checksum=b"", size=None, played=False):
         if App is None or Clock is None:
             return
         app = App.get_running_app()
@@ -3318,7 +3391,22 @@ class Controller:
             return
         root = app.root
         if hasattr(root, "on_passive_file_published"):
-            Clock.schedule_once(lambda dt, p=path, c=checksum: root.on_passive_file_published(p, c), 0)
+            Clock.schedule_once(
+                lambda dt, p=path, c=checksum, s=size, pl=played: root.on_passive_file_published(
+                    p, c, size=s, played=pl
+                ),
+                0,
+            )
+
+    def _notify_job_start(self, event):
+        if App is None or Clock is None:
+            return
+        app = App.get_running_app()
+        if app is None or getattr(app, "root", None) is None:
+            return
+        root = app.root
+        if hasattr(root, "on_job_start_event"):
+            Clock.schedule_once(lambda dt, e=event: root.on_job_start_event(e), 0)
 
     # ----------------------------------------------------------------------
     # thread performing I/O on serial line

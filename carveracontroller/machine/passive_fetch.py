@@ -76,7 +76,9 @@ class PassiveFetchTracker:
     counterpart for a fetch that did not pan out: it keeps the path pending
     for a later retry, but backs off so the retry does not happen on the
     very next tick, and stops retrying automatically after
-    ``MAX_FETCH_ATTEMPTS``.
+    ``MAX_FETCH_ATTEMPTS``. ``note_own_upload`` and ``is_own_upload``
+    recognise the machine's announcement of a file this controller sent
+    itself, which is never fetched back.
     """
 
     _pending_path: str | None = field(default=None, init=False, repr=False)
@@ -85,6 +87,13 @@ class PassiveFetchTracker:
     _failing_path: str | None = field(default=None, init=False, repr=False)
     _fail_count: int = field(default=0, init=False, repr=False)
     _settled_samples: int = field(default=0, init=False, repr=False)
+    # The digest from the most recent upload-finished event that carried
+    # one, and the path it named; see ``checksum_for``.
+    _announced_path: str | None = field(default=None, init=False, repr=False)
+    _announced_checksum: bytes = field(default=b"", init=False, repr=False)
+    # Path on the card -> MD5 (lowercase hex) of the file this controller
+    # itself last sent there; see ``note_own_upload``.
+    _own_uploads: dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
     @property
     def pending_path(self) -> str | None:
@@ -140,6 +149,10 @@ class PassiveFetchTracker:
         -- and, after ``MAX_FETCH_ATTEMPTS`` consecutive failures for this
         same path, stops re-queuing it at all, until a fresh
         ``note_published_file`` (for this path or another) asks again."""
+        if self._pending_path not in (None, path):
+            # A newer file was announced while this fetch ran; that one is
+            # what the machine has now, so it stays queued instead.
+            return
         if path == self._failing_path:
             self._fail_count += 1
         else:
@@ -163,3 +176,83 @@ class PassiveFetchTracker:
         self._retry_after = None
         self._failing_path = None
         self._fail_count = 0
+
+    def mark_fetched(self, path: str) -> None:
+        """Call once a fetch started via ``due_fetch`` has `path` loaded and
+        drawn. Like ``mark_loaded``, except that a different file announced
+        while the fetch ran (and so queued after ``due_fetch`` released
+        this one) stays queued: it is newer than `path`."""
+        if self._pending_path in (None, path):
+            self.mark_loaded(path)
+        else:
+            self._loaded_path = path
+
+    def forget_loaded(self, path: str) -> None:
+        """Call when `path` is no longer drawn (its drawing was removed, or
+        did not match the file on the card), so a later
+        ``note_published_file`` for it queues a fetch again."""
+        if self._loaded_path == path:
+            self._loaded_path = None
+
+    def checksum_for(self, path: str, checksum: bytes) -> bytes:
+        """The digest to check a local copy of `path` against, for an event
+        naming `path` with `checksum` (b"" when the event carries none). An
+        event's own digest is returned as it is and remembered for its
+        path, so a play-started event that follows for the same path, which
+        never carries one of its own, still gets it. b"" when nothing is
+        known. Remembered only for the life of this tracker, which is one
+        connection: uploads made while disconnected are never announced to
+        this controller, so a digest from an earlier connection can be out
+        of date."""
+        if checksum:
+            self._announced_path = path
+            self._announced_checksum = checksum
+            return checksum
+        if path == self._announced_path:
+            return self._announced_checksum
+        return b""
+
+    def note_own_upload(self, path: str, md5_hex: str) -> None:
+        """Call when this controller sends a file to the card, with the
+        path the machine will announce once it is written (see
+        ``published_upload_path``) and the MD5 (hex) this controller
+        announced for it."""
+        if path and md5_hex:
+            self._own_uploads[path] = md5_hex.lower()
+
+    def is_own_upload(self, path: str, checksum: bytes) -> bool:
+        """True when an upload-finished event naming `path` with
+        `checksum` announces bytes this controller sent there itself, so
+        there is nothing to fetch: the machine announces every upload to
+        every identified client, the sender included. Also drops a fetch
+        of `path` still pending from an earlier announcement, since the
+        card now holds this controller's own file under that name.
+
+        Needs the event's own digest: an event without one (play-started,
+        which never carries one) is never taken as this controller's own
+        upload. A digest that differs from the one this controller sent
+        means another client has since written different bytes to the
+        same path: that is a new file, and this controller's own record
+        for the path is forgotten."""
+        own = self._own_uploads.get(path)
+        if own is None or not checksum:
+            return False
+        if checksum.hex() != own:
+            del self._own_uploads[path]
+            return False
+        if self._pending_path == path:
+            self._pending_path = None
+            self._retry_after = None
+        return True
+
+
+def published_upload_path(remote_path: str) -> str:
+    """The path the machine names in its upload-finished event for an
+    upload sent to `remote_path` (the same string the upload command is
+    built from): separators as the upload command sends them, and without
+    the ``.lz`` suffix of a compressed upload, which the machine unpacks
+    under the uncompressed name before announcing it."""
+    path = remote_path.replace("\\", "/")
+    if path.endswith(".lz"):
+        path = path[: -len(".lz")]
+    return path

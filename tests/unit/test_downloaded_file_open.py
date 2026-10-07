@@ -22,6 +22,7 @@ import pytest
 
 import carveracontroller.main as main_module
 from carveracontroller.CNC import CNC
+from carveracontroller.machine.local_copies import LocalCopyStore
 from carveracontroller.main import Makera
 
 # Long enough for any loaded file to show the fault; a hung load is reported
@@ -71,6 +72,8 @@ def _open_host(monkeypatch, main_thread):
 
     root = Makera.__new__(Makera)
     root.load_event = threading.Event()
+    # load_gcode_file and a finished upload remember the file as a local copy.
+    root._local_copies = LocalCopyStore()
     root.load_canceled = False
     root.cnc = CNC()
     root.gcode_viewer = SimpleNamespace(tool_table={}, tool_unit_scale=1.0, load_array=MagicMock())
