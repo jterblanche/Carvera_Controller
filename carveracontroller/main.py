@@ -37,7 +37,7 @@ CONFIG_SET_REPLY_TIMEOUT_S = 3.0
 # regardless of how many automatic attempts have already been spent.
 # Since these queries route through Controller._send_automatic_command
 # (Controller.queryVersion / queryModel), the very first one or two calls
-# can sit queued for up to ACK_TIMEOUT_S (machine/hello.py, ~1s worst case,
+# can sit queued for up to ACK_TIMEOUT_S (machine/hello.py, ~3s worst case,
 # ~70ms typically) if the identify handshake hasn't resolved yet; each
 # still counts as one attempt here, and is sent once the handshake
 # resolves, so this does not change how many times a value is asked for,
@@ -364,7 +364,8 @@ from .GcodeViewer import (
 )
 from .machine.busy_state import machine_is_busy
 from .machine.clients import row_display_text, rows_for_display
-from .machine.identity import load_or_create_identity, set_name
+from .machine.computer_part import computer_part_for_this_process, new_launch_part
+from .machine.identity import load_identity, set_name, with_id
 from .machine.job_start import JobStartAction, JobStartTracker, may_cancel_held_start
 from .machine.local_copies import LocalCopyStore
 from .machine.passive_fetch import PassiveFetchTracker, player_flag, published_upload_path
@@ -441,8 +442,8 @@ def load_halt_translations(tr: translation.Lang):
 
 class _KivyConfigIdentityStore:
     """Adapts machine.identity's IdentityStore protocol onto Kivy's Config,
-    so the controller's random id and display name persist in the same
-    config.ini every other setting lives in."""
+    so the controller's display name persists in the same config.ini every
+    other setting lives in."""
 
     def get(self, key):
         if not Config.has_option("carvera", key):
@@ -454,6 +455,21 @@ class _KivyConfigIdentityStore:
     def set(self, key, value):
         Config.set("carvera", key, value)
         Config.write()
+
+    def remove(self, key):
+        if Config.has_option("carvera", key):
+            Config.remove_option("carvera", key)
+            Config.write()
+
+
+def build_controller_identity(store):
+    """This start's identity: the computer part (from the operating system,
+    the OS user and the copy slot; never stored in the settings), a new
+    launch part, and the display name from the settings. Returns the
+    identity and the computer part, which holds the copy slot for as long as
+    the app runs."""
+    part = computer_part_for_this_process()
+    return load_identity(store, part.id, new_launch_part()), part
 
 
 def app_base_path():
@@ -3214,7 +3230,7 @@ class Makera(RelativeLayout):
 
         self.cnc = CNC()
         self.wcs_names = self.cnc.getWCSNames()
-        self.identity = load_or_create_identity(_KivyConfigIdentityStore())
+        self.identity, self._computer_part = build_controller_identity(_KivyConfigIdentityStore())
         self.controller = Controller(
             self.cnc,
             self.execCallback,
@@ -6509,14 +6525,55 @@ class Makera(RelativeLayout):
         self.show_message_popup(tr._("Cannot connect, machine is busy or not available."), False)
 
     def show_hello_rejected_popup(self, reason, *args):
+        if reason == "duplicate":
+            self._refresh_after_inline_close()
+            self.show_duplicate_identity_popup()
+            return
         if reason == "cap":
             message = tr._("This machine already has the maximum number of controllers connected.")
+        elif reason == "busy":
+            message = tr._("The machine is busy and could not accept this controller. Try connecting again shortly.")
         else:
             message = tr._(
                 "An older controller is connected to this machine. Multiple controllers aren't available until it disconnects."
             )
         self._refresh_after_inline_close()
         self.show_message_popup(message, False)
+
+    def show_duplicate_identity_popup(self):
+        # The machine refused this controller because another one with the
+        # same identity is connected and answered it: almost always a
+        # computer cloned from another. That one keeps its connection.
+        popup = self.confirm_popup
+        popup.reset_layout_defaults()
+        popup.lb_title.text = tr._("Controller identity already in use")
+        popup.lb_content.text = tr._(
+            "Another controller with this computer's identity is already connected. "
+            "This usually means this computer was cloned from another one. "
+            "Close the other copy, or make this a separate controller."
+        )
+        popup.confirm_text = tr._("Make this a separate controller")
+        popup.confirm = self.make_separate_controller
+        popup.cancel = None
+        popup.open(self)
+
+    def make_separate_controller(self, *args):
+        # Adds a random value, kept outside the settings, to this computer's
+        # identity, so it is told apart from the computer it was cloned from
+        # from now on, then connects again.
+        try:
+            self._computer_part = self._computer_part.made_separate()
+        except OSError as e:
+            logger.error(f"Could not make this a separate controller: {e}")
+            self.show_message_popup(
+                tr._("Could not give this controller its own identity: the folder it is kept in cannot be written."),
+                False,
+            )
+            return
+        self.identity = with_id(self.identity, self._computer_part.id)
+        self.controller.identity = self.identity
+        self._job_start.own_id = self.identity.id
+        self.reconnect_last_connection(quiet=False)
 
     def show_peer_closed_popup(self, *args):
         # Shown for a link that was working and then wasn't (see
@@ -9967,7 +10024,9 @@ class Makera(RelativeLayout):
             # set_name trims to the handshake's 31-byte limit and re-persists
             # the (possibly trimmed) value, so Config and the identity object
             # agree even if the settings panel accepted a longer name.
-            self.identity = set_name(_KivyConfigIdentityStore(), self.controller_setting_change_list["controller_name"])
+            self.identity = set_name(
+                _KivyConfigIdentityStore(), self.controller_setting_change_list["controller_name"], self.identity
+            )
             self.controller.identity = self.identity
             App.get_running_app().title = with_controller_name(
                 tr._("Carvera Controller Community") + " v" + __version__, self.identity.name

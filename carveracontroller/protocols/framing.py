@@ -28,7 +28,7 @@ PTYPE_NORMAL_INFO = 0x90
 # machine (hello/hello ack) and ask who else is connected (client-list
 # request/reply). Only the message types this controller actually uses are
 # defined here; the full set of reserved values for this feature runs from
-# 0x60 to 0x6C.
+# 0x60 to 0x6E.
 PTYPE_HELLO = 0x60
 PTYPE_HELLO_ACK = 0x61
 PTYPE_HEARTBEAT = 0x62
@@ -48,6 +48,13 @@ PTYPE_AUTO_COMMAND = 0x6B
 # needs the machine to hold the job start that start_id names (it has the
 # file drawn, or has given up). No reply; never moves control.
 PTYPE_JOB_START_READY = 0x6C
+# Machine to controller, payload number(4): "are you still there?", sent to
+# an identified controller when another hello arrives with its id from a
+# different launch. The controller answers every one at once with a presence
+# reply (0x6E) carrying the same number. No reply means the machine treats
+# the old connection as a leftover and lets the newcomer in.
+PTYPE_PRESENCE_CHECK = 0x6D
+PTYPE_PRESENCE_REPLY = 0x6E
 
 MAX_FRAME_DATA_LENGTH = 8200
 

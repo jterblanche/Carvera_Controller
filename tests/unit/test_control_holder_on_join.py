@@ -37,6 +37,7 @@ import pytest
 import carveracontroller.Controller as controller_module
 from carveracontroller.CNC import CNC
 from carveracontroller.Controller import CONN_WIFI, Controller
+from carveracontroller.machine.hello import ACK_TIMEOUT_S
 from carveracontroller.machine.identity import ControllerIdentity
 from carveracontroller.main import Makera
 from tests.unit.fake_machine import FakeMachine
@@ -295,7 +296,9 @@ def test_old_firmware_leaves_the_control_line_hidden(machine, controller, screen
     m = machine(mode="old")
     controller.open(CONN_WIFI, m.address())
 
-    assert m.wait_until(lambda: controller._hello is not None and controller._hello.resolved, timeout=3.0)
+    assert m.wait_until(
+        lambda: controller._hello is not None and controller._hello.resolved, timeout=ACK_TIMEOUT_S + 2.0
+    )
     time.sleep(0.2)
     clock.run_pending()
     assert root.control_holder_text == ""

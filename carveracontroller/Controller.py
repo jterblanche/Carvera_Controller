@@ -51,8 +51,14 @@ from .protocols import (
     encode_relay,
     encode_tool_table_relay,
 )
-from .protocols.handshake import JOB_START_CANCELLED, JobStartEvent, decode_job_start_event
-from .protocols.makera import encode_job_start_ready
+from .protocols.handshake import (
+    HELLO_BUSY,
+    HELLO_REJECTED_IDENTITY_CONNECTED,
+    JOB_START_CANCELLED,
+    JobStartEvent,
+    decode_job_start_event,
+)
+from .protocols.makera import encode_job_start_ready, encode_presence_reply
 from .USBBulkStream import USBBulkStream, is_usb_bulk_address
 from .USBStream import USBStream
 from .WIFIStream import WIFIStream
@@ -2851,6 +2857,9 @@ class Controller:
         if message.kind == MessageKind.RELAY:
             self._on_relay(message.payload)
             return
+        if message.kind == MessageKind.PRESENCE_CHECK:
+            self._answer_presence_check(message.payload)
+            return
 
         text = message.text or ""
         if message.kind == MessageKind.LOAD_CHUNK:
@@ -2917,6 +2926,11 @@ class Controller:
             frame = negotiator.on_valid_frame(now)
             if frame is not None:
                 self._send_raw(frame)
+        # The same hello again, about a second after the machine answered
+        # that it was busy checking another one (hello-ack result 4).
+        retry = negotiator.due_hello(now)
+        if retry is not None:
+            self._send_raw(retry)
         if negotiator.resolved:
             return
         never_answered = not negotiator.frame_seen
@@ -3029,7 +3043,8 @@ class Controller:
         if ack is None:
             return
         was_resolved = negotiator.resolved
-        newly_identified = negotiator.on_hello_ack(ack)
+        was_refused = negotiator.refusal is not None
+        newly_identified = negotiator.on_hello_ack(ack, time.monotonic())
         if ack.result == HELLO_ACCEPTED:
             self.control_mode = negotiator.mode
         if not was_resolved and negotiator.resolved:
@@ -3039,17 +3054,45 @@ class Controller:
             if self.stream is not None:
                 self._send_raw(encode_client_list_request())
             return
-        if not was_resolved and negotiator.resolution is Resolution.REJECTED:
-            # The machine closes this link shortly after a rejected ack
-            # (cap reached, or an old controller already present) — it was
-            # never going to treat this as a peer. Close it ourselves now,
-            # without starting a reconnect loop against a machine that just
-            # refused us, so the user sees the rejection message rather
-            # than it being overwritten a moment later by a heartbeat-
-            # timeout "connection lost" popup and repeated failed retries.
-            reason = "cap" if ack.result == HELLO_REJECTED_CAP else "old_controller"
-            self._close_inline()
-            self._notify_hello_rejected(reason)
+        if not was_refused:
+            self._close_if_refused(negotiator)
+
+    def _close_if_refused(self, negotiator):
+        """Close the link and say why, once the machine has refused this
+        controller: cap reached, an old controller already present, this
+        identity already connected (result 3, even after the ack wait ran
+        out), or busy for too long (result 4 for BUSY_GIVE_UP_S).
+
+        The machine leaves a refused link unidentified (and closes it soon
+        for results 1 and 2) — it was never going to treat this as a peer.
+        Close it ourselves now, without starting a reconnect loop against a
+        machine that just refused us, so the user sees the rejection
+        message rather than it being overwritten a moment later by a
+        heartbeat-timeout "connection lost" popup and repeated failed
+        retries."""
+        refusal = negotiator.refusal
+        if refusal is None:
+            return
+        if refusal == HELLO_REJECTED_CAP:
+            reason = "cap"
+        elif refusal == HELLO_REJECTED_IDENTITY_CONNECTED:
+            reason = "duplicate"
+        elif refusal == HELLO_BUSY:
+            reason = "busy"
+        else:
+            reason = "old_controller"
+        self._close_inline()
+        self._notify_hello_rejected(reason)
+
+    def _answer_presence_check(self, payload):
+        """Answer the machine's "are you still there" (0x6D) at once, with
+        its number, on this link. Called on the thread that read it, never
+        through the screen, so a busy screen cannot make a live controller
+        look gone. Unconditional: a running controller is always there. A
+        check too short to carry its number is dropped."""
+        if len(payload) < 4 or self.stream is None:
+            return
+        self._send_raw(encode_presence_reply(payload[:4]))
 
     def _on_client_list(self, payload):
         """A client-list reply (requested on identify, and again on every

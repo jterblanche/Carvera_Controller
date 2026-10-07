@@ -29,6 +29,9 @@ class MessageKind(Enum):
     # protocols/relay.py for what this controller puts inside one.
     # source_id carries who sent it; payload is the opaque relay bytes.
     RELAY = auto()
+    # The machine's presence check (0x6D); payload is its number and
+    # whatever follows it. Answered by the reading thread itself.
+    PRESENCE_CHECK = auto()
 
 
 @dataclass(frozen=True)

@@ -11,6 +11,7 @@ import pytest
 
 from carveracontroller.CNC import CNC
 from carveracontroller.Controller import CONN_WIFI, Controller
+from carveracontroller.machine.hello import ACK_TIMEOUT_S
 from carveracontroller.machine.identity import ControllerIdentity
 from carveracontroller.machine.presence import PresenceAnnouncement, presence_announcement
 from carveracontroller.protocols.handshake import ClientPresenceChanged
@@ -154,7 +155,9 @@ def test_old_firmware_announces_nothing(machine, controller):
     # nothing goes wrong.
     m = machine(mode="old")
     controller.open(CONN_WIFI, m.address())
-    assert m.wait_until(lambda: controller._hello is not None and controller._hello.resolved)
+    assert m.wait_until(
+        lambda: controller._hello is not None and controller._hello.resolved, timeout=ACK_TIMEOUT_S + 2.0
+    )
 
     assert controller._status_subscribed() is False
     assert controller.last_presence_announcement is None
