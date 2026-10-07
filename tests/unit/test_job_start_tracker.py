@@ -12,8 +12,10 @@ from carveracontroller.machine.job_start import (
 )
 from carveracontroller.protocols.handshake import (
     JOB_START_CANCELLED,
+    JOB_START_HASHING,
     JOB_START_REASON_ABORT,
     JOB_START_REASON_ALL_READY,
+    JOB_START_REASON_START_NOW,
     JOB_START_REASON_WAITING,
     JOB_START_STARTING,
     JOB_START_WAITING,
@@ -180,3 +182,61 @@ def test_a_new_start_forgets_earlier_failures():
     t.on_event(_event(start_id=7), now=0.0)
     t.give_up(7)
     assert t.on_event(_event(start_id=8), now=1.0) is JobStartAction.PREPARE
+
+
+# -- the machine checking the file first ---------------------------------------
+
+
+def _hashing(**kw):
+    return _event(phase=JOB_START_HASHING, seconds_left=0, checksum=b"", **kw)
+
+
+def test_hashing_holds_the_start_but_asks_nothing():
+    """While the machine computes the file's MD5 there is nothing to compare
+    a copy with: nothing is drawn, fetched or sent, and there is no
+    countdown yet."""
+    t = JobStartTracker(own_id=ME)
+    assert t.on_event(_hashing(), now=0.0) is JobStartAction.NONE
+    assert t.held
+    assert t.hashing
+    assert t.seconds_left(0.0) == 0
+    assert t.on_event(_hashing(), now=1.0) is JobStartAction.NONE
+
+
+def test_the_first_waiting_event_after_hashing_starts_the_countdown_and_asks_to_prepare():
+    t = JobStartTracker(own_id=ME)
+    t.on_event(_hashing(), now=0.0)
+    assert t.on_event(_event(seconds_left=30), now=12.0) is JobStartAction.PREPARE
+    assert not t.hashing
+    assert t.seconds_left(12.0) == 30
+    t.begin_preparing(7)
+    assert t.prepared(7) is True
+
+
+def test_the_starter_is_shown_as_starter_while_hashing():
+    t = JobStartTracker(own_id=STARTER)
+    assert t.on_event(_hashing(not_ready_ids=(ME,)), now=0.0) is JobStartAction.NONE
+    assert t.is_starter
+    assert t.hashing
+
+
+def test_starting_or_cancelled_straight_from_hashing_ends_the_hold():
+    for phase, reason in (
+        (JOB_START_STARTING, JOB_START_REASON_START_NOW),
+        (JOB_START_CANCELLED, JOB_START_REASON_ABORT),
+    ):
+        t = JobStartTracker(own_id=ME)
+        t.on_event(_hashing(), now=0.0)
+        ended = _event(phase=phase, reason=reason, seconds_left=0, checksum=b"")
+        assert t.on_event(ended, now=5.0) is JobStartAction.NONE
+        assert not t.held
+        assert not t.hashing
+
+
+def test_a_hashing_hold_whose_events_stop_is_dropped():
+    """Hashing events come once a second; a hold that hears nothing more
+    for well past that is dropped as for a lost end."""
+    t = JobStartTracker(own_id=ME)
+    t.on_event(_hashing(), now=100.0)
+    assert not t.stale(100.0 + STALE_AFTER_LIMIT_S)
+    assert t.stale(100.0 + STALE_AFTER_LIMIT_S + 1)

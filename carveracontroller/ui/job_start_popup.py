@@ -1,8 +1,9 @@
 """The countdown shown while the machine holds a job's start, and the texts
 for how a held start ended.
 
-Every connected controller shows the countdown. Only the controller that
-started the job gets the Start now and Cancel buttons.
+Every connected controller shows the countdown, and before it that the
+machine is checking the file. Only the controller that started the job
+gets the Start now and Cancel buttons, in both.
 """
 
 from __future__ import annotations
@@ -44,6 +45,18 @@ def countdown_text(path: str, seconds_left: int, waiting_for: Iterable[str], is_
         lines.append(tr._("Press Start now to start at once, or Cancel to stop the job from starting."))
     else:
         lines.append(tr._("The machine will start moving when the countdown ends."))
+    return "\n\n".join(lines)
+
+
+def checking_text(path: str, is_starter: bool) -> str:
+    """The text while the machine computes the file's MD5 before the
+    countdown: which file, and that the countdown follows."""
+    lines = [
+        tr._("Checking {} before the start.").format(_file_name(path)),
+        tr._("The machine is reading the file. The countdown begins once it has been checked."),
+    ]
+    if is_starter:
+        lines.append(tr._("Press Start now to start at once, or Cancel to stop the job from starting."))
     return "\n\n".join(lines)
 
 

@@ -34,6 +34,7 @@ from carveracontroller.protocols.handshake import (
     EVENT_KIND_PLAY_STARTED,
     HELLO_ACCEPTED,
     JOB_START_CANCELLED,
+    JOB_START_HASHING,
     JOB_START_REASON_ABORT,
     JOB_START_REASON_ALL_READY,
     JOB_START_REASON_HALT,
@@ -666,6 +667,147 @@ def test_a_fetch_failing_after_the_job_started_shows_it_without_toolpath(tmp_pat
     root.controller.send_job_start_ready.assert_not_called()
     assert root._job_without_toolpath == PATH
     assert root._passive_fetch.pending_path == PATH
+
+
+# -- the machine checking the file first ---------------------------------------
+
+
+def _hashing(**kw):
+    return _event(phase=JOB_START_HASHING, seconds_left=0, checksum=b"", **kw)
+
+
+def test_hashing_then_waiting_then_ready(tmp_path, app):
+    """While the machine computes the file's MD5, every controller shows
+    that it is checking the file, with no countdown, and nothing is drawn,
+    fetched or sent. The first waiting event carries the MD5: the file is
+    fetched, drawn and checked, the countdown starts, and ready follows."""
+    root = _host(tmp_path)
+
+    Makera.on_job_start_event(root, _hashing())
+    Makera.on_job_start_event(root, _hashing())
+
+    popup = root._job_start_popup
+    assert popup.showing
+    assert popup.buttons[-1] is False
+    assert "Checking" in popup.texts[-1]
+    assert "air-test-long.nc" in popup.texts[-1]
+    assert " s." not in popup.texts[-1]  # no countdown yet
+    root.doDownload.assert_not_called()
+    root.load_gcode_file.assert_not_called()
+    root.controller.send_job_start_ready.assert_not_called()
+    assert app.selected_remote_filename == "/sd/gcodes/spindle-test.nc"
+    assert root._passive_fetch.pending_path is None
+
+    Makera.on_job_start_event(root, _event(seconds_left=30))
+
+    root.doDownload.assert_called_once()
+    root.load_gcode_file.assert_called_once()
+    root.controller.send_job_start_ready.assert_called_once_with(7)
+    assert "30" in popup.texts[-1]
+    assert "Checking" not in popup.texts[-1]
+
+
+def test_a_local_copy_is_drawn_only_once_the_md5_is_known(tmp_path, app):
+    root = _host(tmp_path)
+    root._local_copies.remember(_local_copy(tmp_path))
+
+    Makera.on_job_start_event(root, _hashing())
+    root.load_gcode_file.assert_not_called()
+
+    Makera.on_job_start_event(root, _event(seconds_left=30))
+    root.load_gcode_file.assert_called_once()
+    root.doDownload.assert_not_called()
+    root.controller.send_job_start_ready.assert_called_once_with(7)
+
+
+def test_hashing_straight_to_starting_shows_the_job_without_its_toolpath(tmp_path, app):
+    """The job started while the machine was still checking the file (here
+    by Start now): there is no MD5 to check a copy with, so the job is
+    shown by name and progress with "toolpath not loaded", the other
+    file's drawing is removed, nothing is fetched while it plays, and the
+    file is fetched after it. Play-started for such a start carries no
+    checksum."""
+    root = _host(tmp_path)
+    root._local_copies.remember(_local_copy(tmp_path))
+    Makera.on_job_start_event(root, _hashing())
+
+    Makera.on_job_start_event(
+        root,
+        _event(phase=JOB_START_STARTING, reason=JOB_START_REASON_START_NOW, seconds_left=0, checksum=b""),
+    )
+    app.playing = True
+    CNC.vars["is_playing"] = 1
+    Makera.on_passive_file_published(root, PATH, b"", size=SIZE, played=True)
+
+    assert not root._job_start_popup.showing
+    assert not root._job_start.held
+    root.controller.send_job_start_ready.assert_not_called()
+    root.doDownload.assert_not_called()
+    root.load_gcode_file.assert_not_called()
+    assert root._job_without_toolpath == PATH
+    assert app.selected_remote_filename == ""
+    root.clear_selection.assert_called()
+    assert root._passive_fetch.pending_path == PATH
+    assert any("Demo" in text for text in _logged(root))
+
+
+def test_hashing_straight_to_cancelled_closes_the_check_and_says_why(tmp_path, app):
+    root = _host(tmp_path)
+    Makera.on_job_start_event(root, _hashing())
+
+    Makera.on_job_start_event(
+        root,
+        _event(phase=JOB_START_CANCELLED, reason=JOB_START_REASON_ABORT, seconds_left=0, checksum=b"", not_ready=()),
+    )
+
+    assert not root._job_start_popup.showing
+    assert not root._job_start.held
+    message = root.show_message_popup.call_args.args[0]
+    assert "air-test-long.nc" in message
+    assert "cancelled from a controller" in message
+    root.doDownload.assert_not_called()
+    root.controller.send_job_start_ready.assert_not_called()
+    assert root._job_without_toolpath is None
+    assert app.selected_remote_filename == "/sd/gcodes/spindle-test.nc"
+
+
+class _PopupWithButtons(_FakePopup):
+    made: list = []
+
+    def __init__(self, on_start_now, on_cancel):
+        super().__init__()
+        self.on_start_now = on_start_now
+        self.on_cancel = on_cancel
+        _PopupWithButtons.made.append(self)
+
+
+def test_start_now_during_hashing(tmp_path, app, monkeypatch):
+    """The starter gets Start now and Cancel while the machine is still
+    checking the file. Start now sends start-now; the start that follows
+    straight from hashing leaves the starter's own drawing alone."""
+    _PopupWithButtons.made = []
+    monkeypatch.setattr("carveracontroller.main.JobStartPopup", _PopupWithButtons)
+    root = _host(tmp_path, own_id=PC, has_control=True)
+    root._job_start_popup = None
+
+    Makera.on_job_start_event(root, _hashing(not_ready=(DEMO,)))
+
+    popup = _PopupWithButtons.made[0]
+    assert popup.buttons == [True]
+    assert "Checking" in popup.texts[-1]
+    assert "Start now" in popup.texts[-1]
+    popup.on_start_now()
+    root.controller.startNowCommand.assert_called_once_with()
+
+    Makera.on_job_start_event(
+        root,
+        _event(phase=JOB_START_STARTING, reason=JOB_START_REASON_START_NOW, seconds_left=0, checksum=b""),
+    )
+
+    assert not popup.showing
+    assert root._job_without_toolpath is None
+    assert app.selected_remote_filename == "/sd/gcodes/spindle-test.nc"
+    assert any("without waiting for" in text and "Demo" in text for text in _logged(root))
 
 
 def test_disconnecting_forgets_the_hold(tmp_path, app):

@@ -2,13 +2,17 @@
 
 A machine that holds starts (bit 0 of the hello ack's features byte) does
 not start a job at once while other controllers that take part are
-connected. It announces the job with a job-start event (``0x68`` kind 8)
-in phase "waiting", once when the hold begins and then once a second, and
+connected. It first computes the file's MD5, announcing the job with a
+job-start event (``0x68`` kind 8) in phase "hashing" once a second; that
+event has no checksum and no time left, so there is nothing to compare a
+copy with yet and no countdown. Then it announces phase "waiting", with
+the MD5 and the whole time limit, once and then once a second, and
 starts when every listed controller has said it is ready (frame ``0x6C``),
 when its time limit runs out, or when the starting controller sends
 ``start-now``. The starting controller can also cancel with ``abort``, and
 the hold is cancelled if it disconnects or the machine halts. The event
-then says "starting" or "cancelled" once.
+then says "starting" or "cancelled" once. Those can also come straight
+after hashing (Start now, a cancel, or every awaited controller gone).
 
 This tracker turns those events into what this controller has to do:
 
@@ -38,7 +42,7 @@ import math
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
-from ..protocols.handshake import JOB_START_WAITING, JobStartEvent
+from ..protocols.handshake import JOB_START_HASHING, JOB_START_WAITING, JobStartEvent
 
 # The wait after a failed attempt before the next one: doubled after each
 # failure of the same start, up to the maximum.
@@ -87,6 +91,12 @@ class JobStartTracker:
         return self._event
 
     @property
+    def hashing(self) -> bool:
+        """True while a start is held and the machine is still computing
+        the file's MD5: no countdown yet, and nothing to prepare."""
+        return self._event is not None and self._event.phase == JOB_START_HASHING
+
+    @property
     def ready_sent(self) -> bool:
         """True while a start is held for which this controller has sent
         ready."""
@@ -99,9 +109,10 @@ class JobStartTracker:
 
     def on_event(self, event: JobStartEvent, now: float) -> JobStartAction:
         """Take a job-start event. A "starting" or "cancelled" event ends
-        the hold. A waiting event updates the countdown and says what to do
-        (see the module docstring)."""
-        if event.phase != JOB_START_WAITING:
+        the hold. A hashing event holds it but asks nothing. A waiting event
+        updates the countdown and says what to do (see the module
+        docstring)."""
+        if event.phase not in (JOB_START_WAITING, JOB_START_HASHING):
             self.clear()
             return JobStartAction.NONE
         if self._event is None or self._event.start_id != event.start_id:
@@ -111,6 +122,8 @@ class JobStartTracker:
             self._retry_after = 0.0
         self._event = event
         self._deadline = now + event.seconds_left
+        if event.phase == JOB_START_HASHING:
+            return JobStartAction.NONE
         if event.starter_id == self.own_id or self.own_id not in event.not_ready_ids:
             return JobStartAction.NONE
         if self._ready_for == event.start_id:

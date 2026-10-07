@@ -38,10 +38,15 @@ EVENT_KIND_CLIENT_JOINED = 6
 EVENT_KIND_CLIENT_LEFT = 7
 EVENT_KIND_JOB_START = 8
 
-# Job-start event `phase` values.
+# Job-start event `phase` values. Hashing comes first, while the machine
+# computes the file's MD5: it carries the size but no checksum and no time
+# left, and the first waiting event that follows carries the MD5 and starts
+# the time limit. Starting or cancelled can also follow hashing directly,
+# then with no checksum.
 JOB_START_WAITING = 0
 JOB_START_STARTING = 1
 JOB_START_CANCELLED = 2
+JOB_START_HASHING = 3
 
 # Job-start event `reason` values: 0 with phase waiting; 1 to 3 with phase
 # starting; 4 to 6 with phase cancelled.
@@ -236,8 +241,8 @@ def decode_play_started_event(payload: bytes) -> PlayStarted | None:
 class JobStartEvent:
     """One `0x68` event, kind `EVENT_KIND_JOB_START`: the machine is holding
     the start of a job until the controllers that take part are ready
-    (``phase`` waiting), or the hold has just ended (starting or cancelled,
-    with the ``reason``). ``path``, ``size`` and ``checksum`` name the file,
+    (``phase`` hashing while it computes the file's MD5, then waiting), or
+    the hold has just ended (starting or cancelled, with the ``reason``). ``path``, ``size`` and ``checksum`` name the file,
     as play-started will. ``start_id`` (never 0) is what a ready frame
     answers; ``seconds_left`` is the time to the machine's limit while
     waiting; ``starter_id`` is the controller that started the job, and

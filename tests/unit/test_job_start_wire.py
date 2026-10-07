@@ -15,6 +15,7 @@ from carveracontroller.protocols.handshake import (
     HELLO_ACCEPTED,
     HELLO_FEATURE_JOB_START_WAIT,
     JOB_START_CANCELLED,
+    JOB_START_HASHING,
     JOB_START_REASON_STARTER_LEFT,
     JOB_START_REASON_WAITING,
     JOB_START_WAITING,
@@ -195,6 +196,18 @@ def test_job_start_event_cancelled():
     assert event is not None
     assert event.phase == JOB_START_CANCELLED
     assert event.reason == JOB_START_REASON_STARTER_LEFT
+
+
+def test_job_start_event_hashing_carries_the_size_and_no_checksum():
+    """While the machine computes the file's MD5 at a held start, its
+    events say so (phase 3), with the file's size and no checksum yet."""
+    event = decode_job_start_event(job_start_payload(phase=JOB_START_HASHING, md5=None, seconds_left=0))
+    assert event is not None
+    assert event.phase == JOB_START_HASHING == 3
+    assert event.size == 6
+    assert event.checksum == b""
+    assert event.seconds_left == 0
+    assert event.not_ready_ids == (0x2222,)
 
 
 def test_job_start_event_with_start_id_zero_is_dropped():
