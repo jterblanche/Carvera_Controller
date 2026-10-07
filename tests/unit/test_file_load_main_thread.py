@@ -163,3 +163,82 @@ def test_load_called_on_the_main_thread_still_resets_stock_before_load_end(monke
     assert guard.off_main() == []
     names = guard.names()
     assert names.index("viewer.set_stock") < names.index("load_end")
+
+
+def _drain(scheduled):
+    """Run every queued callback, including any they queue, on this thread."""
+    while True:
+        try:
+            callback = scheduled.get_nowait()
+        except queue.Empty:
+            return
+        callback(0)
+
+
+def _fail_fast_host(monkeypatch, guard, scheduled):
+    root = _load_host(monkeypatch, guard, scheduled)
+    root._mark_gcode_cannot_visualise = guard.wrap("_mark_gcode_cannot_visualise")
+
+    def load_start(*_args):
+        guard.calls.append(("load_start", threading.get_ident() == guard.main_ident))
+        root.loading_file = True
+
+    root.load_start = load_start
+    root.loading_file = False
+    return root
+
+
+def _fail_before_main_thread_runs(root, scheduled, path):
+    """The worker finishes (fails) before the main thread runs anything it
+    scheduled, then the main thread catches up."""
+    worker = _load_on_worker(root, path)
+    worker.join(timeout=LOAD_TIMEOUT_S)
+    assert not worker.is_alive()
+    _drain(scheduled)
+
+
+def test_load_that_fails_at_once_does_not_leave_loading_file_set(monkeypatch, tmp_path):
+    guard = _Guard()
+    scheduled = queue.Queue()
+    root = _fail_fast_host(monkeypatch, guard, scheduled)
+
+    _fail_before_main_thread_runs(root, scheduled, str(tmp_path / "missing.nc"))
+
+    assert "load_error" in guard.names()
+    assert root.loading_file is False
+
+
+def test_load_whose_decompress_fails_does_not_leave_loading_file_set(monkeypatch, tmp_path):
+    guard = _Guard()
+    scheduled = queue.Queue()
+    root = _fail_fast_host(monkeypatch, guard, scheduled)
+    path = tmp_path / "broken.nc"
+    path.write_bytes(b"\x00\x00not a quicklz stream")  # the QuickLZ magic, then nothing valid
+
+    _fail_before_main_thread_runs(root, scheduled, str(path))
+
+    assert "load_start" in guard.names()
+    assert root.loading_file is False
+
+
+def test_failed_reload_of_the_loaded_file_does_not_offer_resume_from_old_lines(monkeypatch, tmp_path):
+    """The file was loaded once; loading it again fails at the decompress, so
+    self.lines still holds the earlier copy. Resume at line must not be
+    offered against those lines."""
+    guard = _Guard()
+    scheduled = queue.Queue()
+    root = _fail_fast_host(monkeypatch, guard, scheduled)
+    path = tmp_path / "job.nc"
+    app = SimpleNamespace(
+        total_pages=0, curr_page=1, selected_remote_filename="/sd/gcodes/job.nc", selected_local_filename=str(path)
+    )
+    monkeypatch.setattr("carveracontroller.main.App.get_running_app", lambda: app)
+    root.lines = ["G21\n", "G1 X1 F100\n"]
+    root.selected_file_line_count = 2
+    root._last_loaded_file_key = "/sd/gcodes/job.nc"
+    path.write_bytes(b"\x00\x00not a quicklz stream")
+
+    _fail_before_main_thread_runs(root, scheduled, str(path))
+
+    assert root.loading_file is False
+    assert root._resume_gcode_lines_available() is False

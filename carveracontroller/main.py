@@ -9809,6 +9809,18 @@ class Makera(RelativeLayout):
         self.gcode_cannot_visualise = True
 
     # ------------------------------------------------------------------------
+    def _end_failed_load(self, *args):
+        """Clear loading_file on the main thread for a load_gcode_file that
+        stopped without reaching load_end. load_start, which sets it, runs
+        through the same Clock and was scheduled first, so a failure that
+        happens before load_start has run cannot be undone by it.
+
+        The file did not load, so it is also no longer the loaded file for
+        resume at line: self.lines may still hold an earlier copy of it."""
+        self.loading_file = False
+        self._last_loaded_file_key = None
+
+    # ------------------------------------------------------------------------
     def load_error(self, error_msg, *args):
         self._clear_tool_change_markers()
         self.progress_popup.dismiss()
@@ -9933,8 +9945,10 @@ class Makera(RelativeLayout):
                 lzpath = lzpath + ".lz"
                 shutil.copyfile(filepath, lzpath)
                 if not self.decompress_file(lzpath, filepath):
+                    Clock.schedule_once(self._end_failed_load, 0)
                     return
                 if not self._verify_deferred_download_md5(filepath):
+                    Clock.schedule_once(self._end_failed_load, 0)
                     return
 
             # Load all lines from the file
@@ -10002,7 +10016,7 @@ class Makera(RelativeLayout):
         except Exception:
             logger.error(sys.exc_info()[1])
             self.heartbeat_time = time.time()
-            self.loading_file = False
+            Clock.schedule_once(self._end_failed_load, 0)
             if f:
                 f.close()
             Clock.schedule_once(self._mark_gcode_cannot_visualise, 0)
