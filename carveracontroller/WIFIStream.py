@@ -123,9 +123,10 @@ class WIFIStream:
 
     # ----------------------------------------------------------------------
     def send(self, data):
+        sent = self.socket.send(data)
         if self.log_sent_receive:
-            logger.debug(f"SENT: {data}")
-        self.socket.send(data)
+            # One line per write, holding exactly the bytes the socket took.
+            logger.debug("SENT: %r", data[:sent])
 
     # ----------------------------------------------------------------------
     def recv(self):

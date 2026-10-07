@@ -1,4 +1,6 @@
+import errno
 import logging
+import re
 import time
 
 import serial
@@ -9,6 +11,45 @@ from .XMODEM import XMODEM
 logger = logging.getLogger(__name__)
 
 SERIAL_TIMEOUT = 0.3  # s
+
+# How pyserial reports that the USB device behind an already open port has
+# gone away (cable unplugged, machine powered off). This only describes
+# failures on an open port: the same Windows "Access is denied" from
+# opening a port means another program holds it, which is a real error.
+#
+# Windows (serialwin32) raises SerialException("<call> failed (<repr of
+# ctypes.WinError()>)"), so only the text survives. The Windows error code
+# is the last number in it; the message before it is localised.
+#   5     ERROR_ACCESS_DENIED, what ClearCommError returns once the cable is out
+#   22    ERROR_BAD_COMMAND, "The device does not recognize the command"
+#   31    ERROR_GEN_FAILURE, "A device attached to the system is not functioning"
+#   1167  ERROR_DEVICE_NOT_CONNECTED
+_WINDOWS_CALL_FAILED = re.compile(r"^(?:ClearCommError|ReadFile|WriteFile|GetOverlappedResult) failed \(.*, (\d+)\)\)$")
+_WINDOWS_DEVICE_GONE = frozenset({5, 22, 31, 1167})
+# Linux and macOS (serialposix): in_waiting is a TIOCINQ query that raises
+# OSError as it is; read() and write() wrap it as "read failed: [Errno n]
+# ..." or "write failed: [Errno n] ...". A tty whose device has gone
+# answers EIO (Linux) or ENXIO (macOS), and ENODEV once the node is gone.
+_POSIX_CALL_FAILED = re.compile(r"^(?:read|write) failed: \[Errno (\d+)\]")
+_POSIX_DEVICE_GONE = frozenset({errno.EIO, errno.ENXIO, errno.ENODEV})
+# serialposix read() when select() reports the port readable but read()
+# returns nothing, which is what a tty does once its device has gone.
+_NO_DATA_WHEN_READY = "device reports readiness to read but returned no data"
+
+
+def is_device_gone(exc):
+    """True when exc is pyserial reporting that the device behind an open
+    port has gone away, False for any other failure."""
+    if isinstance(exc, serial.SerialException):
+        text = str(exc)
+        if text.startswith(_NO_DATA_WHEN_READY):
+            return True
+        match = _WINDOWS_CALL_FAILED.match(text)
+        if match:
+            return int(match.group(1)) in _WINDOWS_DEVICE_GONE
+        match = _POSIX_CALL_FAILED.match(text)
+        return bool(match) and int(match.group(1)) in _POSIX_DEVICE_GONE
+    return isinstance(exc, OSError) and exc.errno in _POSIX_DEVICE_GONE
 
 
 # ==============================================================================
@@ -25,7 +66,6 @@ class USBStream:
         # Rely on the app/Kivy root logger; do not attach extra StreamHandlers to
         # the shared "xmodem.XMODEM" logger (USB+WiFi would duplicate every line).
         self.log_sent_receive = log_sent_receive
-        self._send_log_buffer = b""
         self._recv_log_buffer = b""
         # Set by Controller when the communication protocol is selected.
         self.uses_framed_transfer = False
@@ -40,22 +80,12 @@ class USBStream:
             self.serial.write(data)
         except serial.SerialException as exc:
             self._fail(exc)
+            if is_device_gone(exc):
+                return
             raise PeerClosedError(str(exc)) from exc
-        if not self.log_sent_receive:
-            return
-        if data == b"?":
-            logger.debug("SENT: ?")
-            return
-        self._send_log_buffer += data
-        while b"\n" in self._send_log_buffer:
-            idx = self._send_log_buffer.index(b"\n") + 1
-            line = self._send_log_buffer[:idx]
-            self._send_log_buffer = self._send_log_buffer[idx:]
-            line_str = line.decode("utf-8", errors="replace").rstrip("\r\n")
-            logger.debug("SENT: %s", line_str)
-        if len(self._send_log_buffer) > 4096:
-            logger.debug("SENT: <%d bytes (no newline)>", len(self._send_log_buffer))
-            self._send_log_buffer = b""
+        if self.log_sent_receive:
+            # One line per write, holding exactly the bytes just written.
+            logger.debug("SENT: %r", data)
 
     # ----------------------------------------------------------------------
     def recv(self):
@@ -65,6 +95,8 @@ class USBStream:
             data = self.serial.read()
         except serial.SerialException as exc:
             self._fail(exc)
+            if is_device_gone(exc):
+                return b""
             raise PeerClosedError(str(exc)) from exc
         if self.log_sent_receive and data:
             self._recv_log_buffer += data
@@ -121,7 +153,6 @@ class USBStream:
         baud = int(baud)
         old = self.serial
         self.serial = None
-        self._send_log_buffer = b""
         self._recv_log_buffer = b""
         if old is not None:
             try:
@@ -174,15 +205,23 @@ class USBStream:
         """Tear down a serial port that just proved it's gone (read or
         write raised), without close()'s deliberate 0.5s settle delay —
         that delay is for an intentional close, and only slows down
-        reporting a link that has already failed."""
-        logger.error("USB link failed: %s", exc)
+        reporting a link that has already failed.
+
+        A device that went away is an ordinary disconnect, not an error:
+        the caller reports nothing to read or send, no status arrives, and
+        the app's connection-lost check reports it and offers to reconnect
+        as for any other lost link. Its exception is kept in the debug log
+        only."""
+        if is_device_gone(exc):
+            logger.debug("USB device gone: %s", exc)
+        else:
+            logger.error("USB link failed: %s", exc)
         if self.serial is not None:
             try:
                 self.serial.close()
             except Exception:
                 pass
         self.serial = None
-        self._send_log_buffer = b""
         self._recv_log_buffer = b""
 
     # ----------------------------------------------------------------------
@@ -196,7 +235,6 @@ class USBStream:
         except:
             pass
         self.serial = None
-        self._send_log_buffer = b""
         self._recv_log_buffer = b""
         return True
 
@@ -210,7 +248,15 @@ class USBStream:
     def waiting_for_recv(self):
         if self.serial is None:
             return 0
-        return self.serial.in_waiting
+        try:
+            return self.serial.in_waiting
+        except OSError as exc:
+            # serial.SerialException is an OSError too. Any other failure
+            # is raised unchanged for the caller to report.
+            if not is_device_gone(exc):
+                raise
+            self._fail(exc)
+            return 0
 
     # ----------------------------------------------------------------------
     def getc(self, size, timeout=1):

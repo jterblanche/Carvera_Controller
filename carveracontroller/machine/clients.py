@@ -7,7 +7,7 @@ Kivy-free and framework-agnostic so it is testable without any UI.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from ..protocols.handshake import ClientEntry
 
@@ -75,3 +75,13 @@ def holder_from_client_list(entries: tuple[ClientEntry, ...]) -> tuple[int, str]
         if entry.has_control:
             return entry.id, entry.name
     return 0, ""
+
+
+def entries_with_holder(entries: tuple[ClientEntry, ...], holder_id: int) -> tuple[ClientEntry, ...]:
+    """The same client list with ``has_control`` true on the entry whose id
+    is ``holder_id`` and false on every other one. ``holder_id`` 0 (the
+    machine's "nobody holds control") or an id not in the list leaves no
+    entry marked. Used when a control-changed event arrives: the machine
+    sends no new client list then, so the marks from the last one would
+    otherwise keep naming the previous holder."""
+    return tuple(replace(entry, has_control=holder_id != 0 and entry.id == holder_id) for entry in entries)

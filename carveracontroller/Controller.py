@@ -20,7 +20,7 @@ from functools import partial
 
 from . import Utils
 from .CNC import CMDPAT, CNC, LASER_TOOL_NUMBER, PARENPAT, SEMIPAT, ZPROBE_TOOL_NUMBER
-from .machine.clients import holder_from_client_list
+from .machine.clients import entries_with_holder, holder_from_client_list
 from .machine.control_refusal import is_control_refusal, is_job_start_refusal
 from .machine.heartbeat import heartbeat_due
 from .machine.hello import HelloNegotiator, Resolution
@@ -221,7 +221,9 @@ class Controller:
         # command) or 1 (file transfer start), matching the automatic-
         # command wrapper's `kind` field.
         self._reset_pending_sends()
-        # The other controllers currently connected, from the last client-list reply.
+        # The other controllers currently connected, from the last client-list
+        # reply, with each entry's has_control kept in step with control-changed
+        # events (see _on_control_changed).
         self.connected_clients: tuple[ClientEntry, ...] = ()
         # Who holds control right now: kept in step with the last
         # control-changed event (the machine's `0x68` event frame, kind 5)
@@ -239,6 +241,13 @@ class Controller:
         # Single-user until an ack says otherwise -- the same starting point
         # as control_holder_id/control_holder_name above.
         self.control_mode: int = HELLO_MODE_SINGLE_USER
+        # Whether the screen has been told who holds control on this
+        # connection yet. Cleared on every identify, set by
+        # _on_control_changed. A connection starts at 0 / "" above, which is
+        # also what a client list says when nobody holds control, so the
+        # first client list on a connection must be applied even when it
+        # agrees with that starting state (see _on_client_list).
+        self._control_holder_shown: bool = False
         # The most recent tool-table summary relayed by another identified
         # client (protocols/relay.py) — tool_number -> a short display
         # text. Lets a passive controller show a sensible tool name at a
@@ -2956,6 +2965,14 @@ class Controller:
         return self._status_subscribed() and self.control_mode == HELLO_MODE_MULTI_USER
 
     @property
+    def control_mode_reported(self):
+        """True once an accepted hello ack has reported the machine's running
+        mode, single-user or multi-user (see multi_user_mode). False while
+        the handshake is unresolved and always on old firmware, which has no
+        modes at all."""
+        return self._status_subscribed()
+
+    @property
     def can_write_machine_settings(self):
         """False only while a config write from here would be refused: on a
         machine in multi-user mode, while another controller holds control.
@@ -3018,6 +3035,7 @@ class Controller:
         if not was_resolved and negotiator.resolved:
             self._flush_pending_sends()
         if newly_identified:
+            self._control_holder_shown = False
             if self.stream is not None:
                 self._send_raw(encode_client_list_request())
             return
@@ -3042,12 +3060,19 @@ class Controller:
         never gets a control-changed event for it, so this is the only way
         it learns who already holds control -- derived here and, when it
         differs from what this controller already believes, applied through
-        _on_control_changed, exactly as a control-changed event would. A
-        list that agrees with the current state changes nothing."""
+        _on_control_changed, exactly as a control-changed event would. The
+        first list on a connection is always applied, even when it agrees
+        with the starting "nobody" state, so the screen shows "No one has
+        control" rather than nothing. A later list that agrees with the
+        current state changes nothing."""
         self.connected_clients = decode_client_list(payload)
         self._notify_client_list_updated(self.connected_clients)
         holder_id, holder_name = holder_from_client_list(self.connected_clients)
-        if holder_id != self.control_holder_id or holder_name != self.control_holder_name:
+        if (
+            not self._control_holder_shown
+            or holder_id != self.control_holder_id
+            or holder_name != self.control_holder_name
+        ):
             self._on_control_changed(holder_id, holder_name)
 
     def _on_control_changed(self, holder_id, holder_name):
@@ -3058,10 +3083,21 @@ class Controller:
         entries disagree with the current state (_on_client_list above).
         This is the only place control_holder_id/control_holder_name are
         set: this controller never guesses who holds control from its own
-        sends, only from what the machine actually publishes back."""
+        sends, only from what the machine actually publishes back.
+
+        connected_clients takes the new holder here too: the machine sends
+        no client list when control moves, so the has_control marks from
+        the last one would otherwise keep naming whoever held control at
+        the last join or leave. Nothing is requested from the machine for
+        this."""
         self.control_holder_id = holder_id
         self.control_holder_name = holder_name
+        self._control_holder_shown = True
         self._notify_control_changed(holder_id, holder_name)
+        marked = entries_with_holder(self.connected_clients, holder_id)
+        if marked != self.connected_clients:
+            self.connected_clients = marked
+            self._notify_client_list_updated(marked)
 
     def _on_client_presence(self, event):
         """A client-joined or client-left event (the machine's `0x68` event
@@ -3462,8 +3498,10 @@ class Controller:
                 self._advance_heartbeat(time.monotonic())
 
             except PeerClosedError:
-                # USB's version of the WiFi b"" case just above: the device
-                # itself is gone (unplugged, or the OS reclaimed the port).
+                # USB's version of the WiFi b"" case just above: a USB read
+                # or write failed in a way USBStream does not recognise as
+                # the device going away (an unplug is torn down quietly
+                # there, and left to the app's connection-lost check).
                 # Raised by USBStream.recv()/send() from a caught
                 # serial.SerialException, so it can arrive from either call
                 # in this same try block. Always treated as an established

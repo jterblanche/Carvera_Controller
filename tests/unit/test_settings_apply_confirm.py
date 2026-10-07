@@ -12,7 +12,10 @@ link, must not look identical to success. These pin:
   - the settings page reports "Settings applied" only when every key
     succeeded, otherwise names the failed settings and the firmware's
     reason and reverts just those widgets;
-  - config.txt is always re-read afterwards, success or partial failure;
+  - config.txt is always re-read afterwards, success or partial failure,
+    and when any setting was sent the result is shown only once that
+    read-back has ended: a read-back that fails says the values were sent
+    but not confirmed and offers to read again;
   - the wait happens off the Kivy main thread.
 """
 
@@ -186,11 +189,17 @@ def test_all_keys_acknowledged_reports_success(monkeypatch):
 
     assert root.setting_change_list == {}
     assert root.config_popup.btn_apply.disabled is True
-    root.message_popup.open.assert_called_once()
-    assert "applied" in root.message_popup.lb_content.text
     assert widgets[0].value == "single_user"
     assert root.config_popup._widget_snapshot[("Machine - Basic", "multi_client.mode")] == "single_user"
     root.download_config_file.assert_called_once()
+    # "applied" waits for config.txt to be read back.
+    root.message_popup.open.assert_not_called()
+    assert root._apply_readback.sent == ["multi_client.mode"]
+
+    root._report_apply_readback(root._apply_readback, True)
+
+    root.message_popup.open.assert_called_once()
+    assert "applied" in root.message_popup.lb_content.text
 
 
 def test_one_refused_names_it_and_reverts_the_widget(monkeypatch):
@@ -275,3 +284,200 @@ def test_apply_does_not_block_the_calling_thread(monkeypatch):
     assert elapsed < 0.2
     released.set()
     time.sleep(0.1)  # let the worker thread finish before the test exits
+
+
+# -- Reading config.txt back after Apply ------------------------------------
+#
+# Apply re-reads /sd/config.txt to confirm what the card now holds. When the
+# writes were acknowledged but that read fails for a reason of its own (the
+# machine ends the transfer, refuses it, it arrives damaged), the settings
+# page must say the values were sent but not confirmed and offer to read
+# again -- not report a config load error, and not claim they are applied.
+# These run the real Apply finish, download_config_file, doDownload and
+# finishLoadConfig with only the link and the widgets faked.
+
+REFUSAL = "error:Refused -- Other PC has control"
+
+
+class _ImmediateThread:
+    """Runs the target on .start() instead of in a new thread."""
+
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+        self._target = target
+        self._args = args
+        self._kwargs = kwargs or {}
+
+    def start(self):
+        self._target(*self._args, **self._kwargs)
+
+
+def _readback_host(tmp_path, monkeypatch, download_results):
+    """A Makera whose machine acknowledges every config-set and whose
+    config.txt downloads return ``download_results`` in turn: None for a
+    failed transfer, or a callable that writes the file and returns its
+    size."""
+    from carveracontroller.main import Makera
+
+    monkeypatch.setattr("carveracontroller.main.Clock.schedule_once", lambda cb, t=0: cb(0))
+    monkeypatch.setattr("carveracontroller.main.threading.Thread", _ImmediateThread)
+    monkeypatch.setattr("carveracontroller.main.App.get_running_app", lambda: None)
+
+    results = list(download_results)
+
+    def _download(tmp_filename, md5, progress_cb):
+        result = results.pop(0)
+        return result(tmp_filename) if callable(result) else result
+
+    modem = SimpleNamespace(last_file_error=None, download_md5_failed=False)
+    controller_ = MagicMock()
+    controller_.set_config_value_and_wait.return_value = (True, "sd: multi_client.mode has been set to single_user")
+    controller_.comms.uses_framed_transfer = True
+    controller_.downloadCommand.return_value = True
+    controller_.connection_type = CONN_WIFI
+    controller_.connection_address = "192.0.2.10"
+    controller_.stream.modem = modem
+    controller_.stream.download.side_effect = _download
+
+    widgets = [_widget("Machine - Basic", "multi_client.mode", "single_user")]
+    originals = {("Machine - Basic", "multi_client.mode"): "multi_user"}
+    root = _makera({"multi_client.mode": "single_user"}, widgets, originals, controller_)
+    del root.download_config_file  # use the real one
+    root.temp_dir = str(tmp_path)
+    root.fw_version = "1.0"
+    root.heartbeat_time = 0
+    root._config_download_failures = 0
+    root._config_apply_failed = False
+    root._selected_file_machine_key = "wifi:192.0.2.10"
+    root.confirm_popup = MagicMock()
+    root.show_message_popup = MagicMock()
+    for name in (
+        "progressStart",
+        "progressUpdate",
+        "progressFinish",
+        "updateStatus",
+        "load_machine_config_defaults",
+        "load_coordinates",
+        "load_laser_offsets",
+        "attempt_usb_baud_upgrade_if_eligible",
+    ):
+        setattr(root, name, MagicMock())
+    root.load_machine_config = MagicMock(return_value=True)
+    root.setting_list = {}
+    root.gcode_viewer = SimpleNamespace(high_precision_time_estimate=False)
+    return root, controller_, modem
+
+
+def _config_file(tmp_filename):
+    with open(tmp_filename, "w", encoding="utf-8") as handle:
+        handle.write("multi_client.mode single_user\n")
+    return 30
+
+
+def _everything_shown(root, controller_):
+    """All text the settings page put in front of the user: popups and
+    console lines."""
+    shown = [str(c.args[0]) for c in root.show_message_popup.call_args_list]
+    shown += [str(c.args[0][1]) for c in controller_.log.put.call_args_list]
+    if root.message_popup.open.called:
+        shown.append(str(root.message_popup.lb_content.text))
+    if root.confirm_popup.open.called:
+        shown.append(str(root.confirm_popup.lb_content.text))
+    return shown
+
+
+def test_readback_ended_by_the_machine_is_not_reported_as_a_load_error(tmp_path, monkeypatch):
+    """The machine acknowledges the write, then ends the read-back transfer
+    with no reason (it is already serving another controller's transfer)."""
+    root, controller_, _modem = _readback_host(tmp_path, monkeypatch, [None])
+
+    root.apply_machine_setting_changes()
+
+    shown = _everything_shown(root, controller_)
+    assert not any("Download config file error" in text for text in shown), shown
+    assert not any("Error loading" in text for text in shown), shown
+    assert not any("Settings applied" in text for text in shown), shown
+    root.confirm_popup.open.assert_called_once()
+    text = root.confirm_popup.lb_content.text
+    assert "sent to the machine" in text.lower()
+    assert "could not be confirmed" in text
+    assert "multi_client.mode" in text
+    assert root.confirm_popup.confirm_text == "Check again"
+
+
+def test_readback_refusal_names_the_machines_reason(tmp_path, monkeypatch):
+    root, controller_, modem = _readback_host(tmp_path, monkeypatch, [None])
+
+    def _refused(tmp_filename, md5, progress_cb):
+        # The transfer fails (returns None) with the refusal recorded.
+        modem.last_file_error = REFUSAL
+
+    controller_.stream.download.side_effect = _refused
+
+    root.apply_machine_setting_changes()
+
+    shown = _everything_shown(root, controller_)
+    assert not any("Download config file error" in text for text in shown), shown
+    assert REFUSAL in root.confirm_popup.lb_content.text
+
+
+def test_check_again_reads_back_once_more_and_reports_applied_when_it_succeeds(tmp_path, monkeypatch):
+    root, controller_, _modem = _readback_host(tmp_path, monkeypatch, [None, _config_file])
+
+    root.apply_machine_setting_changes()
+    root.confirm_popup.open.assert_called_once()
+    assert not root.message_popup.open.called
+
+    root.confirm_popup.confirm()  # the "Check again" button
+
+    assert controller_.stream.download.call_count == 2
+    root.message_popup.open.assert_called_once()
+    assert "Settings applied" in root.message_popup.lb_content.text
+    root.confirm_popup.open.assert_called_once()  # not shown a second time
+
+
+def test_check_again_that_fails_again_offers_another_check(tmp_path, monkeypatch):
+    root, controller_, _modem = _readback_host(tmp_path, monkeypatch, [None, None])
+
+    root.apply_machine_setting_changes()
+    root.confirm_popup.confirm()
+
+    assert root.confirm_popup.open.call_count == 2
+    shown = _everything_shown(root, controller_)
+    assert not any("Download config file error" in text for text in shown), shown
+    assert not root.message_popup.open.called
+
+
+def test_readback_that_succeeds_reports_applied(tmp_path, monkeypatch):
+    root, controller_, _modem = _readback_host(tmp_path, monkeypatch, [_config_file])
+
+    root.apply_machine_setting_changes()
+
+    root.message_popup.open.assert_called_once()
+    assert "Settings applied" in root.message_popup.lb_content.text
+    root.confirm_popup.open.assert_not_called()
+    root.load_machine_config.assert_called_once()
+
+
+def test_closing_the_offer_leaves_later_config_loads_alone(tmp_path, monkeypatch):
+    """After the user declines to check again, a config load that is not
+    an Apply read-back reports its own outcome as it always has."""
+    root, controller_, _modem = _readback_host(tmp_path, monkeypatch, [None, None])
+
+    root.apply_machine_setting_changes()
+    root.confirm_popup.open.assert_called_once()
+
+    root.download_config_file()
+
+    root.confirm_popup.open.assert_called_once()
+    shown = [str(c.args[0]) for c in root.show_message_popup.call_args_list]
+    assert any("Download config file error" in text for text in shown), shown
+
+
+def test_config_load_failure_outside_apply_is_still_reported(tmp_path, monkeypatch):
+    root, controller_, _modem = _readback_host(tmp_path, monkeypatch, [None])
+
+    root.download_config_file()
+
+    root.confirm_popup.open.assert_not_called()
+    shown = [str(c.args[0]) for c in root.show_message_popup.call_args_list]
+    assert any("Download config file error" in text for text in shown), shown

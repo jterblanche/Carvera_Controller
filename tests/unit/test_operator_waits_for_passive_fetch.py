@@ -19,6 +19,7 @@ arrives while the fetch's worker thread is downloading.
 from __future__ import annotations
 
 import hashlib
+import os
 import queue
 import threading
 from types import SimpleNamespace
@@ -87,6 +88,7 @@ class _Host:
         self.fetch_result = 1
         root = Makera.__new__(Makera)
         root.temp_dir = str(tmp_path / "cache")
+        os.makedirs(root.temp_dir, exist_ok=True)
         root._passive_fetch = PassiveFetchTracker()
         root._local_copies = LocalCopyStore()
         root._job_start = JobStartTracker(own_id=1)
@@ -136,9 +138,12 @@ class _Host:
 
         return record
 
-    def _download(self, remote_path, local_path, show_progress=True, open_after=True, automatic=False):
+    def _download(self, remote_path, local_path, show_progress=True, open_after=True, automatic=False, **_kwargs):
         if not automatic:
             self.events.append("download")
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            with open(local_path, "wb") as f:
+                f.write(b"mine")
             return 1
         self.events.append("fetch")
         self.root.downloading = True
