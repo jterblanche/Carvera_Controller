@@ -9802,6 +9802,13 @@ class Makera(RelativeLayout):
         Clock.schedule_once(partial(self.load_error, msg), 0)
 
     # ------------------------------------------------------------------------
+    def _mark_gcode_cannot_visualise(self, *args):
+        """Set gcode_cannot_visualise on the main thread, for a load_gcode_file
+        that failed on a worker thread: the Resume at line button and
+        checkbox are bound to it."""
+        self.gcode_cannot_visualise = True
+
+    # ------------------------------------------------------------------------
     def load_error(self, error_msg, *args):
         self._clear_tool_change_markers()
         self.progress_popup.dismiss()
@@ -9998,7 +10005,7 @@ class Makera(RelativeLayout):
             self.loading_file = False
             if f:
                 f.close()
-            self.gcode_cannot_visualise = True
+            Clock.schedule_once(self._mark_gcode_cannot_visualise, 0)
             self.controller.log.put(
                 (
                     Controller.MSG_ERROR,
