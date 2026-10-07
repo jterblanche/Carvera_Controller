@@ -227,9 +227,21 @@ class MakeraProtocol(CommunicationProtocol):
 
         return []
 
+    def feed_packet(self, packet: bytes) -> list[ParsedMessage]:
+        """Parse one frame body (length, type, payload and CRC, without the
+        header and footer) that a file transfer took off the link while it
+        was reading it itself. The byte-by-byte frame state used by feed()
+        is left as it is; text still being assembled (a reply line, a
+        published line) continues across both."""
+        return self._messages_from_packet(packet)
+
     def _dispatch_packet(self) -> list[ParsedMessage]:
-        parsed = validate_packet_data(self._packet_data)
+        packet = bytes(self._packet_data)
         self._packet_data.clear()
+        return self._messages_from_packet(packet)
+
+    def _messages_from_packet(self, packet: bytes) -> list[ParsedMessage]:
+        parsed = validate_packet_data(packet)
         if parsed is None:
             return []
         # Any complete, CRC-valid frame — regardless of type — proves the

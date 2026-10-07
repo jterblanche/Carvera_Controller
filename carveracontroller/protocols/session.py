@@ -151,3 +151,9 @@ class ProtocolSession:
                 if announced and announced != self.name:
                     self.select(announced)
         return messages
+
+    def feed_packet(self, packet: bytes) -> list[ParsedMessage]:
+        """Parse one frame body a file transfer read off the link while it
+        had it (see XMODEM.take_other_frames). Never switches protocol: a
+        transfer only runs on a protocol already selected."""
+        return [_normalize_message(m) for m in self._protocol.feed_packet(packet)]

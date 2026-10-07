@@ -5734,6 +5734,7 @@ class Makera(RelativeLayout):
         self.downloading = True
         # None = error/abort; never use False — `False >= 0` is True in Python.
         download_result = None
+        last_file_error = None
         try:
             md5 = Utils.md5(tmp_filename) if os.path.exists(tmp_filename) else ""
             # Makera framed transfer: pause RX before the download command so
@@ -5757,6 +5758,7 @@ class Makera(RelativeLayout):
                 # succeeds normally.
                 raise RuntimeError(f"Download command held back for {remote_path}: not yet connected to the machine")
             download_result = self.controller.stream.download(tmp_filename, md5, progress_cb)
+            last_file_error = getattr(getattr(self.controller.stream, "modem", None), "last_file_error", None)
         except Exception:
             logger.error(sys.exc_info()[1])
             download_result = None
@@ -5771,6 +5773,8 @@ class Makera(RelativeLayout):
         if download_result is None:
             if os.path.exists(tmp_filename):
                 os.remove(tmp_filename)
+            if last_file_error:
+                self.controller.log.put((Controller.MSG_ERROR, last_file_error))
             # show message popup
             md5_failed = bool(
                 getattr(getattr(getattr(self.controller, "stream", None), "modem", None), "download_md5_failed", False)
