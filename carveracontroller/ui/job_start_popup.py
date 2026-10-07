@@ -1,8 +1,10 @@
 """The countdown shown while the machine holds a job's start, and the texts
 for how a held start ended.
 
-Every connected controller shows the countdown. Only the controller that
-started the job gets the Start now and Cancel buttons.
+Every connected controller shows the countdown, and before it that the
+machine is checking the file. Only the controller that started the job
+gets Start now. Cancel is shown on every controller the machine accepts an
+abort from (see machine/job_start.py's may_cancel_held_start).
 """
 
 from __future__ import annotations
@@ -30,9 +32,20 @@ def _file_name(path: str) -> str:
     return posixpath.basename(path) or path
 
 
-def countdown_text(path: str, seconds_left: int, waiting_for: Iterable[str], is_starter: bool) -> str:
+def _buttons_line(is_starter: bool, can_cancel: bool) -> str | None:
+    if is_starter:
+        return tr._("Press Start now to start at once, or Cancel to stop the job from starting.")
+    if can_cancel:
+        return tr._("Press Cancel to stop the job from starting.")
+    return None
+
+
+def countdown_text(
+    path: str, seconds_left: int, waiting_for: Iterable[str], is_starter: bool, can_cancel: bool = False
+) -> str:
     """The countdown's text: which file, how long the machine may still
-    wait, and which controllers it is waiting for."""
+    wait, which controllers it is waiting for, and the buttons this
+    controller has."""
     names = ", ".join(waiting_for)
     if seconds_left > 0:
         lines = [tr._("{} will start in {} s.").format(_file_name(path), seconds_left)]
@@ -40,10 +53,25 @@ def countdown_text(path: str, seconds_left: int, waiting_for: Iterable[str], is_
         lines = [tr._("{} is starting.").format(_file_name(path))]
     if names:
         lines.append(tr._("Waiting for {} to load the file.").format(names))
-    if is_starter:
-        lines.append(tr._("Press Start now to start at once, or Cancel to stop the job from starting."))
-    else:
+    buttons = _buttons_line(is_starter, can_cancel)
+    if not is_starter:
         lines.append(tr._("The machine will start moving when the countdown ends."))
+    if buttons:
+        lines.append(buttons)
+    return "\n\n".join(lines)
+
+
+def checking_text(path: str, is_starter: bool, can_cancel: bool = False) -> str:
+    """The text while the machine computes the file's MD5 before the
+    countdown: which file, that the countdown follows, and the buttons this
+    controller has."""
+    lines = [
+        tr._("Checking {} before the start.").format(_file_name(path)),
+        tr._("The machine is reading the file. The countdown begins once it has been checked."),
+    ]
+    buttons = _buttons_line(is_starter, can_cancel)
+    if buttons:
+        lines.append(buttons)
     return "\n\n".join(lines)
 
 
@@ -88,8 +116,8 @@ def no_toolpath_progress_text(path: str, played_lines: int, played_seconds: floa
 
 
 class JobStartPopup(Popup):
-    """The countdown. ``update`` refreshes the text and shows or hides the
-    buttons; ``on_start_now`` and ``on_cancel`` are called from the
+    """The countdown. ``update`` refreshes the text and shows or hides each
+    button; ``on_start_now`` and ``on_cancel`` are called from the
     buttons."""
 
     def __init__(self, on_start_now: Callable[[], None], on_cancel: Callable[[], None], **kwargs) -> None:
@@ -116,13 +144,24 @@ class JobStartPopup(Popup):
         )
         self.showing = False
 
-    def update(self, text: str, show_buttons: bool) -> None:
+    def update(self, text: str, show_start_now: bool, show_cancel: bool) -> None:
         self.lb_content.text = text
-        self.buttons.disabled = not show_buttons
-        self.buttons.opacity = 1 if show_buttons else 0
+        self._show_button(self.btn_start_now, show_start_now, index=1)
+        self._show_button(self.btn_cancel, show_cancel, index=0)
+        show_any = show_start_now or show_cancel
+        self.buttons.disabled = not show_any
+        self.buttons.opacity = 1 if show_any else 0
         if not self.showing:
             self.showing = True
             self.open()
+
+    def _show_button(self, button: Button, show: bool, index: int) -> None:
+        """Put `button` in the row (Start now left of Cancel) or take it
+        out, so a lone Cancel fills the row."""
+        if show and button.parent is None:
+            self.buttons.add_widget(button, index=index)
+        elif not show and button.parent is not None:
+            self.buttons.remove_widget(button)
 
     def close(self) -> None:
         if self.showing:

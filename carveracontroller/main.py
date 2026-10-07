@@ -365,11 +365,12 @@ from .machine.busy_state import machine_is_busy
 from .machine.clients import row_display_text, rows_for_display
 from .machine.computer_part import computer_part_for_this_process, new_launch_part
 from .machine.identity import load_identity, set_name, with_id
-from .machine.job_start import JobStartAction, JobStartTracker
+from .machine.job_start import JobStartAction, JobStartTracker, may_cancel_held_start
 from .machine.local_copies import LocalCopyStore
 from .machine.passive_fetch import PassiveFetchTracker, player_flag, published_upload_path
 from .protocols.handshake import (
     JOB_START_CANCELLED,
+    JOB_START_HASHING,
     JOB_START_REASON_START_NOW,
     JOB_START_REASON_TIME_LIMIT,
     JOB_START_STARTING,
@@ -379,6 +380,7 @@ from .ui import widget_helpers
 from .ui.job_start_popup import (
     JobStartPopup,
     cancelled_text,
+    checking_text,
     countdown_text,
     no_toolpath_progress_text,
     not_loaded_text,
@@ -6835,7 +6837,10 @@ class Makera(RelativeLayout):
 
     def on_job_start_event(self, event):
         """A job-start event (Controller._on_job_start), on the main thread.
-        While the machine waits: show the countdown, and if this controller
+        While the machine computes the file's MD5 (hashing): show that it is
+        checking the file, with no countdown, and do nothing else -- there
+        is no MD5 to check a copy with yet. While the machine waits: show
+        the countdown, and if this controller
         is listed as not ready, draw the file from a local copy or fetch it,
         then report ready (or report ready again, if a ready was already
         sent and lost). Ready is only ever sent for a drawing whose size and
@@ -6848,6 +6853,9 @@ class Makera(RelativeLayout):
         was_ready = self._job_start.ready_sent
         was_starter = self._job_start.is_starter
         action = self._job_start.on_event(event, now)
+        if event.phase == JOB_START_HASHING:
+            self._show_job_start_countdown()
+            return
         if event.phase == JOB_START_WAITING:
             self._show_job_start_countdown()
             if action is JobStartAction.RESEND_READY:
@@ -6885,8 +6893,9 @@ class Makera(RelativeLayout):
         controller's own transfer or listing has the link, while another
         fetch is running, or while the machine reports a file playing: the
         next waiting event, a second later, tries again. Without an
-        announced MD5 no copy can be checked, so nothing is fetched and no
-        ready is sent; the file is fetched after the job."""
+        announced MD5 (the machine could not read the file while computing
+        it) no copy can be checked, so nothing is fetched and no ready is
+        sent; the file is fetched after the job."""
         start_id = event.start_id
         if self._show_local_copy(
             event.path, event.size, event.checksum, partial(self._job_start_copy_drawn, start_id, event.path)
@@ -7007,8 +7016,12 @@ class Makera(RelativeLayout):
         return [names.get(client_id) or tr._("another controller") for client_id in client_ids]
 
     def _show_job_start_countdown(self, *args):
-        """Show or refresh the countdown, on every controller. Only the
-        controller that started the job gets Start now and Cancel."""
+        """Show or refresh the countdown, on every controller, or while the
+        machine is still computing the file's MD5, that it is checking the
+        file. Only the controller that started the job gets Start now;
+        every controller the machine accepts an abort from gets Cancel
+        (_may_cancel_held_start), worked out again on every refresh, since
+        control can change hands during the hold."""
         event = self._job_start.event
         if event is None:
             self._close_job_start_countdown()
@@ -7018,16 +7031,39 @@ class Makera(RelativeLayout):
                 on_start_now=self.controller.startNowCommand, on_cancel=self.controller.abortCommand
             )
         is_starter = self._job_start.is_starter
+        can_cancel = self._may_cancel_held_start()
+        if self._job_start.hashing:
+            self._job_start_popup.update(
+                checking_text(event.path, is_starter, can_cancel), show_start_now=is_starter, show_cancel=can_cancel
+            )
+            if self._job_start_clock is None:
+                self._job_start_clock = Clock.schedule_interval(self._tick_job_start_countdown, 1.0)
+            return
         waiting = [i for i in event.not_ready_ids if i != self.identity.id]
         names = self._client_names(waiting)
         if self.identity.id in event.not_ready_ids:
             names.insert(0, tr._("this controller"))
         self._job_start_popup.update(
-            countdown_text(event.path, self._job_start.seconds_left(time.monotonic()), names, is_starter),
-            show_buttons=is_starter,
+            countdown_text(event.path, self._job_start.seconds_left(time.monotonic()), names, is_starter, can_cancel),
+            show_start_now=is_starter,
+            show_cancel=can_cancel,
         )
         if self._job_start_clock is None:
             self._job_start_clock = Clock.schedule_interval(self._tick_job_start_countdown, 1.0)
+
+    def _may_cancel_held_start(self):
+        """Whether the machine accepts abort from this controller during
+        the held start (machine/job_start.py's may_cancel_held_start). The
+        passive rights are the machine's multi_client.passive_rights as
+        last read from its config.txt."""
+        controller = self.controller
+        return may_cancel_held_start(
+            is_starter=self._job_start.is_starter,
+            multi_user=controller.multi_user_mode,
+            has_control=controller.has_control,
+            control_held=controller.control_holder_id != 0,
+            passive_rights=self.setting_list.get("multi_client.passive_rights"),
+        )
 
     def _tick_job_start_countdown(self, *args):
         """Count down between events, which the machine does not send while
