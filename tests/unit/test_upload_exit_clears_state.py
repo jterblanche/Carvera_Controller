@@ -127,11 +127,13 @@ def test_cancelled_transfer_clears_send_state(tmp_path):
 
 
 def test_failed_compressed_upload_whose_file_is_already_gone_clears_send_state(tmp_path):
-    """A failed compressed upload removes its ``.lz`` file afterwards. When
-    that file is already gone the removal raises; the link is still free."""
+    """A failed compressed upload removes the compressed copy it made
+    afterwards. When that copy is already gone the removal only logs; the
+    link is still free."""
     root = _host(tmp_path, upload=False)
     _job(tmp_path)
     compressed = _job(tmp_path, "job.nc.lz", b"compressed bytes")
+    root._compressed_upload_copy = str(compressed)
 
     def upload_and_lose_file(*args, **kwargs):
         compressed.unlink()
@@ -139,8 +141,7 @@ def test_failed_compressed_upload_whose_file_is_already_gone_clears_send_state(t
 
     root.controller.stream.upload.side_effect = upload_and_lose_file
 
-    with pytest.raises(FileNotFoundError):
-        _upload(root, compressed)
+    _upload(root, compressed)
 
     _assert_link_free(root)
 
