@@ -7227,6 +7227,19 @@ class Makera(RelativeLayout):
 
     # -----------------------------------------------------------------------
     def doUpload(self, callback):
+        """Worker-thread body of uploadLocalFile. However it ends -- an
+        early return, an error before or after the transfer, or the
+        transfer failing -- sendNUM and uploading are cleared. While
+        sendNUM is set the link counts as busy with this upload and no
+        status queries are sent; while uploading is set the status light
+        stops blinking and a firmware install is refused."""
+        try:
+            self._upload_file(callback)
+        finally:
+            self.uploading = False
+            self.controller.sendNUM = 0
+
+    def _upload_file(self, callback):
         firmware = bool(self._uploading_firmware)
         upload_result = None
         local_path = self.uploading_file
