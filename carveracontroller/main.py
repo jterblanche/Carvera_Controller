@@ -3011,6 +3011,8 @@ class Makera(RelativeLayout):
     uploading = False
     uploading_size = 0
     uploading_file = ""
+    # The compressed copy compress_file made for the current upload, if any.
+    _compressed_upload_copy = None
 
     downloading = False
     downloading_size = 0
@@ -6742,27 +6744,26 @@ class Makera(RelativeLayout):
 
     # -----------------------------------------------------------------------
     def compress_file(self, input_filename):
+        """Compress a file for upload and return the compressed copy's path,
+        or None if it could not be compressed.
+
+        The copy is made in a new folder of its own inside the temp folder,
+        never beside the user's file, so an upload cannot overwrite or delete
+        anything of the user's, and two uploads of files with the same name
+        cannot share a copy. The file is first copied into that folder too:
+        the upload takes its MD5 from the compressed copy's path without
+        ".lz". _remove_upload_copy removes both."""
         output_filename = None
         try:
             # If the uploaded file is a firmware file, return the original filename without compression.
             if input_filename.find(".bin") != -1:
                 return input_filename
 
-            # Check if the filename.lz is writeable
-            can_write_in_lz = os.access(input_filename + ".lz", os.W_OK)
-            if not can_write_in_lz:
-                logger.warning(f"Compression failed: Cannot write to '{input_filename}.lz', using temp dir")
-                # First copy the file to the temp dir (skip if already there, e.g. facing wizard .nc).
-                dest_path = os.path.join(self.temp_dir, os.path.basename(input_filename))
-                try:
-                    shutil.copy(input_filename, self.temp_dir)
-                except shutil.SameFileError:
-                    pass
-                input_filename = dest_path
-                # Then compress the file to the temp dir
-                output_filename = os.path.join(self.temp_dir, os.path.basename(input_filename) + ".lz")
-            else:
-                output_filename = input_filename + ".lz"
+            folder = tempfile.mkdtemp(prefix="upload-", dir=self.temp_dir)
+            dest_path = os.path.join(folder, os.path.basename(input_filename))
+            output_filename = dest_path + ".lz"
+            shutil.copyfile(input_filename, dest_path)
+            input_filename = dest_path
             sum = 0
             self.fileCompressionBlocks = 0
             self.decompercent = 0
@@ -6798,12 +6799,25 @@ class Makera(RelativeLayout):
             logger.error(f"Compression failed: {e}")
             # Remove a partly written output; if it cannot be removed, the
             # caller still falls back to the uncompressed file.
-            if output_filename and os.path.exists(output_filename):
-                try:
-                    os.remove(output_filename)
-                except OSError as remove_error:
-                    logger.warning(f"Could not remove '{output_filename}': {remove_error}")
+            if output_filename:
+                self._remove_upload_copy(output_filename)
             return None
+
+    # -----------------------------------------------------------------------
+    def _remove_upload_copy(self, compressed_path):
+        """Remove a compressed upload copy made by compress_file, the
+        uncompressed copy beside it and the folder they were made in. Only
+        those two names are removed, so nothing else can be lost."""
+        for path in (compressed_path, compressed_path[: -len(".lz")]):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError as remove_error:
+                logger.warning(f"Could not remove '{path}': {remove_error}")
+        try:
+            os.rmdir(os.path.dirname(compressed_path))
+        except OSError as remove_error:
+            logger.warning(f"Could not remove upload folder: {remove_error}")
 
     # -----------------------------------------------------------------------
     def _decompress_downloaded_file_in_place(self, filepath):
@@ -7171,6 +7185,7 @@ class Makera(RelativeLayout):
             firmware = bool(self.file_popup.firmware_mode)
         self._uploading_firmware = bool(firmware)
         self.controller.sendNUM = SEND_FILE
+        self._compressed_upload_copy = None
         try:
             self.uploading_file = filepath
             self.original_upload_filepath = filepath  # Store original path for recent directory tracking
@@ -7178,6 +7193,8 @@ class Makera(RelativeLayout):
                 qlzfilename = self.compress_file(filepath)
                 if qlzfilename:
                     self.uploading_file = qlzfilename
+                    if qlzfilename != filepath:
+                        self._compressed_upload_copy = qlzfilename
                 else:
                     note = tr._("Could not compress {}; uploading it uncompressed.").format(os.path.basename(filepath))
                     self.controller.log.put((Controller.MSG_NORMAL, note))
@@ -7192,6 +7209,14 @@ class Makera(RelativeLayout):
                 self._log_firmware("SD transfer failed: %s" % exc, error=True)
             self._cleanup_firmware_temp(success=False)
             self._uploading_firmware = False
+            self._remove_compressed_upload_copy()
+
+    # -----------------------------------------------------------------------
+    def _remove_compressed_upload_copy(self):
+        copy = self._compressed_upload_copy
+        self._compressed_upload_copy = None
+        if copy:
+            self._remove_upload_copy(copy)
 
     # -----------------------------------------------------------------------
     def doUpload(self, callback):
@@ -7200,12 +7225,17 @@ class Makera(RelativeLayout):
         transfer failing -- sendNUM and uploading are cleared. While
         sendNUM is set the link counts as busy with this upload and no
         status queries are sent; while uploading is set the status light
-        stops blinking and a firmware install is refused."""
+        stops blinking and a firmware install is refused.
+
+        The compressed copy made for the upload, if any, is removed here
+        too. Only that copy: the file the user chose is never removed, even
+        if its own name ends in ".lz"."""
         try:
             self._upload_file(callback)
         finally:
             self.uploading = False
             self.controller.sendNUM = 0
+            self._remove_compressed_upload_copy()
 
     def _upload_file(self, callback):
         firmware = bool(self._uploading_firmware)
@@ -7273,15 +7303,9 @@ class Makera(RelativeLayout):
             self.controller.log.put((Controller.MSG_NORMAL, tr._("Uploading is canceled manually.")))
             if firmware:
                 self._log_firmware("SD transfer cancelled")
-            # 如果为压缩后的'.lz'文件则删除该文件
-            if self.uploading_file.endswith(".lz"):
-                os.remove(self.uploading_file)
         elif not upload_result:
             if firmware:
                 self._log_firmware("SD transfer failed", error=True)
-            # 如果为压缩后的'.lz'文件则删除该文件
-            if self.uploading_file.endswith(".lz"):
-                os.remove(self.uploading_file)
             if last_file_error:
                 self.controller.log.put((Controller.MSG_ERROR, last_file_error))
             Clock.schedule_once(partial(self.show_message_popup, tr._("Upload file error!"), False), 0)
@@ -7373,7 +7397,6 @@ class Makera(RelativeLayout):
             if self.uploading_file.endswith(".lz"):
                 self.log = logging.getLogger("File.Decompress")
                 self.decompstatus = True
-                os.remove(self.uploading_file)
                 self.decomptime = time.time()
                 Clock.schedule_once(
                     partial(self.progressStart, tr._("Decompressing") + "\n%s" % displayname, False), 0.2
