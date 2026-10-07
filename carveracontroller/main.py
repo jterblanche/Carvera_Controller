@@ -117,6 +117,7 @@ import json
 import os
 import platform
 import re
+import secrets
 import subprocess
 import tempfile
 
@@ -5356,7 +5357,7 @@ class Makera(RelativeLayout):
         self.downloading_file = remote_path
         self.downloading_size = self.file_popup.selected_machine_filesize
         self.downloading_config = False
-        threading.Thread(target=self.doDownload, args=(remote_path, dest), kwargs={"open_after": False}).start()
+        threading.Thread(target=self._save_machine_file_to_device, args=(remote_path, dest)).start()
 
     # -----------------------------------------------------------------------
     def start_back_up_config(self):
@@ -5671,7 +5672,12 @@ class Makera(RelativeLayout):
         self._ingest_machine_gcode_thumbnail(remote_path, local_path)
 
     # -----------------------------------------------------------------------
-    def doDownload(self, remote_path, local_path, show_progress=True, open_after=True, automatic=False):
+    def doDownload(
+        self, remote_path, local_path, show_progress=True, open_after=True, automatic=False, decompress=True
+    ):
+        """Download `remote_path` to `local_path`. With open_after False and
+        decompress False, a compressed download is left compressed at
+        `local_path` for the caller to decompress."""
         app = App.get_running_app()
         was_config_download = self.downloading_config
         # Config backup reuses downloading_config so /sd is not added to recents, but those
@@ -5816,7 +5822,7 @@ class Makera(RelativeLayout):
                 # it) is deferred via Clock.schedule_once rather than run
                 # inline here.
                 Clock.schedule_once(partial(self._finish_downloaded_file_open, remote_path, local_path))
-            else:
+            elif decompress:
                 if self._decompress_downloaded_file_in_place(local_path):
                     self._ingest_machine_gcode_thumbnail(remote_path, local_path)
 
@@ -6834,6 +6840,67 @@ class Makera(RelativeLayout):
         except OSError:
             pass
         return self._verify_deferred_download_md5(filepath)
+
+    # -----------------------------------------------------------------------
+    def _save_machine_file_to_device(self, remote_path, dest):
+        """Worker-thread body of save_machine_file_to_device.
+
+        The download, its decompress and both checksums happen in a folder
+        of its own inside the temp folder. Only a complete, verified file is
+        then put at `dest`, in one step (_replace_file). Nothing else in the
+        chosen folder is touched, and if anything fails the file already at
+        `dest`, if any, stays exactly as it was and the user is told why."""
+        folder = tempfile.mkdtemp(prefix="save-", dir=self.temp_dir)
+        staged = os.path.join(folder, os.path.basename(dest))
+        try:
+            if os.path.exists(dest):
+                # Lets the machine skip sending a file that is already the same.
+                shutil.copyfile(dest, staged)
+            result = self.doDownload(remote_path, staged, open_after=False, decompress=False)
+            if result is None or result < 0:
+                return  # failed or cancelled; doDownload has said so
+            if result == 0 and os.path.exists(dest):
+                return  # the machine's copy is the same as the one already saved
+            if self._replace_file(dest, partial(self._fill_from_download, staged, dest)):
+                self._ingest_machine_gcode_thumbnail(remote_path, dest)
+        except Exception as exc:
+            logger.exception("Could not save %s to %s", remote_path, dest)
+            Clock.schedule_once(
+                partial(self.show_message_popup, tr._("Could not save the file:") + "\n%s\n%s" % (dest, exc), False),
+                0,
+            )
+        finally:
+            for path in (staged, staged + ".tmp"):
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except OSError:
+                    logger.warning("Could not remove %s", path)
+            try:
+                os.rmdir(folder)
+            except OSError:
+                logger.warning("Could not remove %s", folder)
+
+    # -----------------------------------------------------------------------
+    def _fill_from_download(self, staged, dest, partial_path):
+        """Write the downloaded file `staged` to `partial_path`, decompressing
+        it first if the machine sent it compressed. Returns True only if the
+        result is complete and verified; otherwise the user has been told
+        why. Used through _replace_file."""
+        with open(staged, "rb") as handle:
+            compressed = handle.read(2) == b"\x00\x00"
+        if not compressed:
+            shutil.copyfile(staged, partial_path)
+            return True
+        if not self.decompress_file(staged, partial_path):
+            message = (
+                tr._("The downloaded file could not be decompressed, so it was not saved. It may be damaged.")
+                + "\n%s" % dest
+            )
+            Clock.schedule_once(partial(self.show_message_popup, message, False), 0)
+            return False
+        # On a mismatch this shows its own message.
+        return self._verify_deferred_download_md5(partial_path)
 
     # -----------------------------------------------------------------------
     def _verify_deferred_download_md5(self, filepath):
@@ -9785,20 +9852,50 @@ class Makera(RelativeLayout):
         self.load_page(0)
 
     # -----------------------------------------------------------------------
+    def _replace_file(self, filepath, fill):
+        """Put a new version of `filepath` in place in one step, or leave it
+        exactly as it was.
+
+        `fill(partial_path)` writes the new version to a hidden file in the
+        same folder and returns True only if it is complete and verified.
+        Only then is that file renamed over `filepath`: os.replace, a single
+        step within one folder, which also overwrites on Windows. The new
+        version keeps the permissions of the file it replaces; a new file
+        gets the usual permissions for a new file. Otherwise, or if anything
+        raises, only the hidden file is removed. Returns what `fill`
+        returned."""
+        folder, filename = os.path.split(os.path.abspath(filepath))
+        partial_path = os.path.join(folder, ".%s.%s.tmp" % (filename, secrets.token_hex(4)))
+        # O_EXCL: never reuse a file that is already there.
+        os.close(os.open(partial_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666))
+        try:
+            if not fill(partial_path):
+                return False
+            if os.path.exists(filepath):
+                try:
+                    shutil.copymode(filepath, partial_path)
+                except OSError:
+                    pass
+            os.replace(partial_path, filepath)
+            return True
+        finally:
+            if os.path.exists(partial_path):
+                try:
+                    os.remove(partial_path)
+                except OSError:
+                    logger.warning("Could not remove partial file %s", partial_path)
+
+    # -----------------------------------------------------------------------
     def _decompress_over(self, lzpath, filepath):
         """Decompress the QuickLZ file `lzpath` and put the result at
         `filepath`, the compressed file being opened, but only once the
-        result is complete and has passed both checksums. Until then it is
-        written to a hidden file in the same folder, so the replace is a
-        single rename, and on any failure only that file is removed: the
-        file the user opened stays exactly as it was.
+        result is complete and has passed both checksums (_replace_file): on
+        any failure the file the user opened stays exactly as it was.
 
         Returns False on failure, after scheduling _end_failed_load with the
         reason. Called from load_gcode_file's worker thread."""
-        folder, filename = os.path.split(os.path.abspath(filepath))
-        handle, partial_path = tempfile.mkstemp(prefix="." + filename + ".", suffix=".tmp", dir=folder)
-        os.close(handle)
-        try:
+
+        def fill(partial_path):
             if not self.decompress_file(lzpath, partial_path):
                 message = (
                     tr._("This file is compressed and could not be decompressed. It may be damaged.")
@@ -9810,20 +9907,9 @@ class Makera(RelativeLayout):
                 # The checksum check has already scheduled its own message.
                 Clock.schedule_once(self._end_failed_load, 0)
                 return False
-            # mkstemp creates the file readable by its owner only; keep the
-            # permissions the user's file had.
-            try:
-                shutil.copymode(filepath, partial_path)
-            except OSError:
-                pass
-            os.replace(partial_path, filepath)
             return True
-        finally:
-            if os.path.exists(partial_path):
-                try:
-                    os.remove(partial_path)
-                except OSError:
-                    logger.warning("Could not remove partial decompress output %s", partial_path)
+
+        return self._replace_file(filepath, fill)
 
     # -----------------------------------------------------------------------
     def load_gcode_file(self, filepath):
