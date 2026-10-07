@@ -151,7 +151,7 @@ def test_nothing_is_logged_when_logging_is_off(make_stream, caplog):
 
 
 class _ShortWriteSocket:
-    """socket double whose send() takes only the first few bytes, as a
+    """socket double whose send() takes at most a few bytes per call, as a
     socket with a send timeout may."""
 
     def __init__(self, accept):
@@ -169,7 +169,7 @@ class _FailingSocket:
         raise OSError("Broken pipe")
 
 
-def test_wifi_sent_line_reports_only_the_bytes_the_socket_took(caplog):
+def test_wifi_short_writes_give_one_sent_line_for_the_whole_frame(caplog):
     caplog.set_level(logging.DEBUG)
     stream = WIFIStream(log_sent_receive=True)
     stream.socket = _ShortWriteSocket(accept=4)
@@ -177,7 +177,8 @@ def test_wifi_sent_line_reports_only_the_bytes_the_socket_took(caplog):
 
     stream.send(frame)
 
-    assert _sent_messages(caplog) == [f"SENT: {frame[:4]!r}"]
+    assert bytes(stream.socket.wire) == frame
+    assert _sent_messages(caplog) == [f"SENT: {frame!r}"]
 
 
 def test_wifi_send_that_fails_logs_no_sent_line(caplog):
