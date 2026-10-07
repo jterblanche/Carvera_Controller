@@ -9674,8 +9674,12 @@ class Makera(RelativeLayout):
         """Clear loading_file on the main thread for a load_gcode_file that
         stopped without reaching load_end. load_start, which sets it, runs
         through the same Clock and was scheduled first, so a failure that
-        happens before load_start has run cannot be undone by it."""
+        happens before load_start has run cannot be undone by it.
+
+        The file did not load, so it is also no longer the loaded file for
+        resume at line: self.lines may still hold an earlier copy of it."""
         self.loading_file = False
+        self._last_loaded_file_key = None
 
     # ------------------------------------------------------------------------
     def load_error(self, error_msg, *args):

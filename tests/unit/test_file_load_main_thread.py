@@ -219,3 +219,26 @@ def test_load_whose_decompress_fails_does_not_leave_loading_file_set(monkeypatch
 
     assert "load_start" in guard.names()
     assert root.loading_file is False
+
+
+def test_failed_reload_of_the_loaded_file_does_not_offer_resume_from_old_lines(monkeypatch, tmp_path):
+    """The file was loaded once; loading it again fails at the decompress, so
+    self.lines still holds the earlier copy. Resume at line must not be
+    offered against those lines."""
+    guard = _Guard()
+    scheduled = queue.Queue()
+    root = _fail_fast_host(monkeypatch, guard, scheduled)
+    path = tmp_path / "job.nc"
+    app = SimpleNamespace(
+        total_pages=0, curr_page=1, selected_remote_filename="/sd/gcodes/job.nc", selected_local_filename=str(path)
+    )
+    monkeypatch.setattr("carveracontroller.main.App.get_running_app", lambda: app)
+    root.lines = ["G21\n", "G1 X1 F100\n"]
+    root.selected_file_line_count = 2
+    root._last_loaded_file_key = "/sd/gcodes/job.nc"
+    path.write_bytes(b"\x00\x00not a quicklz stream")
+
+    _fail_before_main_thread_runs(root, scheduled, str(path))
+
+    assert root.loading_file is False
+    assert root._resume_gcode_lines_available() is False
