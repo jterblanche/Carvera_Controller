@@ -7351,7 +7351,7 @@ class Makera(RelativeLayout):
                 os.remove(self.uploading_file)
                 self.decomptime = time.time()
                 Clock.schedule_once(
-                    partial(self.progressStart, tr._("Decompressing") + "\n%s" % displayname, False), 0.2
+                    partial(self._open_decompress_progress, tr._("Decompressing") + "\n%s" % displayname), 0.2
                 )
 
         self.controller.sendNUM = 0
@@ -7638,6 +7638,23 @@ class Makera(RelativeLayout):
         Clock.schedule_once(self.progressFinish, 0)
         Clock.schedule_once(partial(self.show_message_popup, message, False), 0)
 
+    # -----------------------------------------------------------------------
+    def _open_decompress_progress(self, text, *args):
+        """Open the "Decompressing" popup, but only while the decompress
+        wait is still running.
+
+        doUpload schedules this a short delay after the upload ends, so the
+        "Uploading" popup has closed first. A small file can finish
+        decompressing on the machine within that delay (its final
+        "decompart" reply can arrive with the upload's own reply), and
+        updateCompressProgress has then already scheduled the popup's close.
+        Opening it after that close would leave it on screen, with Cancel
+        disabled and nothing left to close it.
+        """
+        if not self.decompstatus:
+            return
+        self.progressStart(text, False)
+
     # --------------------------------------------------------------`---------
     def updateCompressProgress(self, value):
         # self.fileCompressionBlocks is 0 only when there was nothing to
@@ -7647,10 +7664,13 @@ class Makera(RelativeLayout):
         percent = 100.0 if total_blocks <= 0 else value * 100.0 / total_blocks
         Clock.schedule_once(partial(self.progressUpdate, percent, "", True), 0)
         if value == self.fileCompressionBlocks:
+            # End the wait before scheduling the popup's close, so a pending
+            # _open_decompress_progress can never see the wait still running
+            # after that close has run.
+            self.decompstatus = False
             Clock.schedule_once(self.progressFinish, 0)
             # Refresh the remote dir since upload finished
             Clock.schedule_once(self.file_popup.refresh_machine, 0)
-            self.decompstatus = False
             # Call pending callback after decompression completes (for .lz files)
             if hasattr(self, "pending_decompress_callback") and self.pending_decompress_callback:
                 # Capture callback before clearing it
