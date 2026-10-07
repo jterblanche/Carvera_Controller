@@ -44,6 +44,26 @@ class _Guard:
         return [name for name, _ in self.calls]
 
 
+class _Popup:
+    """Stand-in for the progress and message popups (both ModalViews with
+    auto_dismiss off): records whether it is open and what it shows."""
+
+    def __init__(self):
+        self.is_open = False
+        self.btn_cancel = SimpleNamespace(disabled=False)
+        self.btn_ok = SimpleNamespace(disabled=False)
+        self.lb_content = SimpleNamespace(text="")
+        self.progress_text = ""
+        self.progress_value = 0
+        self.cancel = None
+
+    def open(self, *_args):
+        self.is_open = True
+
+    def dismiss(self, *_args):
+        self.is_open = False
+
+
 def _write_gcode(path, line_count):
     with open(path, "w", encoding="utf-8") as handle:
         handle.write("G21\nG90\n")
@@ -73,9 +93,8 @@ def _load_host(monkeypatch, guard, scheduled):
     root.stock_settings_popup = SimpleNamespace(
         reset_for_loaded_file=guard.wrap("popup.reset_for_loaded_file", main_module.default_settings())
     )
-    root.progress_popup = SimpleNamespace(
-        btn_cancel=SimpleNamespace(disabled=True), progress_text="", progress_value=0, cancel=None
-    )
+    root.progress_popup = _Popup()
+    root.message_popup = _Popup()
     root.controller = SimpleNamespace(log=SimpleNamespace(put=MagicMock()), stream=None)
     root.load_start = guard.wrap("load_start")
     root.load_page = guard.wrap("load_page")
@@ -242,3 +261,63 @@ def test_failed_reload_of_the_loaded_file_does_not_offer_resume_from_old_lines(m
 
     assert root.loading_file is False
     assert root._resume_gcode_lines_available() is False
+
+
+def _open_from_file_browser(monkeypatch, root, scheduled, path):
+    """view_local_file, as the file browser's open runs it: opens the
+    progress popup with Cancel disabled and loads on a worker thread. Then
+    the main thread runs everything the load scheduled."""
+    app = SimpleNamespace(total_pages=0, curr_page=1, selected_local_filename="", selected_remote_filename="")
+    monkeypatch.setattr("carveracontroller.main.App.get_running_app", lambda: app)
+    root.file_popup = SimpleNamespace(selected_device_file=path, dismiss=lambda *_: None)
+    done = threading.Event()
+    real_load = root.load_gcode_file
+
+    def load(filepath):
+        try:
+            real_load(filepath)
+        finally:
+            done.set()
+
+    root.load_gcode_file = load
+    Makera.view_local_file(root)
+    assert root.progress_popup.is_open and root.progress_popup.btn_cancel.disabled
+    assert done.wait(LOAD_TIMEOUT_S)
+    _drain(scheduled)
+
+
+def test_corrupt_compressed_file_closes_the_progress_popup_and_says_why(monkeypatch, tmp_path):
+    guard = _Guard()
+    scheduled = queue.Queue()
+    root = _fail_fast_host(monkeypatch, guard, scheduled)
+    path = tmp_path / "broken.nc"
+    path.write_bytes(b"\x00\x00not a quicklz stream")  # the QuickLZ magic, then nothing valid
+
+    _open_from_file_browser(monkeypatch, root, scheduled, str(path))
+
+    assert root.progress_popup.is_open is False
+    assert root.message_popup.is_open is True
+    assert "could not be decompressed" in root.message_popup.lb_content.text
+    assert root.message_popup.btn_ok.disabled is False
+
+
+def test_checksum_mismatch_after_decompress_closes_the_progress_popup(monkeypatch, tmp_path):
+    guard = _Guard()
+    scheduled = queue.Queue()
+    root = _fail_fast_host(monkeypatch, guard, scheduled)
+    path = tmp_path / "job.nc"
+    path.write_bytes(b"\x00\x00compressed")
+
+    def decompress(_lz, out):
+        with open(out, "w", encoding="utf-8") as handle:
+            handle.write("G21\nG1 X1 F100\n")
+        return True
+
+    root.decompress_file = decompress
+    root.controller.stream = SimpleNamespace(modem=SimpleNamespace(deferred_download_md5="0" * 32))
+
+    _open_from_file_browser(monkeypatch, root, scheduled, str(path))
+
+    assert root.progress_popup.is_open is False
+    assert root.message_popup.is_open is True
+    assert "MD5" in root.message_popup.lb_content.text  # the checksum check's own message
