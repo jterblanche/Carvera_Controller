@@ -117,6 +117,7 @@ import json
 import os
 import platform
 import re
+import secrets
 import subprocess
 import tempfile
 
@@ -364,7 +365,7 @@ from .GcodeViewer import (
 from .machine.busy_state import machine_is_busy
 from .machine.clients import row_display_text, rows_for_display
 from .machine.identity import load_or_create_identity, set_name
-from .machine.passive_fetch import PassiveFetchTracker
+from .machine.passive_fetch import PassiveFetchTracker, player_flag
 from .ui import widget_helpers
 from .ui.PlayProgressBar import (
     next_tool_change_after_line,
@@ -1686,6 +1687,21 @@ def tool_confirm_button_text(*, has_control, control_holder_id, control_holder_n
         return tr._("Confirm")
     name = control_holder_name or tr._("Another controller")
     return tr._("Confirm and take control from {name}").format(name=name)
+
+
+class ApplyReadback:
+    """Settings whose config-set the machine acknowledged, waiting for
+    /sd/config.txt to be read back to confirm the card holds them.
+
+    ``sent`` lists the keys written. ``refused`` is the text naming the
+    settings in the same Apply that the machine refused, or None when it
+    accepted them all. ``reason`` says why the read-back failed, when it
+    does."""
+
+    def __init__(self, sent, refused=None):
+        self.sent = list(sent)
+        self.refused = refused
+        self.reason = None
 
 
 class ConfigPopup(ModalView):
@@ -3011,11 +3027,15 @@ class Makera(RelativeLayout):
     uploading = False
     uploading_size = 0
     uploading_file = ""
+    # The compressed copy compress_file made for the current upload, if any.
+    _compressed_upload_copy = None
 
     downloading = False
     downloading_size = 0
     downloading_file = ""
     downloading_config = False
+    # The Apply waiting on its config.txt read-back (ApplyReadback), if any.
+    _apply_readback = None
 
     setting_list = {}
     setting_type_list = {}
@@ -5356,7 +5376,7 @@ class Makera(RelativeLayout):
         self.downloading_file = remote_path
         self.downloading_size = self.file_popup.selected_machine_filesize
         self.downloading_config = False
-        threading.Thread(target=self.doDownload, args=(remote_path, dest), kwargs={"open_after": False}).start()
+        threading.Thread(target=self._save_machine_file_to_device, args=(remote_path, dest)).start()
 
     # -----------------------------------------------------------------------
     def start_back_up_config(self):
@@ -5490,6 +5510,7 @@ class Makera(RelativeLayout):
     # -----------------------------------------------------------------------
     def finishLoadConfig(self, success, *args):
         self.downloading_config = False
+        readback, self._apply_readback = self._apply_readback, None
         if success:
             try:
                 self.setting_list.clear()
@@ -5542,18 +5563,24 @@ class Makera(RelativeLayout):
                 self.config_loaded = False
                 self._config_apply_failed = True
                 self.controller.log.put((Controller.MSG_ERROR, tr._("Failed to load config file: {}").format(e)))
+                success = False
+                if readback is not None:
+                    readback.reason = str(e)
             finally:
                 self.config_loading = False
         else:
             self.config_loading = False
             self._config_download_failures += 1
-            self.controller.log.put((Controller.MSG_ERROR, tr._("Download config file error")))
+            if readback is None:
+                self.controller.log.put((Controller.MSG_ERROR, tr._("Download config file error")))
             if self._config_download_failures >= MAX_CONFIG_DOWNLOAD_ATTEMPTS:
                 logger.error(
                     "Giving up config download after %s failed attempts",
                     self._config_download_failures,
                 )
             # self.controller.close()
+        if readback is not None:
+            self._report_apply_readback(readback, success)
 
         # Preserve selected file only when reconnecting to the same machine.
         # finishLoadConfig() can be called on reconnect; resume-at-line depends on
@@ -5662,16 +5689,27 @@ class Makera(RelativeLayout):
         """Main-thread completion of doDownload's open_after branch (a
         manual download-and-open from the file browser's
         check_and_download(), which starts doDownload on a worker thread).
-        load_gcode_file() draws the toolpath and must run on the main Kivy
-        thread, so it -- and the thumbnail ingest alongside it -- are
-        scheduled here rather than called inline from doDownload."""
-        # Decompress QuickLZ in place first; ingesting the compressed
-        # payload would wrongly cache this file as having no thumbnail.
-        self.load_gcode_file(local_path)
-        self._ingest_machine_gcode_thumbnail(remote_path, local_path)
+        The loading itself (load_gcode_file) runs on a worker thread, as it
+        does when a file is opened from the file browser: it waits for its
+        own page loads, which the main thread runs, after every
+        LOAD_INTERVAL lines, so on the main thread it would stop for good on
+        a file longer than that."""
+
+        def load():
+            # Decompress QuickLZ in place first; ingesting the compressed
+            # payload would wrongly cache this file as having no thumbnail.
+            self.load_gcode_file(local_path)
+            self._ingest_machine_gcode_thumbnail(remote_path, local_path)
+
+        threading.Thread(target=load, daemon=True).start()
 
     # -----------------------------------------------------------------------
-    def doDownload(self, remote_path, local_path, show_progress=True, open_after=True, automatic=False):
+    def doDownload(
+        self, remote_path, local_path, show_progress=True, open_after=True, automatic=False, decompress=True
+    ):
+        """Download `remote_path` to `local_path`. With open_after False and
+        decompress False, a compressed download is left compressed at
+        `local_path` for the caller to decompress."""
         app = App.get_running_app()
         was_config_download = self.downloading_config
         # Config backup reuses downloading_config so /sd is not added to recents, but those
@@ -5704,6 +5742,7 @@ class Makera(RelativeLayout):
         self.downloading = True
         # None = error/abort; never use False — `False >= 0` is True in Python.
         download_result = None
+        last_file_error = None
         try:
             md5 = Utils.md5(tmp_filename) if os.path.exists(tmp_filename) else ""
             # Makera framed transfer: pause RX before the download command so
@@ -5727,6 +5766,7 @@ class Makera(RelativeLayout):
                 # succeeds normally.
                 raise RuntimeError(f"Download command held back for {remote_path}: not yet connected to the machine")
             download_result = self.controller.stream.download(tmp_filename, md5, progress_cb)
+            last_file_error = getattr(getattr(self.controller.stream, "modem", None), "last_file_error", None)
         except Exception:
             logger.error(sys.exc_info()[1])
             download_result = None
@@ -5741,10 +5781,15 @@ class Makera(RelativeLayout):
         if download_result is None:
             if os.path.exists(tmp_filename):
                 os.remove(tmp_filename)
+            if last_file_error:
+                self.controller.log.put((Controller.MSG_ERROR, last_file_error))
             # show message popup
             md5_failed = bool(
                 getattr(getattr(getattr(self.controller, "stream", None), "modem", None), "download_md5_failed", False)
             )
+            readback = self._apply_readback if apply_config else None
+            if readback is not None:
+                readback.reason = self._readback_failure_reason(md5_failed)
             if apply_config:
                 Clock.schedule_once(partial(self.finishLoadConfig, False), 0.1)
                 error_msg = (
@@ -5755,7 +5800,8 @@ class Makera(RelativeLayout):
                     if md5_failed
                     else tr._("Download config file error!")
                 )
-                Clock.schedule_once(partial(self.show_message_popup, error_msg, False), 0.2)
+                if readback is None:
+                    Clock.schedule_once(partial(self.show_message_popup, error_msg, False), 0.2)
             else:
                 error_msg = (
                     tr._(
@@ -5809,14 +5855,11 @@ class Makera(RelativeLayout):
                     Clock.schedule_once(
                         partial(self.progressUpdate, 0, tr._("Open cached file") + " \n%s" % local_path, True), 0
                     )
-                # load_gcode_file() draws the toolpath, which only the main
-                # Kivy thread may touch; doDownload's callers that use
-                # open_after=True (check_and_download) run it on a worker
-                # thread, so the load (and the thumbnail ingest alongside
-                # it) is deferred via Clock.schedule_once rather than run
-                # inline here.
+                # Opening the file is handed to the main thread, after the
+                # progress update above; _finish_downloaded_file_open then
+                # loads it on a worker thread of its own.
                 Clock.schedule_once(partial(self._finish_downloaded_file_open, remote_path, local_path))
-            else:
+            elif decompress:
                 if self._decompress_downloaded_file_in_place(local_path):
                     self._ingest_machine_gcode_thumbnail(remote_path, local_path)
 
@@ -6443,7 +6486,12 @@ class Makera(RelativeLayout):
         button is disabled while another controller holds control in
         multi-user mode (see refresh_settings_apply_button). Nothing else is
         disabled or greyed out, and nothing prompts — control simply follows
-        whoever the machine says last acted."""
+        whoever the machine says last acted.
+
+        Once the hello ack has reported it, the text also names the machine's
+        running mode ("You have control · multi-user"): the two modes treat
+        another controller's commands differently, taking control over in
+        single-user mode and refusing them in multi-user mode."""
         own_id = self.identity.id if getattr(self, "identity", None) is not None else None
         if holder_id == 0:
             text = tr._("No one has control")
@@ -6451,6 +6499,9 @@ class Makera(RelativeLayout):
             text = tr._("You have control")
         else:
             text = tr._("{name} has control").format(name=holder_name or tr._("Another controller"))
+        if self.controller.control_mode_reported:
+            mode = tr._("multi-user") if self.controller.multi_user_mode else tr._("single-user")
+            text = tr._("{control} · {mode}").format(control=text, mode=mode)
         self.control_holder_text = text
         self.status_drop_down.can_release_control = self.controller.can_release_control
         self.refresh_settings_apply_button()
@@ -6629,10 +6680,19 @@ class Makera(RelativeLayout):
         Called both right after a publish (on_passive_file_published) and
         on every status update (updateStatus) -- the machine going idle is
         what actually releases a fetch that arrived while a job was still
-        playing (see machine/passive_fetch.py)."""
+        playing (see machine/passive_fetch.py). The player flag from the
+        status report's P: field is passed alongside the state word, since
+        the firmware also reports Idle mid-job; it is trusted at 0 only on
+        firmware that reports it, the same test updateStatus uses for
+        app.playing."""
         if self._auto_fetch_in_progress:
             return
-        path = self._passive_fetch.due_fetch(is_idle, now=time.monotonic())
+        app = App.get_running_app()
+        reports_flag = (
+            app is not None and app.is_community_firmware and app.fw_version_digitized >= Utils.digitize_v("2.1.0")
+        )
+        playing = player_flag(CNC.vars.get("is_playing", 0), reports_flag)
+        path = self._passive_fetch.due_fetch(is_idle, now=time.monotonic(), playing=playing)
         if path is None:
             return
         self._auto_fetch_in_progress = True
@@ -6742,26 +6802,26 @@ class Makera(RelativeLayout):
 
     # -----------------------------------------------------------------------
     def compress_file(self, input_filename):
+        """Compress a file for upload and return the compressed copy's path,
+        or None if it could not be compressed.
+
+        The copy is made in a new folder of its own inside the temp folder,
+        never beside the user's file, so an upload cannot overwrite or delete
+        anything of the user's, and two uploads of files with the same name
+        cannot share a copy. The file is first copied into that folder too:
+        the upload takes its MD5 from the compressed copy's path without
+        ".lz". _remove_upload_copy removes both."""
+        output_filename = None
         try:
             # If the uploaded file is a firmware file, return the original filename without compression.
             if input_filename.find(".bin") != -1:
                 return input_filename
 
-            # Check if the filename.lz is writeable
-            can_write_in_lz = os.access(input_filename + ".lz", os.W_OK)
-            if not can_write_in_lz:
-                logger.warning(f"Compression failed: Cannot write to '{input_filename}.lz', using temp dir")
-                # First copy the file to the temp dir (skip if already there, e.g. facing wizard .nc).
-                dest_path = os.path.join(self.temp_dir, os.path.basename(input_filename))
-                try:
-                    shutil.copy(input_filename, self.temp_dir)
-                except shutil.SameFileError:
-                    pass
-                input_filename = dest_path
-                # Then compress the file to the temp dir
-                output_filename = os.path.join(self.temp_dir, os.path.basename(input_filename) + ".lz")
-            else:
-                output_filename = input_filename + ".lz"
+            folder = tempfile.mkdtemp(prefix="upload-", dir=self.temp_dir)
+            dest_path = os.path.join(folder, os.path.basename(input_filename))
+            output_filename = dest_path + ".lz"
+            shutil.copyfile(input_filename, dest_path)
+            input_filename = dest_path
             sum = 0
             self.fileCompressionBlocks = 0
             self.decompercent = 0
@@ -6795,9 +6855,27 @@ class Makera(RelativeLayout):
 
         except Exception as e:
             logger.error(f"Compression failed: {e}")
-            if os.path.exists(output_filename):
-                os.remove(output_filename)
+            # Remove a partly written output; if it cannot be removed, the
+            # caller still falls back to the uncompressed file.
+            if output_filename:
+                self._remove_upload_copy(output_filename)
             return None
+
+    # -----------------------------------------------------------------------
+    def _remove_upload_copy(self, compressed_path):
+        """Remove a compressed upload copy made by compress_file, the
+        uncompressed copy beside it and the folder they were made in. Only
+        those two names are removed, so nothing else can be lost."""
+        for path in (compressed_path, compressed_path[: -len(".lz")]):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError as remove_error:
+                logger.warning(f"Could not remove '{path}': {remove_error}")
+        try:
+            os.rmdir(os.path.dirname(compressed_path))
+        except OSError as remove_error:
+            logger.warning(f"Could not remove upload folder: {remove_error}")
 
     # -----------------------------------------------------------------------
     def _decompress_downloaded_file_in_place(self, filepath):
@@ -6834,6 +6912,67 @@ class Makera(RelativeLayout):
         except OSError:
             pass
         return self._verify_deferred_download_md5(filepath)
+
+    # -----------------------------------------------------------------------
+    def _save_machine_file_to_device(self, remote_path, dest):
+        """Worker-thread body of save_machine_file_to_device.
+
+        The download, its decompress and both checksums happen in a folder
+        of its own inside the temp folder. Only a complete, verified file is
+        then put at `dest`, in one step (_replace_file). Nothing else in the
+        chosen folder is touched, and if anything fails the file already at
+        `dest`, if any, stays exactly as it was and the user is told why."""
+        folder = tempfile.mkdtemp(prefix="save-", dir=self.temp_dir)
+        staged = os.path.join(folder, os.path.basename(dest))
+        try:
+            if os.path.exists(dest):
+                # Lets the machine skip sending a file that is already the same.
+                shutil.copyfile(dest, staged)
+            result = self.doDownload(remote_path, staged, open_after=False, decompress=False)
+            if result is None or result < 0:
+                return  # failed or cancelled; doDownload has said so
+            if result == 0 and os.path.exists(dest):
+                return  # the machine's copy is the same as the one already saved
+            if self._replace_file(dest, partial(self._fill_from_download, staged, dest)):
+                self._ingest_machine_gcode_thumbnail(remote_path, dest)
+        except Exception as exc:
+            logger.exception("Could not save %s to %s", remote_path, dest)
+            Clock.schedule_once(
+                partial(self.show_message_popup, tr._("Could not save the file:") + "\n%s\n%s" % (dest, exc), False),
+                0,
+            )
+        finally:
+            for path in (staged, staged + ".tmp"):
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except OSError:
+                    logger.warning("Could not remove %s", path)
+            try:
+                os.rmdir(folder)
+            except OSError:
+                logger.warning("Could not remove %s", folder)
+
+    # -----------------------------------------------------------------------
+    def _fill_from_download(self, staged, dest, partial_path):
+        """Write the downloaded file `staged` to `partial_path`, decompressing
+        it first if the machine sent it compressed. Returns True only if the
+        result is complete and verified; otherwise the user has been told
+        why. Used through _replace_file."""
+        with open(staged, "rb") as handle:
+            compressed = handle.read(2) == b"\x00\x00"
+        if not compressed:
+            shutil.copyfile(staged, partial_path)
+            return True
+        if not self.decompress_file(staged, partial_path):
+            message = (
+                tr._("The downloaded file could not be decompressed, so it was not saved. It may be damaged.")
+                + "\n%s" % dest
+            )
+            Clock.schedule_once(partial(self.show_message_popup, message, False), 0)
+            return False
+        # On a mismatch this shows its own message.
+        return self._verify_deferred_download_md5(partial_path)
 
     # -----------------------------------------------------------------------
     def _verify_deferred_download_md5(self, filepath):
@@ -7165,16 +7304,59 @@ class Makera(RelativeLayout):
             firmware = bool(self.file_popup.firmware_mode)
         self._uploading_firmware = bool(firmware)
         self.controller.sendNUM = SEND_FILE
-        self.uploading_file = filepath
-        self.original_upload_filepath = filepath  # Store original path for recent directory tracking
-        if "lz" in self.filetype and not self._uploading_firmware:  # Compress file if supported
-            qlzfilename = self.compress_file(filepath)
-            if qlzfilename:
-                self.uploading_file = qlzfilename
-        threading.Thread(target=self.doUpload, args=(callback,)).start()
+        self._compressed_upload_copy = None
+        try:
+            self.uploading_file = filepath
+            self.original_upload_filepath = filepath  # Store original path for recent directory tracking
+            if "lz" in self.filetype and not self._uploading_firmware:  # Compress file if supported
+                qlzfilename = self.compress_file(filepath)
+                if qlzfilename:
+                    self.uploading_file = qlzfilename
+                    if qlzfilename != filepath:
+                        self._compressed_upload_copy = qlzfilename
+                else:
+                    note = tr._("Could not compress {}; uploading it uncompressed.").format(os.path.basename(filepath))
+                    self.controller.log.put((Controller.MSG_NORMAL, note))
+            threading.Thread(target=self.doUpload, args=(callback,)).start()
+        except Exception as exc:
+            # doUpload never ran, so nothing else will clear the busy mark.
+            self.controller.sendNUM = 0
+            logger.exception("Upload could not start")
+            self.controller.log.put((Controller.MSG_ERROR, tr._("Upload could not start: {}").format(exc)))
+            Clock.schedule_once(partial(self.show_message_popup, tr._("Upload file error!"), False), 0)
+            if firmware:
+                self._log_firmware("SD transfer failed: %s" % exc, error=True)
+            self._cleanup_firmware_temp(success=False)
+            self._uploading_firmware = False
+            self._remove_compressed_upload_copy()
+
+    # -----------------------------------------------------------------------
+    def _remove_compressed_upload_copy(self):
+        copy = self._compressed_upload_copy
+        self._compressed_upload_copy = None
+        if copy:
+            self._remove_upload_copy(copy)
 
     # -----------------------------------------------------------------------
     def doUpload(self, callback):
+        """Worker-thread body of uploadLocalFile. However it ends -- an
+        early return, an error before or after the transfer, or the
+        transfer failing -- sendNUM and uploading are cleared. While
+        sendNUM is set the link counts as busy with this upload and no
+        status queries are sent; while uploading is set the status light
+        stops blinking and a firmware install is refused.
+
+        The compressed copy made for the upload, if any, is removed here
+        too. Only that copy: the file the user chose is never removed, even
+        if its own name ends in ".lz"."""
+        try:
+            self._upload_file(callback)
+        finally:
+            self.uploading = False
+            self.controller.sendNUM = 0
+            self._remove_compressed_upload_copy()
+
+    def _upload_file(self, callback):
         firmware = bool(self._uploading_firmware)
         upload_result = None
         local_path = self.uploading_file
@@ -7240,15 +7422,9 @@ class Makera(RelativeLayout):
             self.controller.log.put((Controller.MSG_NORMAL, tr._("Uploading is canceled manually.")))
             if firmware:
                 self._log_firmware("SD transfer cancelled")
-            # 如果为压缩后的'.lz'文件则删除该文件
-            if self.uploading_file.endswith(".lz"):
-                os.remove(self.uploading_file)
         elif not upload_result:
             if firmware:
                 self._log_firmware("SD transfer failed", error=True)
-            # 如果为压缩后的'.lz'文件则删除该文件
-            if self.uploading_file.endswith(".lz"):
-                os.remove(self.uploading_file)
             if last_file_error:
                 self.controller.log.put((Controller.MSG_ERROR, last_file_error))
             Clock.schedule_once(partial(self.show_message_popup, tr._("Upload file error!"), False), 0)
@@ -7340,10 +7516,9 @@ class Makera(RelativeLayout):
             if self.uploading_file.endswith(".lz"):
                 self.log = logging.getLogger("File.Decompress")
                 self.decompstatus = True
-                os.remove(self.uploading_file)
                 self.decomptime = time.time()
                 Clock.schedule_once(
-                    partial(self.progressStart, tr._("Decompressing") + "\n%s" % displayname, False), 0.2
+                    partial(self._open_decompress_progress, tr._("Decompressing") + "\n%s" % displayname), 0.2
                 )
 
         self.controller.sendNUM = 0
@@ -7630,6 +7805,23 @@ class Makera(RelativeLayout):
         Clock.schedule_once(self.progressFinish, 0)
         Clock.schedule_once(partial(self.show_message_popup, message, False), 0)
 
+    # -----------------------------------------------------------------------
+    def _open_decompress_progress(self, text, *args):
+        """Open the "Decompressing" popup, but only while the decompress
+        wait is still running.
+
+        doUpload schedules this a short delay after the upload ends, so the
+        "Uploading" popup has closed first. A small file can finish
+        decompressing on the machine within that delay (its final
+        "decompart" reply can arrive with the upload's own reply), and
+        updateCompressProgress has then already scheduled the popup's close.
+        Opening it after that close would leave it on screen, with Cancel
+        disabled and nothing left to close it.
+        """
+        if not self.decompstatus:
+            return
+        self.progressStart(text, False)
+
     # --------------------------------------------------------------`---------
     def updateCompressProgress(self, value):
         # self.fileCompressionBlocks is 0 only when there was nothing to
@@ -7639,10 +7831,13 @@ class Makera(RelativeLayout):
         percent = 100.0 if total_blocks <= 0 else value * 100.0 / total_blocks
         Clock.schedule_once(partial(self.progressUpdate, percent, "", True), 0)
         if value == self.fileCompressionBlocks:
+            # End the wait before scheduling the popup's close, so a pending
+            # _open_decompress_progress can never see the wait still running
+            # after that close has run.
+            self.decompstatus = False
             Clock.schedule_once(self.progressFinish, 0)
             # Refresh the remote dir since upload finished
             Clock.schedule_once(self.file_popup.refresh_machine, 0)
-            self.decompstatus = False
             # Call pending callback after decompression completes (for .lz files)
             if hasattr(self, "pending_decompress_callback") and self.pending_decompress_callback:
                 # Capture callback before clearing it
@@ -9087,15 +9282,82 @@ class Makera(RelativeLayout):
                 # snapshot must too, or the next Apply would see a change
                 # that was already applied and resend it.
                 self.config_popup._widget_snapshot[(widget.section, widget.key)] = widget.value
+        refused = None
         if failures:
             reasons = "\n".join(f"{key}: {reason}" for key, reason in failures)
-            self.message_popup.lb_content.text = tr._(
-                "Could not apply the following settings; reverted to the current value:\n{reasons}"
-            ).format(reasons=reasons)
-        else:
-            self.message_popup.lb_content.text = tr._("Settings applied, need machine reset to take effect !")
+            refused = tr._("Could not apply the following settings; reverted to the current value:\n{reasons}").format(
+                reasons=reasons
+            )
+        sent = [key for key in pending if key not in failed_keys]
+        if sent:
+            # The result is shown once config.txt has been read back
+            # (_report_apply_readback).
+            self._start_apply_readback(ApplyReadback(sent, refused))
+            return
+        self.message_popup.lb_content.text = refused
         self.message_popup.open()
         self.download_config_file()
+
+    def _start_apply_readback(self, readback):
+        """Read /sd/config.txt back to confirm the settings in ``readback``.
+        finishLoadConfig reports the outcome through _report_apply_readback.
+        The modem's last transfer error is cleared first, so a reason left
+        by an earlier transfer is not given for this one."""
+        readback.reason = None
+        modem = getattr(getattr(self.controller, "stream", None), "modem", None)
+        if modem is not None:
+            modem.last_file_error = None
+        self._apply_readback = readback
+        self.download_config_file()
+
+    def _readback_failure_reason(self, md5_failed):
+        """Why reading config.txt back failed, in words for the settings
+        page: the machine's own reason when the transfer recorded one (a
+        refusal, a cancel with a message, a stall), else what is known."""
+        if md5_failed:
+            return tr._("the file arrived damaged (its MD5 hash did not match)")
+        modem = getattr(getattr(self.controller, "stream", None), "modem", None)
+        reason = getattr(modem, "last_file_error", None)
+        if reason:
+            return str(reason)
+        return tr._("the machine did not send the file")
+
+    def _report_apply_readback(self, readback, read_back):
+        """Runs on the Kivy main thread, from finishLoadConfig, once the
+        read-back after Apply has ended. When config.txt was read, the page
+        now shows what the card holds and the Apply result is shown as it
+        is. When it was not, the settings were sent and acknowledged but
+        are not confirmed: say so, without calling them applied, and offer
+        to read config.txt again."""
+        if read_back:
+            self.message_popup.lb_content.text = readback.refused or tr._(
+                "Settings applied, need machine reset to take effect !"
+            )
+            self.message_popup.open()
+            return
+        reason = readback.reason or tr._("the machine did not send the file")
+        self.controller.log.put(
+            (
+                Controller.MSG_ERROR,
+                tr._("Settings sent but not confirmed: could not read config.txt back ({reason})").format(
+                    reason=reason
+                ),
+            )
+        )
+        text = tr._(
+            "Sent to the machine, but could not be confirmed: {keys}\n\n"
+            "Reading config.txt back from the machine failed: {reason}\n\n"
+            "Do not rely on the new value until it is confirmed. "
+            "Check again reads config.txt from the machine once more."
+        ).format(keys=", ".join(readback.sent), reason=reason)
+        if readback.refused:
+            text = readback.refused + "\n\n" + text
+        self.confirm_popup.lb_title.text = tr._("Settings not confirmed")
+        self.confirm_popup.lb_content.text = text
+        self.confirm_popup.confirm_text = tr._("Check again")
+        self.confirm_popup.confirm = partial(self._start_apply_readback, readback)
+        self.confirm_popup.cancel = None
+        self.confirm_popup.open(self)
 
     def apply_controller_setting_changes(self):
         if self.controller_setting_change_list.get("ui_density_override") or self.controller_setting_change_list.get(
@@ -9663,6 +9925,32 @@ class Makera(RelativeLayout):
         Clock.schedule_once(partial(self.load_error, msg), 0)
 
     # ------------------------------------------------------------------------
+    def _mark_gcode_cannot_visualise(self, *args):
+        """Set gcode_cannot_visualise on the main thread, for a load_gcode_file
+        that failed on a worker thread: the Resume at line button and
+        checkbox are bound to it."""
+        self.gcode_cannot_visualise = True
+
+    # ------------------------------------------------------------------------
+    def _end_failed_load(self, *args, message=None):
+        """Clear loading_file on the main thread for a load_gcode_file that
+        stopped without reaching load_end. load_start, which sets it, runs
+        through the same Clock and was scheduled first, so a failure that
+        happens before load_start has run cannot be undone by it.
+
+        The file did not load, so it is also no longer the loaded file for
+        resume at line: self.lines may still hold an earlier copy of it.
+
+        Closes the progress popup the open path showed (it cannot be closed
+        by hand: Cancel is disabled until the first batch is drawn) and, if
+        `message` is given, tells the user why the file did not open."""
+        self.loading_file = False
+        self._last_loaded_file_key = None
+        self.progress_popup.dismiss()
+        if message:
+            self.show_message_popup(message, False)
+
+    # ------------------------------------------------------------------------
     def load_error(self, error_msg, *args):
         self._clear_tool_change_markers()
         self.progress_popup.dismiss()
@@ -9759,6 +10047,66 @@ class Makera(RelativeLayout):
         self.load_page(0)
 
     # -----------------------------------------------------------------------
+    def _replace_file(self, filepath, fill):
+        """Put a new version of `filepath` in place in one step, or leave it
+        exactly as it was.
+
+        `fill(partial_path)` writes the new version to a hidden file in the
+        same folder and returns True only if it is complete and verified.
+        Only then is that file renamed over `filepath`: os.replace, a single
+        step within one folder, which also overwrites on Windows. The new
+        version keeps the permissions of the file it replaces; a new file
+        gets the usual permissions for a new file. Otherwise, or if anything
+        raises, only the hidden file is removed. Returns what `fill`
+        returned."""
+        folder, filename = os.path.split(os.path.abspath(filepath))
+        partial_path = os.path.join(folder, ".%s.%s.tmp" % (filename, secrets.token_hex(4)))
+        # O_EXCL: never reuse a file that is already there.
+        os.close(os.open(partial_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666))
+        try:
+            if not fill(partial_path):
+                return False
+            if os.path.exists(filepath):
+                try:
+                    shutil.copymode(filepath, partial_path)
+                except OSError:
+                    pass
+            os.replace(partial_path, filepath)
+            return True
+        finally:
+            if os.path.exists(partial_path):
+                try:
+                    os.remove(partial_path)
+                except OSError:
+                    logger.warning("Could not remove partial file %s", partial_path)
+
+    # -----------------------------------------------------------------------
+    def _decompress_over(self, lzpath, filepath):
+        """Decompress the QuickLZ file `lzpath` and put the result at
+        `filepath`, the compressed file being opened, but only once the
+        result is complete and has passed both checksums (_replace_file): on
+        any failure the file the user opened stays exactly as it was.
+
+        Returns False on failure, after scheduling _end_failed_load with the
+        reason. Called from load_gcode_file's worker thread."""
+
+        def fill(partial_path):
+            if not self.decompress_file(lzpath, partial_path):
+                message = (
+                    tr._("This file is compressed and could not be decompressed. It may be damaged.")
+                    + "\n%s" % filepath
+                )
+                Clock.schedule_once(partial(self._end_failed_load, message=message), 0)
+                return False
+            if not self._verify_deferred_download_md5(partial_path):
+                # The checksum check has already scheduled its own message.
+                Clock.schedule_once(self._end_failed_load, 0)
+                return False
+            return True
+
+        return self._replace_file(filepath, fill)
+
+    # -----------------------------------------------------------------------
     def load_gcode_file(self, filepath):
         self.load_event.set()
         self.upcoming_tool = 0
@@ -9786,9 +10134,7 @@ class Makera(RelativeLayout):
                     os.makedirs(os.path.dirname(lzpath))
                 lzpath = lzpath + ".lz"
                 shutil.copyfile(filepath, lzpath)
-                if not self.decompress_file(lzpath, filepath):
-                    return
-                if not self._verify_deferred_download_md5(filepath):
+                if not self._decompress_over(lzpath, filepath):
                     return
 
             # Load all lines from the file
@@ -9856,10 +10202,10 @@ class Makera(RelativeLayout):
         except Exception:
             logger.error(sys.exc_info()[1])
             self.heartbeat_time = time.time()
-            self.loading_file = False
+            Clock.schedule_once(self._end_failed_load, 0)
             if f:
                 f.close()
-            self.gcode_cannot_visualise = True
+            Clock.schedule_once(self._mark_gcode_cannot_visualise, 0)
             self.controller.log.put(
                 (
                     Controller.MSG_ERROR,

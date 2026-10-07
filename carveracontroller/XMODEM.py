@@ -130,6 +130,18 @@ CRC = b"C"
 MD5_HEX_DIGITS = frozenset("0123456789abcdef")
 MD5_HEX_LENGTH = 32
 
+# A framed transfer ends once this many seconds pass with other frames
+# (status reports, events, replies) arriving but none of the transfer's own
+# packets among them. The machine does not publish status while it runs a
+# transfer, so a steady stream of other frames with no transfer packet means
+# it is not running this one. Its own limit for a transfer that hears
+# nothing from the controller is 29 seconds.
+TRANSFER_STALL_TIMEOUT_S = 30
+
+# What _other_frame() found, when the transfer cannot go on.
+_REFUSED = "refused"
+_STALLED = "stalled"
+
 
 class RevPacketState(Enum):
     WAIT_HEADER = auto()
@@ -459,8 +471,12 @@ class XMODEM:
         # until after decompress. Cleared at the start of each download and after checking.
         self.deferred_download_md5 = None
         self.download_md5_failed = False
-        # Text from a FILE_CAN payload when the machine included one.
+        # Why the last framed transfer failed, when there is a reason to
+        # show: a FILE_CAN payload, the machine's refusal reply, or a stall.
         self.last_file_error = None
+        # Frame bodies (packetData) that arrived during the last framed
+        # transfer but were not part of it; see take_other_frames().
+        self.other_frames = []
 
     def clear_mode_set(self):
         self.mode_set = False
@@ -496,6 +512,43 @@ class XMODEM:
 
     def _send_file_trans_command(self, cmd: int, data: bytes) -> None:
         self.putc(build_frame(cmd, data))
+
+    def take_other_frames(self):
+        """Return the frames kept by the last framed transfer, oldest first,
+        and forget them. The controller dispatches them once the transfer
+        has handed the link back."""
+        frames, self.other_frames = self.other_frames, []
+        return frames
+
+    def _other_frame(self, last_progress):
+        """Deal with a frame in ``packetData`` that arrived during a framed
+        transfer but is not part of it: anything below PTYPE_FILE_MD5, such
+        as a status report, a published event or console line, or a reply.
+
+        The machine's control gate refuses a transfer with one reply line
+        (``error:Refused -- ...``, see machine/control_refusal.py) sent as
+        PTYPE_NORMAL_INFO, and then never starts it. That ends the transfer
+        at once: returns _REFUSED with the reply in ``last_file_error``,
+        where the caller reports it. Every other frame is kept for the
+        controller (``other_frames``). Returns _STALLED when no transfer
+        packet has arrived since ``last_progress`` for longer than
+        TRANSFER_STALL_TIMEOUT_S, else None to carry on waiting.
+        """
+        if self.packetData[2] == PTYPE_NORMAL_INFO:
+            reason = self._file_packet_text()
+            if is_control_refusal(reason):
+                self.last_file_error = reason
+                self.log.info("Transmission refused by Machine: %s", reason)
+                return _REFUSED
+        self.other_frames.append(bytes(self.packetData))
+        if time.time() - last_progress > TRANSFER_STALL_TIMEOUT_S:
+            self.last_file_error = (
+                f"Transfer stopped: the machine has not answered the file transfer for "
+                f"{TRANSFER_STALL_TIMEOUT_S:g} seconds"
+            )
+            self.log.info("%s", self.last_file_error)
+            return _STALLED
+        return None
 
     @staticmethod
     def _normalize_advertised_md5(expected_md5):
@@ -643,7 +696,10 @@ class XMODEM:
         first_bytes = bytearray()
         self.deferred_download_md5 = None
         self.download_md5_failed = False
+        self.last_file_error = None
+        self.other_frames = []
         self.FileRcvState = FileTransState.WAIT_MD5
+        last_progress = time.time()
         while True:
             if self.canceled:
                 self._send_file_trans_command(PTYPE_FILE_CAN, b"")
@@ -654,7 +710,14 @@ class XMODEM:
             if result:
                 cmd_type = self.packetData[2]
                 if cmd_type < PTYPE_FILE_MD5:
-                    continue
+                    outcome = self._other_frame(last_progress)
+                    if outcome is None:
+                        continue
+                    if outcome == _STALLED:
+                        self._send_file_trans_command(PTYPE_FILE_CAN, b"")
+                    self.FileRcvState = FileTransState.WAIT_MD5
+                    return None
+                last_progress = time.time()
                 if cmd_type == PTYPE_FILE_CAN:
                     self.log.info("Transmission canceled by Machine.")
                     self.FileRcvState = FileTransState.WAIT_MD5
@@ -767,6 +830,7 @@ class XMODEM:
         packet_size = self._framed_packet_size()
         data = md5.encode()
         self.last_file_error = None
+        self.other_frames = []
         self._send_file_trans_command(PTYPE_FILE_MD5, data)
         lastcmd = PTYPE_FILE_MD5
         lastseq = 0
@@ -780,28 +844,17 @@ class XMODEM:
                 return None
             result = self.recv_packet(timeout * 8)
             if result:
-                td = time.time()
                 cmd_type = self.packetData[2]
                 if cmd_type < PTYPE_FILE_MD5:
-                    if cmd_type == PTYPE_NORMAL_INFO:
-                        # Every ordinary command reply, including the
-                        # control gate's own refusal (ControlToken.cpp),
-                        # arrives as this type -- see
-                        # WifiProvider::printf()/PacketMessage(). Nothing
-                        # else sent as PTYPE_NORMAL_INFO belongs to this
-                        # transfer, but a refusal means the firmware will
-                        # never start one: stop waiting for file-transfer
-                        # packets that are not coming, the same way a
-                        # PTYPE_FILE_CAN with a reason does below, instead
-                        # of falling through to the plain `continue` and
-                        # only giving up once the 9s receive-timeout fires
-                        # with no reason at all.
-                        reason = self._file_packet_text()
-                        if is_control_refusal(reason):
-                            self.last_file_error = reason
-                            self.log.info("Transmission refused by Machine: %s", reason)
-                            return None
-                    continue
+                    # Not part of this transfer, and not progress either:
+                    # td moves only for the transfer's own packets.
+                    outcome = self._other_frame(td)
+                    if outcome is None:
+                        continue
+                    if outcome == _STALLED:
+                        self._send_file_trans_command(PTYPE_FILE_CAN, b"")
+                    return None
+                td = time.time()
                 if cmd_type == PTYPE_FILE_CAN:
                     # Abort on both C1/CA1 and Z1. Success is FILE_END. C1/CA1 may
                     # payload `ok`; Z1 may payload the open-error string.

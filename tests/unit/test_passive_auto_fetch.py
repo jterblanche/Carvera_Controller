@@ -25,6 +25,8 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from carveracontroller import Utils
+from carveracontroller.CNC import CNC
 from carveracontroller.machine.passive_fetch import (
     MAX_FETCH_ATTEMPTS,
     RETRY_BACKOFF_S,
@@ -253,6 +255,41 @@ def test_check_passive_fetch_does_not_overlap_a_fetch_already_in_flight(monkeypa
     assert started == []  # never started a second worker thread
     # The path is still owed -- a fetch under way is not the same as loaded.
     assert root._passive_fetch.pending_path == "/sd/job.nc"
+
+
+def _status_with_player_flag(monkeypatch, is_playing):
+    """Firmware that reports the player flag, with the given flag in the
+    latest status report."""
+    app = SimpleNamespace(is_community_firmware=True, fw_version_digitized=Utils.digitize_v("2.2.0"))
+    monkeypatch.setattr("carveracontroller.main.App.get_running_app", lambda: app)
+    monkeypatch.setitem(CNC.vars, "is_playing", is_playing)
+
+
+def test_an_idle_report_mid_job_does_not_start_a_fetch(monkeypatch, tmp_path):
+    """The firmware reports Idle whenever its motion queue is empty, also
+    while the player is playing (tool change, probe, start-of-job routine).
+    The player flag in the same report keeps the fetch waiting."""
+    root = _passive_host(tmp_path)
+    root._passive_fetch.note_published_file("/sd/job.nc")
+    started = []
+    monkeypatch.setattr(
+        "carveracontroller.main.threading.Thread",
+        lambda target=None, args=(), **kwargs: started.append(args) or MagicMock(),
+    )
+    _status_with_player_flag(monkeypatch, 1)
+
+    for _ in range(5):
+        Makera._check_passive_fetch(root, is_idle=True)
+
+    assert started == []
+    assert root._passive_fetch.pending_path == "/sd/job.nc"
+
+    # The job ends: the player flag drops to 0 and the fetch is released.
+    monkeypatch.setitem(CNC.vars, "is_playing", 0)
+    for _ in range(3):
+        Makera._check_passive_fetch(root, is_idle=True)
+
+    assert started == [("/sd/job.nc",)]
 
 
 def test_on_passive_file_published_blanks_a_stale_selection(monkeypatch, tmp_path):

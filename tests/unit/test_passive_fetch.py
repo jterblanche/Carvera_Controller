@@ -4,6 +4,7 @@ select itself, versus just showing progress until the machine goes idle."""
 
 from __future__ import annotations
 
+from carveracontroller.machine import passive_fetch
 from carveracontroller.machine.passive_fetch import (
     MAX_FETCH_ATTEMPTS,
     RETRY_BACKOFF_S,
@@ -144,3 +145,96 @@ def test_a_fetch_failure_does_not_mark_the_path_loaded():
     t.note_fetch_failed("/sd/job.nc", now=0.0)
     t.note_published_file("/sd/job.nc")  # a later event re-announces it
     assert t.due_fetch(is_idle=True, now=0.0) == "/sd/job.nc"
+
+
+# The player flag: the fourth value of the status report's P: field
+# (P:<lines>,<percent>,<elapsed>,<playing>,...). The state word alone is not
+# enough: the firmware reports Idle whenever the motion queue is empty,
+# including mid-job during a tool change, a probe or the start-of-job
+# routine, while the player is still playing.
+
+
+def test_an_idle_report_while_the_player_is_playing_does_not_release_the_fetch():
+    t = PassiveFetchTracker()
+    t.note_published_file("/sd/job.nc")
+    for _ in range(passive_fetch.SETTLE_SAMPLES + 2):
+        assert t.due_fetch(is_idle=True, playing=True) is None
+    assert t.pending_path == "/sd/job.nc"  # still owed, not dropped
+
+
+def test_a_job_with_idle_moments_is_fetched_only_after_the_player_stops():
+    """The status sequence of a job that empties its motion queue mid-job
+    (tool change, probe, start-of-job routine): Run and Idle alternate while
+    the player flag stays 1. The fetch is released only once the player
+    reports 0 at the end of the job."""
+    t = PassiveFetchTracker()
+    t.note_published_file("/sd/job.nc")
+    mid_job = [(False, True), (True, True), (True, True), (False, True), (True, True), (False, True)]
+    for is_idle, playing in mid_job:
+        assert t.due_fetch(is_idle=is_idle, playing=playing) is None
+    results = [t.due_fetch(is_idle=True, playing=False) for _ in range(passive_fetch.SETTLE_SAMPLES)]
+    assert results[-1] == "/sd/job.nc"
+    assert all(r is None for r in results[:-1])
+
+
+def test_one_not_playing_sample_after_a_publish_is_not_enough():
+    """The report a controller holds when the event arrives may predate the
+    event, so a release needs SETTLE_SAMPLES consecutive observations."""
+    t = PassiveFetchTracker()
+    t.note_published_file("/sd/job.nc")
+    for _ in range(passive_fetch.SETTLE_SAMPLES - 1):
+        assert t.due_fetch(is_idle=True, playing=False) is None
+    assert t.due_fetch(is_idle=True, playing=False) == "/sd/job.nc"
+
+
+def test_a_playing_sample_restarts_the_settle_count():
+    t = PassiveFetchTracker()
+    t.note_published_file("/sd/job.nc")
+    for _ in range(passive_fetch.SETTLE_SAMPLES - 1):
+        assert t.due_fetch(is_idle=True, playing=False) is None
+    assert t.due_fetch(is_idle=True, playing=True) is None
+    for _ in range(passive_fetch.SETTLE_SAMPLES - 1):
+        assert t.due_fetch(is_idle=True, playing=False) is None
+    assert t.due_fetch(is_idle=True, playing=False) == "/sd/job.nc"
+
+
+def test_a_publish_restarts_the_settle_count():
+    """Reports seen before the event do not count towards releasing it."""
+    t = PassiveFetchTracker()
+    for _ in range(passive_fetch.SETTLE_SAMPLES + 1):
+        t.due_fetch(is_idle=True, playing=False)
+    t.note_published_file("/sd/job.nc")
+    assert t.due_fetch(is_idle=True, playing=False) is None
+    assert t.pending_path == "/sd/job.nc"
+
+
+def test_not_playing_but_not_idle_still_waits():
+    """Jogging or an alarm with no job playing: the state word still has to
+    say Idle, as without the flag."""
+    t = PassiveFetchTracker()
+    t.note_published_file("/sd/job.nc")
+    for _ in range(passive_fetch.SETTLE_SAMPLES + 2):
+        assert t.due_fetch(is_idle=False, playing=False) is None
+    assert t.pending_path == "/sd/job.nc"
+
+
+def test_without_a_player_flag_a_single_idle_sample_releases_the_fetch():
+    """Firmware that does not report the flag: the state word decides, on
+    the first Idle report."""
+    t = PassiveFetchTracker()
+    t.note_published_file("/sd/job.nc")
+    assert t.due_fetch(is_idle=False, playing=None) is None
+    assert t.due_fetch(is_idle=True, playing=None) == "/sd/job.nc"
+
+
+def test_player_flag_trusts_a_reported_playing_value():
+    # Only firmware that reports the flag can set it, so 1 always means playing.
+    assert passive_fetch.player_flag(1, reports_flag=True) is True
+    assert passive_fetch.player_flag(1, reports_flag=False) is True
+
+
+def test_player_flag_trusts_zero_only_from_firmware_that_reports_the_flag():
+    assert passive_fetch.player_flag(0, reports_flag=True) is False
+    # Zero is also the value when the field is absent, so it says nothing
+    # about firmware that may not report it.
+    assert passive_fetch.player_flag(0, reports_flag=False) is None
