@@ -815,7 +815,7 @@ class XMODEM:
                 error_count += 1
                 if error_count >= 1:
                     totalerr_count += 1
-                    self._send_file_trans_command(PTYPE_FILE_RETRY, b"")
+                    self._ask_again_for_download_packet(sequence)
                     self.packetData.clear()
 
             if totalerr_count >= retry:
@@ -824,6 +824,31 @@ class XMODEM:
                 self.abort_framed()
                 self.FileRcvState = FileTransState.WAIT_MD5
                 return None
+
+    def _ask_again_for_download_packet(self, sequence):
+        """Nothing usable arrived in time during a download: ask again for
+        what the download is waiting for, naming it (the digest, the file
+        view, or data packet ``sequence``), never with FILE_RETRY.
+
+        The machine's download loop (Player::download_command) answers a
+        FILE_RETRY by resending its last packet, and remembers that it did
+        until it next serves a data request; that next request is then
+        served from the sequence number it last stored instead of the one
+        asked for. Before any data has gone out that stored number is 0,
+        so a RETRY answered with the digest or the file view makes the
+        first data request read from before the start of the file: the
+        read comes back empty and the machine ends the download with
+        FILE_CAN and "Error: Machine read file error!". On USB a RETRY
+        goes out after 0.3 seconds of silence (USBStream's read timeout),
+        so a machine slow to send the digest was enough to trigger it.
+        Asking by name gives the machine the same answer it would have
+        resent, without the stored state."""
+        if self.FileRcvState == FileTransState.WAIT_MD5:
+            self._send_file_trans_command(PTYPE_FILE_MD5, b"")
+        elif self.FileRcvState == FileTransState.WAIT_FILE_VIEW:
+            self._send_file_trans_command(PTYPE_FILE_VIEW, b"")
+        else:
+            self._send_file_trans_command(PTYPE_FILE_DATA, sequence.to_bytes(4, byteorder="big", signed=False))
 
     def send(self, stream, md5, retry=16, timeout=5, quiet=False, callback=None):
         """Send a file using the Makera framed transfer protocol."""
