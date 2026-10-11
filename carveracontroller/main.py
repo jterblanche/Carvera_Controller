@@ -267,6 +267,7 @@ from kivy.core.text import LabelBase
 from kivy.core.window import Window
 from kivy.resources import resource_add_path
 
+from . import toolpath_budget
 from .WIFIStream import MachineDetector
 
 if sys.platform == "ios":
@@ -10575,6 +10576,27 @@ class Makera(RelativeLayout):
         self.message_popup.open(self)
 
     # ------------------------------------------------------------------------
+    def _show_toolpath_skipped(self, skipped):
+        """The file loaded without its toolpath (load_gcode_file found it
+        too large for the memory free): features that need the toolpath
+        are off, as for a file that cannot be visualised, and the user is
+        told why. ``skipped`` is (points needed, budget)."""
+        points, budget = skipped
+        self.gcode_cannot_visualise = True
+        logger.warning(
+            "Toolpath of %s not drawn: more than %d points needed, budget %d",
+            getattr(App.get_running_app(), "selected_local_filename", ""),
+            points,
+            budget,
+        )
+        message = tr._(
+            "This file's toolpath is too large to draw with the memory this computer has free, so it is not shown. "
+            "The file is loaded and can still be run."
+        )
+        self.controller.log.put((Controller.MSG_NORMAL, message))
+        self.show_message_popup(message, False)
+
+    # ------------------------------------------------------------------------
     def load_end(self, *args):
         if self.load_canceled:
             self.gcode_viewer.load_array([], True)
@@ -10591,6 +10613,9 @@ class Makera(RelativeLayout):
             self.gcode_cannot_visualise = False
             self.gcode_viewer_distance = self.gcode_viewer.get_total_distance()
             self.gcode_viewer.show_all()
+        skipped = getattr(self, "_toolpath_skipped", None)
+        if skipped is not None:
+            self._show_toolpath_skipped(skipped)
 
         self._push_path_visibility()
         self.refresh_gcode_color_legend()
@@ -10728,6 +10753,9 @@ class Makera(RelativeLayout):
         # Every file drawn here is a local copy the machine may later play.
         self._local_copies.remember(filepath)
         self._job_without_toolpath = None
+        # (points needed so far, budget) once the toolpath is found too
+        # large to draw; load_end tells the user.
+        self._toolpath_skipped = None
         self.load_event.set()
         self.upcoming_tool = 0
         self.file_has_ocodes = False
@@ -10782,6 +10810,10 @@ class Makera(RelativeLayout):
             Clock.schedule_once(partial(self.load_page, 1), 0)
             f = None
             line_no = 1
+            # A toolpath too large for the memory free is not drawn: the
+            # file still loads (text, tools, run), without the toolpath.
+            point_budget = toolpath_budget.point_budget(toolpath_budget.available_memory_bytes())
+            drawn_points = 0
             # now = time.time()
             # temp_list = []
             for line in self.lines:
@@ -10812,6 +10844,16 @@ class Makera(RelativeLayout):
                     parsed_list = self.cnc.coordinates
                     self.load_event.wait()
                     self.load_event.clear()
+                    if self._toolpath_skipped is None:
+                        drawn_points += len(parsed_list)
+                        if toolpath_budget.over_budget(drawn_points, point_budget):
+                            self._toolpath_skipped = (drawn_points, point_budget)
+                            # Drop what has been drawn so far; later batches
+                            # send nothing, and the last one ends the load
+                            # with an empty view.
+                            Clock.schedule_once(lambda *_: self.gcode_viewer.begin_new_file_load(), 0)
+                    if self._toolpath_skipped is not None:
+                        parsed_list = []
                     # temp_list.extend(self.cnc.coordinates)
                     Clock.schedule_once(partial(self.load_gcodes, line_no, parsed_list), 0)
                     self.cnc.coordinates = []
