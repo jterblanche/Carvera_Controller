@@ -376,6 +376,8 @@ from .protocols.handshake import (
     JOB_START_REASON_TIME_LIMIT,
     JOB_START_STARTING,
     JOB_START_WAITING,
+    TRANSFER_DOWNLOADING,
+    TRANSFER_UPLOADING,
 )
 from .ui import widget_helpers
 from .ui.job_start_popup import (
@@ -7243,7 +7245,8 @@ class Makera(RelativeLayout):
 
         The same applies while another controller's file transfer keeps the
         machine busy (Controller.peer_transfer_active): the actions run once
-        it ends (on_peer_transfer_finished).
+        it ends (on_peer_transfer_finished). The popup names the download or
+        upload when the machine's keep-alive says which it is.
         """
         peer_transfer = getattr(self.controller, "peer_transfer_active", False)
         with self._held_for_passive_fetch_lock:
@@ -7252,7 +7255,12 @@ class Makera(RelativeLayout):
             self._held_for_passive_fetch = (*self._held_for_passive_fetch, action)
         if not self.backing_up_config:
             self._passive_fetch_hint_shown = True
-            if peer_transfer and not self._auto_fetch_in_progress:
+            direction = getattr(self.controller, "peer_transfer_direction", None)
+            if peer_transfer and not self._auto_fetch_in_progress and direction == TRANSFER_DOWNLOADING:
+                text = tr._("Waiting for another controller's download to finish...")
+            elif peer_transfer and not self._auto_fetch_in_progress and direction == TRANSFER_UPLOADING:
+                text = tr._("Waiting for another controller's upload to finish...")
+            elif peer_transfer and not self._auto_fetch_in_progress:
                 text = tr._("Waiting for another controller's file transfer to finish...")
             else:
                 text = tr._("Waiting for a download to finish...")

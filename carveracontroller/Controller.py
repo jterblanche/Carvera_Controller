@@ -26,7 +26,12 @@ from .machine.heartbeat import heartbeat_due
 from .machine.hello import HelloNegotiator, Resolution
 from .machine.identity import ControllerIdentity, default_name, generate_id
 from .machine.peer_closed import PeerClosedError
-from .machine.peer_transfer import PeerTransferWatch, is_transfer_busy_reply, transfer_allowance_s
+from .machine.peer_transfer import (
+    PeerTransferWatch,
+    is_transfer_busy_reply,
+    peer_transfer_console_line,
+    transfer_allowance_s,
+)
 from .machine.presence import PresenceAnnouncement, presence_announcement
 from .protocols import (
     HELLO_ACCEPTED,
@@ -58,6 +63,7 @@ from .protocols.handshake import (
     JOB_START_CANCELLED,
     JobStartEvent,
     decode_job_start_event,
+    decode_transfer_in_progress_event,
 )
 from .protocols.makera import encode_job_start_ready, encode_presence_reply
 from .protocols.relay import decode_transfer_relay, encode_transfer_ended_relay, encode_transfer_started_relay
@@ -497,6 +503,16 @@ class Controller:
         with nothing but its busy reply, or, for a transfer over the other
         link, with nothing at all, and the other controller has said so."""
         return self._peer_transfer.running(time.monotonic())
+
+    @property
+    def peer_transfer_direction(self):
+        """While peer_transfer_active, the direction the machine's last
+        keep-alive named (protocols/handshake.py TRANSFER_DOWNLOADING or
+        TRANSFER_UPLOADING); None when no keep-alive has said, as with
+        firmware that sends none."""
+        if not self.peer_transfer_active:
+            return None
+        return self._peer_transfer.direction
 
     def _gate_send(self, kind, payload, display):
         """Hold back an ordinary-channel send while the identify handshake
@@ -2979,9 +2995,14 @@ class Controller:
         (_refresh_heartbeat), which matters while another controller's file
         transfer keeps the machine from sending status.
 
+        The machine's keep-alive during that transfer (a transfer-in-
+        progress event, machine/peer_transfer.py) starts or continues it and
+        is handled here: returns True. The first news of a transfer goes to
+        the console as one line naming its direction.
+
         The machine's busy reply (machine/peer_transfer.py) starts or
         continues that transfer and is handled here: returns True, and
-        nothing else sees it. Only the first one of a transfer, and one
+        nothing else sees it. Only the first news of a transfer, and one
         that answers a command of this controller's, reach the console; the
         rest answer _advance_heartbeat's probes. A listing or other load
         command still waiting for its reply was turned away, so it goes
@@ -3003,6 +3024,12 @@ class Controller:
                     self._peer_transfer.end_announcement()
                 if was_running and not self.peer_transfer_active:
                     self._notify_peer_transfer_finished()
+                return True
+        if message.kind == MessageKind.EVENT:
+            direction = decode_transfer_in_progress_event(message.payload)
+            if direction is not None:
+                if self._peer_transfer.on_keepalive(time.monotonic(), direction):
+                    self.log.put((self.MSG_NORMAL, peer_transfer_console_line(direction)))
                 return True
         if message.kind == MessageKind.LINE and is_transfer_busy_reply(message.text):
             if self._peer_transfer.on_busy_reply():
@@ -3146,15 +3173,19 @@ class Controller:
         request goes out every PROBE_INTERVAL_S instead: unlike a heartbeat,
         the machine answers it even then (machine/peer_transfer.py). Only a
         machine that has sent its busy reply gets one, which firmware
-        without that reply never does.
+        without that reply never does, and none while the machine's own
+        keep-alives arrive: they prove the link already.
         """
-        if self._peer_transfer.announced(now):
-            # A transfer over the other link: the machine sends nothing
-            # until it ends, so the other controller's notice stands in for
-            # the frames that would prove the link (main.py's
-            # lost-connection check), until its end notice or its time.
+        if self._peer_transfer.silence_covered(now):
+            # A transfer over the other link, on firmware without the
+            # keep-alive: the machine sends nothing until it ends, so the
+            # other controller's notice stands in for the frames that would
+            # prove the link (main.py's lost-connection check), until its
+            # end notice or its time.
             self._refresh_heartbeat = True
-        elif self._peer_transfer.expire(now) and not self._peer_transfer.active:
+        if self._peer_transfer.expire(now) and not self._peer_transfer.running(now):
+            # A notice ran out, or the keep-alives stopped with no other
+            # frame since to end the transfer.
             self._notify_peer_transfer_finished()
         if self.stream is not None and self._peer_transfer.probe_due(now):
             # Another controller's transfer: ask something the machine

@@ -37,6 +37,7 @@ from carveracontroller.Controller import CONN_WIFI, LOAD_DIR, Controller
 from carveracontroller.machine.identity import ControllerIdentity
 from carveracontroller.machine.peer_transfer import (
     DEFAULT_ALLOWANCE_S,
+    KEEPALIVE_LAPSE_S,
     PROBE_INTERVAL_S,
     PeerTransferWatch,
     is_transfer_busy_reply,
@@ -48,12 +49,18 @@ from carveracontroller.protocols.framing import (
     PTYPE_CLIENT_LIST_REQ,
     PTYPE_CTRL_MULTI,
     PTYPE_CTRL_SINGLE,
+    PTYPE_EVENT,
     PTYPE_FILE_START,
     PTYPE_HEARTBEAT,
     PTYPE_LOAD_FINISH,
     PTYPE_NORMAL_INFO,
     PTYPE_RELAY,
     build_frame,
+)
+from carveracontroller.protocols.handshake import (
+    TRANSFER_DOWNLOADING,
+    TRANSFER_UPLOADING,
+    decode_transfer_in_progress_event,
 )
 from carveracontroller.protocols.relay import (
     decode_transfer_relay,
@@ -205,14 +212,20 @@ def _app_root(controller, now):
     return root
 
 
-def _run(controller, root, machine, clock, seconds):
+def _run(controller, root, machine, clock, seconds, push=None):
     """Run streamIO's heartbeat step and the machine's answers every tick,
-    and blink_state every half second, for `seconds` of fake time. Returns
-    the fake time at which blink_state closed the link, or None."""
+    and blink_state every half second, for `seconds` of fake time. `push`,
+    if given, is called every tick with the time and returns bytes the
+    machine sends on its own (or nothing). Returns the fake time at which
+    blink_state closed the link, or None."""
     end = clock.t + seconds
     next_blink = clock.t + BLINK_PERIOD_S
     while clock.t < end:
         clock.t += TICK_S
+        if push is not None:
+            pushed = push(clock.t)
+            if pushed:
+                _receive(controller, pushed)
         before = len(controller.stream.sent)
         controller._advance_heartbeat(clock.t)
         for frame in controller.stream.sent[before:]:
@@ -640,3 +653,257 @@ def test_tool_table_relay_is_not_a_notice():
     _receive(controller, _notice_frame(bytes([1, 1, 0, 3, 3]) + b"T3a"))
     assert not controller.peer_transfer_active
     assert controller.relayed_tool_table == {3: "T3a"}
+
+
+# -- firmware that sends the transfer keep-alive -------------------------------
+#
+# From the moment it accepts a transfer until it ends, newer firmware sends
+# every other identified controller, on both links, a transfer-in-progress
+# event (0x68, kind 9, then the direction: 0 download, 1 upload) once a
+# second. There is no end event: the keep-alives stop and status resumes.
+
+
+def _keepalive_frame(direction=TRANSFER_DOWNLOADING):
+    return build_frame(PTYPE_EVENT, bytes([9, direction]))
+
+
+STATUS_FRAME = build_frame(PTYPE_NORMAL_INFO, b"<Idle|MPos:0.000,0.000,0.000|WPos:0.000,0.000,0.000>\n")
+
+
+class _KeepAlives:
+    """The machine's keep-alives, one a second while `running`, as a `push`
+    for _run."""
+
+    def __init__(self, direction=TRANSFER_DOWNLOADING):
+        self.direction = direction
+        self.running = True
+        self.sent = 0
+        self._next = None
+
+    def __call__(self, now):
+        if not self.running:
+            return b""
+        if self._next is None or now >= self._next:
+            self._next = now + 1.0
+            self.sent += 1
+            return _keepalive_frame(self.direction)
+        return b""
+
+
+def test_keepalive_frame_decodes_to_its_direction():
+    # The frame exactly as the firmware's design gives it: 11 bytes, length 5.
+    frame = _keepalive_frame(TRANSFER_DOWNLOADING)
+    assert len(frame) == 11 and frame[:7] == bytes([0x86, 0x68, 0x00, 0x05, 0x68, 0x09, 0x00])
+    assert decode_transfer_in_progress_event(bytes([9, 0])) == TRANSFER_DOWNLOADING
+    assert decode_transfer_in_progress_event(bytes([9, 1])) == TRANSFER_UPLOADING
+    assert decode_transfer_in_progress_event(bytes([9, 1, 7, 7])) == TRANSFER_UPLOADING  # later bytes ignored
+    assert decode_transfer_in_progress_event(bytes([9])) is None  # cut short
+    assert decode_transfer_in_progress_event(bytes([8, 0])) is None  # another kind
+    assert decode_transfer_in_progress_event(b"") is None
+
+
+def test_watch_keepalives_mark_the_transfer_until_they_stop():
+    watch = PeerTransferWatch()
+    assert watch.on_keepalive(10.0, TRANSFER_UPLOADING) is True  # first news: shown
+    assert watch.on_keepalive(11.0, TRANSFER_UPLOADING) is False
+    assert watch.running(11.0 + KEEPALIVE_LAPSE_S - 0.01)
+    assert watch.direction == TRANSFER_UPLOADING
+    assert watch.expire(11.0 + KEEPALIVE_LAPSE_S - 0.01) is False
+    assert watch.expire(11.0 + KEEPALIVE_LAPSE_S) is True
+    assert not watch.running(11.0 + KEEPALIVE_LAPSE_S)
+    assert watch.direction is None
+    # Known for the rest of the connection; a new connection forgets it.
+    assert watch.firmware_keepalive is True
+    assert watch.on_keepalive(20.0, TRANSFER_DOWNLOADING) is True  # a new transfer
+    assert watch.on_other_frame() is True
+    assert watch.firmware_keepalive is True
+    watch.reset()
+    assert watch.firmware_keepalive is False
+
+
+def test_watch_no_probes_while_keepalives_prove_the_link():
+    watch = PeerTransferWatch()
+    watch.on_busy_reply()
+    watch.on_keepalive(10.0, TRANSFER_DOWNLOADING)
+    assert watch.probe_due(10.5) is False
+    # Keep-alives stop but the busy reply's transfer has not ended: probing
+    # takes over again.
+    assert watch.probe_due(10.0 + KEEPALIVE_LAPSE_S) is True
+
+
+def test_watch_notice_covers_silence_only_without_keepalives():
+    watch = PeerTransferWatch()
+    watch.announce(10.0, 600)
+    assert watch.silence_covered(11.0) is True
+    watch.on_keepalive(11.0, TRANSFER_UPLOADING)
+    assert watch.silence_covered(12.0) is False
+    assert watch.running(12.0)  # the notice still says a transfer runs
+
+
+def test_link_kept_through_a_ten_minute_transfer_on_keepalives_alone(clock):
+    """A USB controller during a WiFi download, or the reverse: no status,
+    no busy reply, no notice; only the keep-alives. Nothing is sent to the
+    machine, as before."""
+    controller = _controller_on_wire()
+    root = _app_root(controller, clock.t)
+    machine = _TransferringMachine()
+    machine.dead = True  # nothing but the keep-alives comes back
+    keepalives = _KeepAlives(TRANSFER_DOWNLOADING)
+    finished = []
+    controller._notify_peer_transfer_finished = lambda: finished.append(clock.t)
+
+    assert _run(controller, root, machine, clock, seconds=600, push=keepalives) is None
+    controller.close.assert_not_called()
+    assert keepalives.sent >= 550  # one a second, give or take a tick
+    assert controller.peer_transfer_active
+    assert controller.peer_transfer_direction == TRANSFER_DOWNLOADING
+    assert controller.stream.sent == []  # no probes, nothing at all
+    assert finished == []
+
+    # The transfer ends: keep-alives stop and status resumes.
+    keepalives.running = False
+    _receive(controller, STATUS_FRAME)
+    assert not controller.peer_transfer_active
+    assert controller.peer_transfer_direction is None
+    assert len(finished) == 1
+
+
+def test_keepalives_stopping_without_status_end_the_transfer(clock):
+    controller = _controller_on_wire()
+    root = _app_root(controller, clock.t)
+    machine = _TransferringMachine()
+    machine.dead = True
+    keepalives = _KeepAlives(TRANSFER_UPLOADING)
+    finished = []
+    controller._notify_peer_transfer_finished = lambda: finished.append(clock.t)
+
+    assert _run(controller, root, machine, clock, seconds=10, push=keepalives) is None
+    keepalives.running = False
+    stopped_at = clock.t
+    lost_at = _run(controller, root, machine, clock, seconds=20)
+    assert len(finished) == 1
+    assert finished[0] - stopped_at <= KEEPALIVE_LAPSE_S + TICK_S
+    # And with nothing else coming, the link is lost as usual.
+    assert lost_at is not None
+    assert lost_at - stopped_at <= HEARTBEAT_TIMEOUT + 2 * BLINK_PERIOD_S
+
+
+def test_with_keepalives_a_notice_no_longer_hides_a_lost_link(clock):
+    """The firmware signal wins over a notice: once the machine has sent a
+    keep-alive, a link that goes silent inside a notice is lost after the
+    usual 5 s, not when the notice runs out."""
+    controller = _controller_on_wire()
+    root = _app_root(controller, clock.t)
+    machine = _TransferringMachine()
+    machine.dead = True
+    keepalives = _KeepAlives(TRANSFER_UPLOADING)
+
+    _receive(controller, _notice_frame(encode_transfer_started_relay(transfer_allowance_s(1_048_767))))
+    assert _run(controller, root, machine, clock, seconds=30, push=keepalives) is None
+
+    keepalives.running = False  # the link goes: nothing at all from here
+    gone_at = clock.t
+    lost_at = _run(controller, root, machine, clock, seconds=60)
+    assert lost_at is not None
+    assert lost_at - gone_at <= HEARTBEAT_TIMEOUT + 2 * BLINK_PERIOD_S
+
+
+def test_wifi_busy_reply_and_keepalives_send_no_probes_until_keepalives_stop(clock):
+    """A WiFi controller during another WiFi controller's transfer gets
+    both the busy reply and the keep-alives. The keep-alives prove the
+    link, so no probes go; if they stop while the busy transfer has not
+    ended, probing takes over as with older firmware."""
+    controller = _controller_on_wire()
+    root = _app_root(controller, clock.t)
+    machine = _TransferringMachine()
+    keepalives = _KeepAlives(TRANSFER_DOWNLOADING)
+
+    _receive(controller, machine.answer(build_frame(PTYPE_HEARTBEAT), clock.t))
+    assert _run(controller, root, machine, clock, seconds=60, push=keepalives) is None
+    assert controller.stream.frames_of_type(PTYPE_CLIENT_LIST_REQ) == []
+
+    keepalives.running = False
+    assert _run(controller, root, machine, clock, seconds=60) is None
+    controller.close.assert_not_called()
+    assert len(controller.stream.frames_of_type(PTYPE_CLIENT_LIST_REQ)) >= 50
+
+
+def test_console_shows_one_line_per_transfer_naming_its_direction():
+    controller = _controller_on_wire()
+    _console(controller)
+    _receive(controller, _keepalive_frame(TRANSFER_UPLOADING))
+    _receive(controller, _keepalive_frame(TRANSFER_UPLOADING))
+    _receive(controller, BUSY_FRAME)  # first busy reply: the keep-alive already said
+    assert _console(controller) == ["Another controller is uploading a file to the machine"]
+
+    controller.executeCommand("version")
+    _receive(controller, BUSY_FRAME)  # turns this controller's own command away
+    assert _console(controller) == [BUSY_TEXT.decode().strip()]
+
+    _receive(controller, CLIENT_LIST_FRAME)  # the transfer has ended
+    _receive(controller, _keepalive_frame(TRANSFER_DOWNLOADING))
+    assert _console(controller) == ["Another controller is downloading a file from the machine"]
+
+
+def test_keepalive_is_not_shown_as_text_or_handled_as_another_event():
+    controller = _controller_on_wire()
+    _console(controller)
+    controller._on_job_start = MagicMock()
+    controller._on_file_published = MagicMock()
+    _receive(controller, _keepalive_frame())
+    controller._on_job_start.assert_not_called()
+    controller._on_file_published.assert_not_called()
+    assert controller.load_buffer.qsize() == 0
+
+
+def test_listing_turned_away_during_keepalives_goes_again_after():
+    controller = _controller_on_wire()
+    controller.loadNUM = LOAD_DIR
+    controller.loadEOF = controller.loadERR = False
+    _receive(controller, _keepalive_frame())
+    controller.lsCommand("/sd/gcodes")
+    (listing,) = controller.stream.frames_of_type(PTYPE_CTRL_MULTI)
+    _receive(controller, BUSY_FRAME)
+    _receive(controller, _keepalive_frame())
+    assert controller.stream.frames_of_type(PTYPE_CTRL_MULTI) == [listing]
+    _receive(controller, STATUS_FRAME)
+    assert controller.stream.frames_of_type(PTYPE_CTRL_MULTI) == [listing, listing]
+
+
+def test_listing_held_over_usb_during_keepalives_is_not_sent_twice():
+    """Over USB the machine holds a command until the transfer ends, then
+    answers it: no busy reply, so nothing goes again."""
+    controller = _controller_on_wire()
+    controller.loadNUM = LOAD_DIR
+    controller.loadEOF = controller.loadERR = False
+    _receive(controller, _keepalive_frame())
+    controller.lsCommand("/sd/gcodes")
+    _receive(controller, _keepalive_frame())
+    _receive(controller, STATUS_FRAME)
+    assert len(controller.stream.frames_of_type(PTYPE_CTRL_MULTI)) == 1
+
+
+def test_closing_the_link_forgets_the_keepalives():
+    controller = _controller_on_wire()
+    notified = []
+    controller._notify_peer_transfer_finished = lambda: notified.append(True)
+    _receive(controller, _keepalive_frame())
+    controller._reset_pending_sends()
+    assert not controller.peer_transfer_active
+    assert controller._peer_transfer.firmware_keepalive is False
+    assert notified == [True]
+
+
+@pytest.mark.parametrize(
+    ("direction", "words"),
+    [
+        (TRANSFER_DOWNLOADING, "another controller's download"),
+        (TRANSFER_UPLOADING, "another controller's upload"),
+        (None, "another controller's file transfer"),
+    ],
+)
+def test_waiting_popup_names_the_download_or_upload(run_clock_now, direction, words):
+    root = _held_actions_host(peer_transfer_active=True)
+    root.controller.peer_transfer_direction = direction
+    assert root._hold_for_passive_fetch(MagicMock()) is True
+    assert words in root.progressStart.call_args[0][0]
