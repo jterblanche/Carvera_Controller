@@ -670,7 +670,18 @@ class CNC:
                 # Determine the number of interpolation steps based on the largest movement
                 max_delta = max(abs(self.dx), abs(self.dy), abs(self.dz), abs(self.da))
                 steps = max(int(max_delta / 0.5), 1)  # 0.5 is an arbitrary resolution, adjust as needed
-                for i in range(1, steps + 1):
+                if self.da != 0.0:
+                    # Turning A: the drawn path curves around the A axis, so
+                    # every step is needed.
+                    step_numbers = range(1, steps + 1)
+                else:
+                    # A straight move: keep the first step and the end. The
+                    # steps between lie on the line from one to the other
+                    # and carry the same line number, feed, tool and colour,
+                    # so leaving them out draws the same path, but saves
+                    # memory for every half millimetre of travel.
+                    step_numbers = (1, steps) if steps > 1 else (1,)
+                for i in step_numbers:
                     t = i / steps
                     x = self.x + t * self.dx
                     y = self.y + t * self.dy
