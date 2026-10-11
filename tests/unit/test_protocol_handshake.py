@@ -56,6 +56,62 @@ def test_decode_client_list_stops_on_truncated_entry():
     assert entries[0].name == "A"
 
 
+def _client_list_entry(client_id, name, link, has_control):
+    raw = name.encode()
+    return client_id.to_bytes(8, "big") + bytes([len(raw)]) + raw + bytes([link, 1 if has_control else 0])
+
+
+def test_decode_client_list_reads_the_addresses_after_the_last_entry():
+    payload = (
+        bytes([3])
+        + _client_list_entry(1, "PC", 0, False)
+        + _client_list_entry(2, "PC", 0, True)
+        + _client_list_entry(3, "PC", 1, False)
+        + bytes([192, 168, 1, 23])
+        + bytes([192, 168, 1, 57])
+        + bytes([0, 0, 0, 0])
+    )
+
+    entries = decode_client_list(payload)
+
+    assert [(entry.id, entry.ip) for entry in entries] == [(1, "192.168.1.23"), (2, "192.168.1.57"), (3, "")]
+    assert entries[1].has_control is True
+
+
+def test_decode_client_list_without_addresses_has_no_ips():
+    # Firmware from before the addresses were added ends at the last entry.
+    payload = bytes([2]) + _client_list_entry(1, "PC", 0, False) + _client_list_entry(2, "PC", 1, False)
+
+    entries = decode_client_list(payload)
+
+    assert [(entry.id, entry.link, entry.ip) for entry in entries] == [(1, 0, ""), (2, 1, "")]
+
+
+def test_decode_client_list_ignores_addresses_cut_short():
+    payload = bytes([2]) + _client_list_entry(1, "PC", 0, False) + _client_list_entry(2, "PC", 0, False)
+    payload += bytes([192, 168, 1, 23, 192, 168])
+
+    entries = decode_client_list(payload)
+
+    assert [entry.ip for entry in entries] == ["", ""]
+
+
+def test_decode_client_list_ignores_bytes_after_the_addresses():
+    payload = bytes([1]) + _client_list_entry(1, "PC", 0, False) + bytes([10, 0, 0, 5]) + b"later"
+
+    entries = decode_client_list(payload)
+
+    assert entries == (ClientEntry(id=1, name="PC", link=0, has_control=False, ip="10.0.0.5"),)
+
+
+def test_decode_client_list_reads_no_addresses_after_a_truncated_entry():
+    payload = bytes([2]) + _client_list_entry(1, "PC", 0, False) + bytes([10, 0, 0, 5, 10, 0, 0, 6])
+
+    entries = decode_client_list(payload)
+
+    assert [entry.ip for entry in entries] == [""]
+
+
 def test_decode_published_line():
     payload = (
         (0x0102030405060708).to_bytes(8, "big") + bytes([len(b"Office PC")]) + b"Office PC" + bytes([0]) + b"version"

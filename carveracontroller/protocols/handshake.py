@@ -7,7 +7,7 @@ frame builders.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 # hello ack `result` values.
 HELLO_ACCEPTED = 0
@@ -90,18 +90,27 @@ def decode_hello_ack(payload: bytes) -> HelloAck | None:
     return HelloAck(protocol_version=payload[0], result=payload[1], mode=payload[2], features=features)
 
 
+_ADDRESS_BYTES = 4
+
+
 @dataclass(frozen=True)
 class ClientEntry:
     id: int
     name: str
     link: int
     has_control: bool
+    # The client's IPv4 address as "a.b.c.d", or "" when the machine did not
+    # send one (firmware from before addresses were added, and the USB
+    # entry, whose address is 0.0.0.0).
+    ip: str = ""
 
 
 def decode_client_list(payload: bytes) -> tuple[ClientEntry, ...]:
-    """Decode a client-list-reply payload: count(1) + entries.
+    """Decode a client-list-reply payload: count(1) + entries + addresses.
 
     Each entry is id(8) + name_len(1) + name(<=31) + link(1) + has_control(1).
+    After the last entry, newer firmware sends one IPv4 address(4) per entry,
+    in entry order, 0.0.0.0 for USB; without them every entry's ``ip`` is "".
     Malformed trailing data (short read) stops decoding and returns whatever
     complete entries were parsed, rather than raising.
     """
@@ -126,6 +135,14 @@ def decode_client_list(payload: bytes) -> tuple[ClientEntry, ...]:
         has_control = payload[offset] != 0
         offset += 1
         entries.append(ClientEntry(id=client_id, name=name, link=link, has_control=has_control))
+    if len(entries) == count and offset + _ADDRESS_BYTES * count <= len(payload):
+        with_ips = []
+        for entry in entries:
+            address = payload[offset : offset + _ADDRESS_BYTES]
+            offset += _ADDRESS_BYTES
+            ip = ".".join(str(part) for part in address) if any(address) else ""
+            with_ips.append(replace(entry, ip=ip))
+        entries = with_ips
     return tuple(entries)
 
 
