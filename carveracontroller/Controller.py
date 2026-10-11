@@ -26,6 +26,12 @@ from .machine.heartbeat import heartbeat_due
 from .machine.hello import HelloNegotiator, Resolution
 from .machine.identity import ControllerIdentity, default_name, generate_id
 from .machine.peer_closed import PeerClosedError
+from .machine.peer_transfer import (
+    PeerTransferWatch,
+    is_transfer_busy_reply,
+    peer_transfer_console_line,
+    transfer_allowance_s,
+)
 from .machine.presence import PresenceAnnouncement, presence_announcement
 from .protocols import (
     HELLO_ACCEPTED,
@@ -57,8 +63,10 @@ from .protocols.handshake import (
     JOB_START_CANCELLED,
     JobStartEvent,
     decode_job_start_event,
+    decode_transfer_in_progress_event,
 )
 from .protocols.makera import encode_job_start_ready, encode_presence_reply
+from .protocols.relay import decode_transfer_relay, encode_transfer_ended_relay, encode_transfer_started_relay
 from .USBBulkStream import USBBulkStream, is_usb_bulk_address
 from .USBStream import USBStream
 from .WIFIStream import WIFIStream
@@ -226,6 +234,19 @@ class Controller:
         # handshake identified us, unwrapped otherwise). kind is 0 (console
         # command) or 1 (file transfer start), matching the automatic-
         # command wrapper's `kind` field.
+        # Another controller's file transfer, which keeps the machine from
+        # answering this one until it ends (machine/peer_transfer.py).
+        # Created before _reset_pending_sends(), which resets it too.
+        self._peer_transfer = PeerTransferWatch()
+        # The last listing, delete, rename, mkdir or WiFi command sent
+        # (_send_load_command), and whether the machine turned it away
+        # during another controller's transfer, so it goes again once that
+        # transfer ends.
+        self._load_command = None
+        self._resend_load_command = False
+        # True from this controller's own transfer notice until its end
+        # notice (_announce_own_transfer, resumeStream).
+        self._own_transfer_announced = False
         self._reset_pending_sends()
         # The other controllers currently connected, from the last client-list
         # reply, with each entry's has_control kept in step with control-changed
@@ -457,6 +478,7 @@ class Controller:
                 if self._gate_send(0, payload, display):
                     return
                 self._send_wire(self.comms.encode_command(payload))
+                self._peer_transfer.note_command_sent()
                 if display is not None:
                     self.execCallback(display)
             except Exception:
@@ -465,6 +487,32 @@ class Controller:
     def _reset_pending_sends(self):
         with self._pending_sends_lock:
             self._pending_sends = []
+        # A new or closed connection knows of no transfer and owes no resend.
+        # Anything the app held for a transfer is told it has ended.
+        was_running = self.peer_transfer_active
+        self._peer_transfer.reset()
+        self._resend_load_command = False
+        self._own_transfer_announced = False
+        if was_running:
+            self._notify_peer_transfer_finished()
+
+    @property
+    def peer_transfer_active(self):
+        """True while the machine is busy with another controller's file
+        transfer (see machine/peer_transfer.py): it answers this controller
+        with nothing but its busy reply, or, for a transfer over the other
+        link, with nothing at all, and the other controller has said so."""
+        return self._peer_transfer.running(time.monotonic())
+
+    @property
+    def peer_transfer_direction(self):
+        """While peer_transfer_active, the direction the machine's last
+        keep-alive named (protocols/handshake.py TRANSFER_DOWNLOADING or
+        TRANSFER_UPLOADING); None when no keep-alive has said, as with
+        firmware that sends none."""
+        if not self.peer_transfer_active:
+            return None
+        return self._peer_transfer.direction
 
     def _gate_send(self, kind, payload, display):
         """Hold back an ordinary-channel send while the identify handshake
@@ -627,6 +675,7 @@ class Controller:
                 if self._gate_send(1, payload, display):
                     return False
                 self._send_wire(self.comms.encode_file_command(payload))
+                self._peer_transfer.note_command_sent()
                 if display is not None:
                     self.execCallback(display)
                 return True
@@ -1077,7 +1126,7 @@ class Controller:
         ls_command = "ls -e -s %s\n" % ls_dir.replace(" ", "\x01")
         if "\\" in ls_dir:
             ls_command = "ls -e -s %s\n" % "/".join(ls_dir.split("\\")).replace(" ", "\x01")
-        self.executeCommand(self.escape(ls_command))
+        self._send_load_command(self.escape(ls_command))
 
     def catCommand(self, filename):
         cat_command = "cat %s -e\n" % filename.replace(" ", "\x01")
@@ -1089,7 +1138,7 @@ class Controller:
         rm_command = "rm %s -e\n" % filename.replace(" ", "\x01")
         if "\\" in filename:
             rm_command = "rm %s -e\n" % "/".join(filename.split("\\")).replace(" ", "\x01")
-        self.executeCommand(self.escape(rm_command))
+        self._send_load_command(self.escape(rm_command))
 
     def mvCommand(self, file, newfile):
         mv_command = "mv %s %s -e\n" % (file.replace(" ", "\x01"), newfile.replace(" ", "\x01"))
@@ -1098,13 +1147,13 @@ class Controller:
                 "/".join(file.split("\\")).replace(" ", "\x01"),
                 "/".join(newfile.split("\\")).replace(" ", "\x01"),
             )
-        self.executeCommand(self.escape(mv_command))
+        self._send_load_command(self.escape(mv_command))
 
     def mkdirCommand(self, dirname):
         mkdir_command = "mkdir %s -e\n" % dirname.replace(" ", "\x01")
         if "\\" in dirname:
             mkdir_command = "mkdir %s -e\n" % "/".join(dirname.split("\\")).replace(" ", "\x01")
-        self.executeCommand(self.escape(mkdir_command))
+        self._send_load_command(self.escape(mkdir_command))
 
     def md5Command(self, filename):
         """Ask the machine to md5sum an absolute path already on the card.
@@ -1137,8 +1186,18 @@ class Controller:
         """
         self.executeCommand(self.escape("md5sum %s\n" % remote_command_path(filename)))
 
+    def _send_load_command(self, command):
+        """Send a command whose reply the app waits for through loadNUM (a
+        listing, delete, rename, mkdir, WiFi scan or WiFi connect), and
+        remember it: if the machine turns it away because another
+        controller's file transfer is running, it goes again once that
+        transfer ends (_on_peer_transfer_frame)."""
+        self._load_command = command
+        self._resend_load_command = False
+        self.executeCommand(command)
+
     def loadWiFiCommand(self):
-        self.executeCommand("wlan -e\n")
+        self._send_load_command("wlan -e\n")
 
     def disconnectWiFiCommand(self):
         # The trailing "disconnect" is not decorative -- do not remove it.
@@ -1152,7 +1211,7 @@ class Controller:
 
     def connectWiFiCommand(self, ssid, password):
         wifi_command = "wlan %s %s -e\n" % (ssid.replace(" ", "\x01"), password.replace(" ", "\x01"))
-        self.executeCommand(self.escape(wifi_command))
+        self._send_load_command(self.escape(wifi_command))
 
     def loadConfigCommand(self):
         self.executeCommand("config-get-all -e\n")
@@ -1163,12 +1222,28 @@ class Controller:
     def defaultConfigCommand(self):
         self.executeCommand("config-default\n")
 
-    def uploadCommand(self, filename):
+    def _announce_own_transfer(self, size):
+        """Before a file transfer starts, tell the other controllers, so
+        they do not take the machine's silence for a lost link (see
+        machine/peer_transfer.py). ``size`` is the bytes to go over the
+        link, or None when not known. Only once identified: firmware that
+        has not identified this controller does not repeat relays. The end
+        notice goes from resumeStream, which every transfer calls when it
+        hands the link back."""
+        if not self._status_subscribed() or self.stream is None:
+            return
+        self._send_raw(encode_relay(encode_transfer_started_relay(transfer_allowance_s(size))))
+        self._own_transfer_announced = True
+
+    def uploadCommand(self, filename, size=None):
         """Send an upload-start command. Returns True if actually sent now,
-        False if held back — see ``executeFileCommand``."""
+        False if held back — see ``executeFileCommand``. ``size`` is the
+        file's size as sent (compressed), for the notice to the other
+        controllers."""
         upload_command = "upload %s\n" % filename.replace(" ", "\x01")
         if "\\" in filename:
             upload_command = "upload %s\n" % "/".join(filename.split("\\")).replace(" ", "\x01")
+        self._announce_own_transfer(size)
         return self.executeFileCommand(self.escape(upload_command))
 
     def downloadCommand(self, filename, automatic=False):
@@ -1187,6 +1262,7 @@ class Controller:
         if "\\" in filename:
             download_command = "download %s\n" % "/".join(filename.split("\\")).replace(" ", "\x01")
         escaped = self.escape(download_command)
+        self._announce_own_transfer(None)
         if automatic:
             display = escaped if self.execCallback else None
             return self._send_automatic_command(1, escaped, display)
@@ -2790,6 +2866,10 @@ class Controller:
 
     def resumeStream(self):
         self._dispatch_frames_from_transfer()
+        if self._own_transfer_announced:
+            self._own_transfer_announced = False
+            if self.stream is not None:
+                self._send_raw(encode_relay(encode_transfer_ended_relay()))
         self.paused = False
         self.pausing = False
         self._stream_io_parked = False
@@ -2813,6 +2893,8 @@ class Controller:
 
     def _handle_protocol_message(self, message):
         """Dispatch a ParsedMessage from the active communication protocol."""
+        if self._on_peer_transfer_frame(message):
+            return
         if message.kind == MessageKind.HELLO_ACK:
             self._on_hello_ack(message.payload)
             return
@@ -2905,6 +2987,63 @@ class Controller:
                     continue
                 self.load_buffer.put(line2)
                 self.load_buffer_size += len(line2) + 1
+
+    def _on_peer_transfer_frame(self, message):
+        """Called for every message from the machine, before anything else
+        handles it. Any frame at all proves the link is alive, so it counts
+        for main.py's lost-connection check the same as a status report
+        (_refresh_heartbeat), which matters while another controller's file
+        transfer keeps the machine from sending status.
+
+        The machine's keep-alive during that transfer (a transfer-in-
+        progress event, machine/peer_transfer.py) starts or continues it and
+        is handled here: returns True. The first news of a transfer goes to
+        the console as one line naming its direction.
+
+        The machine's busy reply (machine/peer_transfer.py) starts or
+        continues that transfer and is handled here: returns True, and
+        nothing else sees it. Only the first news of a transfer, and one
+        that answers a command of this controller's, reach the console; the
+        rest answer _advance_heartbeat's probes. A listing or other load
+        command still waiting for its reply was turned away, so it goes
+        again when the transfer ends, and the reply is not taken for
+        listing data. Any other frame ends the transfer and is handled as
+        usual.
+
+        Another controller's notice that its transfer starts or has ended
+        (a relay, protocols/relay.py) is also handled here and returns
+        True; the app is told when that leaves no transfer known."""
+        self._refresh_heartbeat = True
+        if message.kind == MessageKind.RELAY:
+            notice = decode_transfer_relay(message.payload)
+            if notice is not None:
+                was_running = self.peer_transfer_active
+                if notice[0] == "started":
+                    self._peer_transfer.announce(time.monotonic(), notice[1])
+                else:
+                    self._peer_transfer.end_announcement()
+                if was_running and not self.peer_transfer_active:
+                    self._notify_peer_transfer_finished()
+                return True
+        if message.kind == MessageKind.EVENT:
+            direction = decode_transfer_in_progress_event(message.payload)
+            if direction is not None:
+                if self._peer_transfer.on_keepalive(time.monotonic(), direction):
+                    self.log.put((self.MSG_NORMAL, peer_transfer_console_line(direction)))
+                return True
+        if message.kind == MessageKind.LINE and is_transfer_busy_reply(message.text):
+            if self._peer_transfer.on_busy_reply():
+                self.log.put((self.MSG_ERROR, message.text.strip()))
+            if self.loadNUM != 0 and self._load_command and not (self.loadEOF or self.loadERR):
+                self._resend_load_command = True
+            return True
+        if self._peer_transfer.on_other_frame():
+            # Ends a notice too: this transfer is the one it announced.
+            if self._resend_load_command and self.loadNUM != 0 and self._load_command:
+                self.executeCommand(self._load_command)
+            self._resend_load_command = False
+            self._notify_peer_transfer_finished()
+        return False
 
     def _advance_hello(self, now):
         """Called every streamIO tick. Sends hello the first time a frame is
@@ -3029,7 +3168,32 @@ class Controller:
         the handshake is unresolved: that firmware never asked for it, and
         sending anything it doesn't understand would be a behaviour change
         for a case that must stay exactly as it is today.
+
+        While another controller's file transfer runs, a client-list
+        request goes out every PROBE_INTERVAL_S instead: unlike a heartbeat,
+        the machine answers it even then (machine/peer_transfer.py). Only a
+        machine that has sent its busy reply gets one, which firmware
+        without that reply never does, and none while the machine's own
+        keep-alives arrive: they prove the link already.
         """
+        if self._peer_transfer.silence_covered(now):
+            # A transfer over the other link, on firmware without the
+            # keep-alive: the machine sends nothing until it ends, so the
+            # other controller's notice stands in for the frames that would
+            # prove the link (main.py's lost-connection check), until its
+            # end notice or its time.
+            self._refresh_heartbeat = True
+        if self._peer_transfer.expire(now) and not self._peer_transfer.running(now):
+            # A notice ran out, or the keep-alives stopped with no other
+            # frame since to end the transfer.
+            self._notify_peer_transfer_finished()
+        if self.stream is not None and self._peer_transfer.probe_due(now):
+            # Another controller's transfer: ask something the machine
+            # answers even then (machine/peer_transfer.py). It also counts
+            # as traffic, so no heartbeat is due while these go out.
+            self._peer_transfer.probe_sent(now)
+            self._send_raw(encode_client_list_request())
+            return
         if not self._status_subscribed() or self.stream is None:
             return
         if heartbeat_due(now, self._last_send_monotonic):
@@ -3385,6 +3549,16 @@ class Controller:
         root = app.root
         if hasattr(root, "show_peer_closed_popup"):
             Clock.schedule_once(lambda dt: root.show_peer_closed_popup(), 0)
+
+    def _notify_peer_transfer_finished(self):
+        if App is None or Clock is None:
+            return
+        app = App.get_running_app()
+        if app is None or getattr(app, "root", None) is None:
+            return
+        root = app.root
+        if hasattr(root, "on_peer_transfer_finished"):
+            Clock.schedule_once(lambda dt: root.on_peer_transfer_finished(), 0)
 
     def _notify_client_list_updated(self, entries):
         if App is None or Clock is None:
