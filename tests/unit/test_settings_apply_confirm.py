@@ -194,9 +194,10 @@ def test_all_keys_acknowledged_reports_success(monkeypatch):
     root.download_config_file.assert_called_once()
     # "applied" waits for config.txt to be read back.
     root.message_popup.open.assert_not_called()
-    assert root._apply_readback.sent == ["multi_client.mode"]
+    readback = root.download_config_file.call_args.kwargs["readback"]
+    assert readback.sent == ["multi_client.mode"]
 
-    root._report_apply_readback(root._apply_readback, True)
+    root._report_apply_readback(readback, True)
 
     root.message_popup.open.assert_called_once()
     assert "applied" in root.message_popup.lb_content.text
