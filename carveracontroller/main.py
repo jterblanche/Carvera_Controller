@@ -263,6 +263,7 @@ class LightProperty(BooleanProperty):
 import webbrowser
 from functools import partial
 
+from kivy.core.text import Label as CoreLabel
 from kivy.core.text import LabelBase
 from kivy.core.window import Window
 from kivy.resources import resource_add_path
@@ -2278,10 +2279,16 @@ class ConnectedControllerRow(Label):
     single, legible line that never wraps -- a wrapped line reads as a
     second controller. The name is already truncated with an
     ellipsis by machine.clients.row_display_text before it gets here, and
-    `has_control` only changes this row's colour, so "you" and "in control"
+    `has_control` only changes this row's colour, so "you" and "Has Control"
     stay readable at a glance without the row growing a second line."""
 
     has_control = BooleanProperty(False)
+
+    def width_for_one_line(self):
+        """The row width its whole text needs on one line, padding
+        included."""
+        text_width = CoreLabel(font_size=self.font_size, font_name=self.font_name).get_extents(self.text)[0]
+        return text_width + self.padding[0] + self.padding[2] + dp(2)
 
 
 class StatusDropDown(ToolTipDropDown):
@@ -2290,6 +2297,9 @@ class StatusDropDown(ToolTipDropDown):
     # widget is built before app.root is assigned, so a live
     # `app.root.can_release_control` binding fails at kv-parse time.
     can_release_control = BooleanProperty(False)
+    # The drop-down's width with no controller row wider than it. It grows
+    # past this to fit the widest row (see set_connected_controllers).
+    min_width = NumericProperty(dp(260))
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -2299,16 +2309,23 @@ class StatusDropDown(ToolTipDropDown):
         controller (see ConnectedControllerRow): a wrapped second line on a
         single shared label could be mistaken for another controller, so
         each controller gets its own single-line row instead. Empty `rows`
-        leaves the container with no children, so nothing is shown."""
+        leaves the container with no children, so nothing is shown.
+
+        The drop-down widens to fit the widest row, up to the window's
+        width, and goes back to min_width when the rows fit in that."""
         container = self.connected_controllers_container
         container.clear_widgets()
+        widest = 0
         for row in rows:
             text = row_display_text(
                 row,
                 you_suffix=tr._(" (you)"),
-                control_suffix=tr._(" — in control"),
+                control_suffix=tr._(" — Has Control"),
             )
-            container.add_widget(ConnectedControllerRow(text=text, has_control=row.has_control))
+            widget = ConnectedControllerRow(text=text, has_control=row.has_control)
+            container.add_widget(widget)
+            widest = max(widest, widget.width_for_one_line())
+        self.width = max(self.min_width, min(widest, Window.width - dp(16)))
 
 
 class ComPortsDropDown(ToolTipDropDown):
