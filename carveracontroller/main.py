@@ -900,9 +900,26 @@ class ManualWifiPopup(ModalView):
 class ProgressPopup(ModalView):
     progress_text = StringProperty("")
     progress_value = NumericProperty("0")
+    # What the Cancel button does while the popup is showing: set by
+    # whoever opens it (Makera.progressStart) to stop what it shows, and
+    # cleared when the popup closes.
+    cancel_func = None
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+
+    def cancel(self):
+        """The Cancel button (makera.kv). Stops what the popup shows when
+        its opener said how; otherwise there is nothing to stop and the
+        popup just closes."""
+        cancel_func = self.cancel_func
+        if callable(cancel_func):
+            cancel_func()
+        else:
+            self.dismiss()
+
+    def on_dismiss(self):
+        self.cancel_func = None
 
 
 class GCodeLineContextMenu(FloatLayout):
@@ -8153,7 +8170,14 @@ class Makera(RelativeLayout):
 
     # -----------------------------------------------------------------------
     def cancelProcessingFile(self):
-        self.controller.stream.cancel_process()
+        """Cancel button of an upload's or download's progress popup: stop
+        the transfer when one is running. When none is (it has ended, or
+        failed without closing the popup), just close the popup."""
+        stream = self.controller.stream
+        if (self.downloading or self.uploading) and stream is not None:
+            stream.cancel_process()
+        else:
+            self.progressFinish()
 
     # -----------------------------------------------------------------------
     def process_loaded_dir(self, listed_path=None):
@@ -8223,9 +8247,10 @@ class Makera(RelativeLayout):
         self.progress_popup.progress_text = text
         self.progress_popup.progress_value = 0
         if cancel_func:
-            self.progress_popup.cancel = cancel_func
+            self.progress_popup.cancel_func = cancel_func
             self.progress_popup.btn_cancel.disabled = False
         else:
+            self.progress_popup.cancel_func = None
             self.progress_popup.btn_cancel.disabled = True
         self.progress_popup.open()
 
@@ -10523,7 +10548,7 @@ class Makera(RelativeLayout):
             self.progress_popup.progress_text = tr._("Calculating run time estimate...")
             self.progress_popup.progress_value = 0
         else:
-            self.progress_popup.cancel = self.cancel_load_gcodes
+            self.progress_popup.cancel_func = self.cancel_load_gcodes
             self.progress_popup.btn_cancel.disabled = False
             self.progress_popup.progress_value = line_no * 100.0 / self.selected_file_line_count
 
