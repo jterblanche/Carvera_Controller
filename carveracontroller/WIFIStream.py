@@ -215,22 +215,20 @@ class WIFIStream:
         return len(data)
 
     def upload(self, filename, local_md5, callback):
-        stream = open(filename, "rb")
-        if self.uses_framed_transfer:
-            result = self.modem.send(stream, md5=local_md5, retry=50, callback=callback)
-        else:
-            result = self.modem.send_legacy(stream, md5=local_md5, retry=10, callback=callback)
-        stream.close()
-        return result
+        # The file is closed however the transfer ends, a raised error
+        # included: a handle left open keeps the file locked on Windows.
+        with open(filename, "rb") as stream:
+            if self.uses_framed_transfer:
+                return self.modem.send(stream, md5=local_md5, retry=50, callback=callback)
+            return self.modem.send_legacy(stream, md5=local_md5, retry=10, callback=callback)
 
     def download(self, filename, local_md5, callback):
-        stream = open(filename, "wb")
-        if self.uses_framed_transfer:
-            result = self.modem.recv(stream, md5=local_md5, retry=50, callback=callback)
-        else:
-            result = self.modem.recv_legacy(stream, md5=local_md5, retry=10, callback=callback)
-        stream.close()
-        return result
+        # As upload: closed even when the transfer raises, or the caller
+        # cannot rename or delete the file afterwards on Windows.
+        with open(filename, "wb") as stream:
+            if self.uses_framed_transfer:
+                return self.modem.recv(stream, md5=local_md5, retry=50, callback=callback)
+            return self.modem.recv_legacy(stream, md5=local_md5, retry=10, callback=callback)
 
     def cancel_process(self):
         self.modem.canceled = True
