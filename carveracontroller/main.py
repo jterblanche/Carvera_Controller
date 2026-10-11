@@ -4881,6 +4881,12 @@ class Makera(RelativeLayout):
                 Clock.schedule_once(self._apply_estop_note_to_halt_popup, 0)
                 self.controller.diagnoseUpdate = False
 
+            if getattr(self.controller, "peer_transfer_active", False):
+                # Another controller's file transfer: the machine answers
+                # nothing until it ends, then the controller sends a load
+                # command it turned away again. Its wait starts over.
+                self.short_load_time = t
+                self.wifi_load_time = t
             if self.controller.loadNUM == LOAD_DIR:
                 if self.controller.loadEOF or self.controller.loadERR or t - self.short_load_time > SHORT_LOAD_TIMEOUT:
                     self._finish_machine_ls(t)
@@ -7186,6 +7192,7 @@ class Makera(RelativeLayout):
             or self.backing_up_config
             or self.controller.sendNUM != 0
             or self.controller.loadNUM != 0
+            or getattr(self.controller, "peer_transfer_active", False)
         )
 
     def _start_link_worker(self, target, *args, daemon=None, **kwargs):
@@ -7232,14 +7239,24 @@ class Makera(RelativeLayout):
         Meanwhile the progress popup says what is happening; cancelling it
         drops the waiting actions, never the fetch. A config backup shows
         its own progress popup, which is left as it is. Called on the main
-        thread."""
+        thread.
+
+        The same applies while another controller's file transfer keeps the
+        machine busy (Controller.peer_transfer_active): the actions run once
+        it ends (on_peer_transfer_finished).
+        """
+        peer_transfer = getattr(self.controller, "peer_transfer_active", False)
         with self._held_for_passive_fetch_lock:
-            if not (self._auto_fetch_in_progress or self._held_for_passive_fetch):
+            if not (self._auto_fetch_in_progress or self._held_for_passive_fetch or peer_transfer):
                 return False
             self._held_for_passive_fetch = (*self._held_for_passive_fetch, action)
         if not self.backing_up_config:
             self._passive_fetch_hint_shown = True
-            self.progressStart(tr._("Waiting for a download to finish..."), self._cancel_held_for_passive_fetch)
+            if peer_transfer and not self._auto_fetch_in_progress:
+                text = tr._("Waiting for another controller's file transfer to finish...")
+            else:
+                text = tr._("Waiting for a download to finish...")
+            self.progressStart(text, self._cancel_held_for_passive_fetch)
         return True
 
     def _cancel_held_for_passive_fetch(self):
@@ -7269,6 +7286,22 @@ class Makera(RelativeLayout):
             held = bool(self._held_for_passive_fetch)
         if held:
             Clock.schedule_once(self._run_held_for_passive_fetch)
+
+    def on_peer_transfer_finished(self):
+        """Another controller's file transfer has ended (main thread, from
+        Controller._notify_peer_transfer_finished), or the link closed
+        while it ran. Operator actions held meanwhile run now, unless a
+        passive fetch of this controller's own still has the link: they run
+        when it ends instead. With the link closed they are dropped, the
+        same as cancelling the wait."""
+        with self._held_for_passive_fetch_lock:
+            held = bool(self._held_for_passive_fetch) and not self._auto_fetch_in_progress
+        if not held:
+            return
+        if self.controller.stream is None:
+            self._cancel_held_for_passive_fetch()
+            return
+        Clock.schedule_once(self._run_held_for_passive_fetch)
 
     def _run_held_for_passive_fetch(self, *_args):
         with self._held_for_passive_fetch_lock:
@@ -7990,7 +8023,7 @@ class Makera(RelativeLayout):
             # announcement of this upload is recognised as this
             # controller's own whenever it arrives (on_passive_file_published).
             self._passive_fetch.note_own_upload(published_upload_path(os.path.normpath(remotename)), md5)
-            sent = self.controller.uploadCommand(os.path.normpath(remotename))
+            sent = self.controller.uploadCommand(os.path.normpath(remotename), size=self.uploading_size)
             if not sent:
                 # Held back: the identify handshake is still unresolved (a
                 # sub-1-second window right after connecting) and streamIO

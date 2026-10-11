@@ -3,10 +3,13 @@
 The machine treats a relay payload as opaque bytes -- it only repeats it to
 every other identified client, prefixed with the sender's id. What those
 bytes mean is a convention between controllers, not part of the wire
-protocol the machine itself understands. This file defines the one
-convention this controller uses today: a compact summary of the currently
-loaded tool table, so a controller that does not have the G-code file open
-can still show a sensible tool name at a tool-change prompt.
+protocol the machine itself understands. This file defines the
+conventions this controller uses: a compact summary of the currently loaded
+tool table, so a controller that does not have the G-code file open can
+still show a sensible tool name at a tool-change prompt; and a notice that
+this controller is starting or has finished a file transfer, because the
+machine sends the other controllers nothing at all while it runs one over
+the other link (see machine/peer_transfer.py).
 
 A relay's own payload is capped by the machine at 527 bytes (535 minus the
 8-byte source id it prepends before repeating the frame) -- see
@@ -15,11 +18,12 @@ A relay's own payload is capped by the machine at 527 bytes (535 minus the
 
 from __future__ import annotations
 
-# The only relay payload kind this controller sends or understands today.
 # The first byte of every payload this module builds, so a decoder can tell
-# a tool-table summary apart from any other relay traffic (its own, or a
-# future kind) without guessing from the shape of the bytes.
+# one kind apart from any other relay traffic (its own, or a future kind)
+# without guessing from the shape of the bytes.
 RELAY_KIND_TOOL_TABLE = 1
+RELAY_KIND_TRANSFER_STARTED = 2
+RELAY_KIND_TRANSFER_ENDED = 3
 
 # 527 B relay payload cap, minus kind(1) + count(1).
 _HEADER_BYTES = 2
@@ -92,3 +96,30 @@ def decode_tool_table_relay(payload: bytes) -> dict[int, str] | None:
         offset += text_len
         entries[number] = text
     return entries
+
+
+def encode_transfer_started_relay(allowance_s: int) -> bytes:
+    """Build a relay payload saying this controller is about to start a
+    file transfer, expected to take no longer than ``allowance_s`` seconds:
+    kind(1) + allowance_s(2, BE), clamped to 1..65535."""
+    allowance = max(1, min(int(allowance_s), 0xFFFF))
+    return bytes([RELAY_KIND_TRANSFER_STARTED]) + allowance.to_bytes(2, "big")
+
+
+def encode_transfer_ended_relay() -> bytes:
+    """Build a relay payload saying this controller's file transfer has
+    ended, however it ended: kind(1)."""
+    return bytes([RELAY_KIND_TRANSFER_ENDED])
+
+
+def decode_transfer_relay(payload: bytes) -> tuple[str, int] | None:
+    """Decode a transfer notice: ("started", allowance_s) or ("ended", 0).
+    None for any other payload, or a started notice too short to hold its
+    allowance."""
+    if not payload:
+        return None
+    if payload[0] == RELAY_KIND_TRANSFER_STARTED and len(payload) >= 3:
+        return ("started", int.from_bytes(payload[1:3], "big"))
+    if payload[0] == RELAY_KIND_TRANSFER_ENDED:
+        return ("ended", 0)
+    return None

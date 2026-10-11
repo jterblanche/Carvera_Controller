@@ -75,7 +75,7 @@ def compressed_upload(kivy_app, tmp_path, monkeypatch):
     stream.upload.return_value = True
     stream.modem = None
     monkeypatch.setattr(root.controller, "stream", stream)
-    monkeypatch.setattr(root.controller, "uploadCommand", lambda name: True)
+    monkeypatch.setattr(root.controller, "uploadCommand", lambda name, size=None: True)
     monkeypatch.setattr(root, "filetype", "lz")
     monkeypatch.setattr(root.file_popup, "firmware_mode", False)
     monkeypatch.setattr(root.file_popup, "refresh_machine", lambda *args: None)
