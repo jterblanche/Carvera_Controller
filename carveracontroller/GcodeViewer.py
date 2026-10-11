@@ -13,7 +13,7 @@ from kivy.clock import Clock
 from kivy.config import Config
 from kivy.core.window import Window
 from kivy.graphics import *
-from kivy.graphics import Callback, Mesh
+from kivy.graphics import Callback, ClearBuffers, ClearColor, Color, Fbo, Mesh, Rectangle
 from kivy.graphics.instructions import RenderContext
 from kivy.graphics.opengl import *
 from kivy.graphics.texture import Texture
@@ -736,7 +736,30 @@ class GCodeViewer(Widget):
 
     def __init__(self) -> None:
         super().__init__()
-        self.canvas = RenderContext()
+        # The 3D scene is drawn into an off-screen buffer, self._scene, and the
+        # widget shows that buffer as a picture. Kivy redraws the whole window
+        # whenever anything on it changes (a label, a button, a blinking
+        # status), and drawing the scene is the costly part of that: with a
+        # large toolpath on a software-rendered display, hundreds of
+        # milliseconds a time. The buffer is only drawn again when something
+        # in the scene itself changes; every other redraw just copies it.
+        #
+        # The buffer starts transparent and keeps, in its alpha, how much of
+        # whatever is behind the viewer each pixel covers, so the picture can
+        # be laid over the window and look exactly as drawing the scene
+        # straight onto it did ("premultiplied" alpha: see _scene_blend).
+        self._scene = Fbo(size=(1, 1), with_depthbuffer=True)
+        self._set_scene_texture_filters()
+        with self._scene:
+            ClearColor(0, 0, 0, 0)
+            ClearBuffers(clear_color=True, clear_depth=True)
+            Callback(self._begin_scene)
+        self.canvas.add(self._scene)
+        with self.canvas:
+            Callback(self._begin_scene_copy)
+            Color(1, 1, 1, 1)
+            self._scene_rect = Rectangle(texture=self._scene.texture, pos=self.pos, size=(1, 1))
+            Callback(self._end_scene_copy)
         shader_dir = os.path.join(os.path.dirname(__file__), "shaders")
 
         self.gridmesh = RenderContext()
@@ -878,8 +901,58 @@ class GCodeViewer(Widget):
         Clock.schedule_interval(self._on_frame_tick, 1 / 60)
 
     def _on_size_change(self, *args):
+        self._resize_scene()
         self._proj_dirty = True
         self._scene_dirty = True
+
+    def _scene_pixel_size(self):
+        """The off-screen buffer's size: the widget's, in whole pixels
+        (whole as glViewport took them when the scene was drawn on the
+        window: cut, not rounded)."""
+        return max(1, int(self.width)), max(1, int(self.height))
+
+    def _set_scene_texture_filters(self):
+        # The picture is shown at its own size, pixel for pixel: no smoothing.
+        self._scene.texture.mag_filter = "nearest"
+        self._scene.texture.min_filter = "nearest"
+
+    def _resize_scene(self):
+        size = self._scene_pixel_size()
+        if tuple(self._scene.size) != size:
+            # A new size gives the buffer a new texture.
+            self._scene.size = size
+            self._set_scene_texture_filters()
+            self._scene_rect.texture = self._scene.texture
+            self._scene.ask_update()
+        self._place_scene_rect()
+
+    def _place_scene_rect(self):
+        """Put the picture on whole window pixels, where glViewport put the
+        scene when it was drawn on the window, so it is not shifted by a
+        fraction of a pixel."""
+        wx, wy = self.to_window(*self.pos)
+        self._scene_rect.pos = (self.x - (wx - int(wx)), self.y - (wy - int(wy)))
+        self._scene_rect.size = self._scene_pixel_size()
+
+    @staticmethod
+    def _scene_blend():
+        """Blending inside the scene buffer: colours mix as they always have
+        (source alpha over what is there), and the buffer's alpha adds up how
+        much each pixel covers. The colours are then already weighted by
+        their alpha, which is what _begin_scene_copy expects."""
+        glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA)
+
+    def _begin_scene(self, *args):
+        glEnable(GL_BLEND)
+        self._scene_blend()
+
+    def _begin_scene_copy(self, *args):
+        # The buffer's colours are already weighted by their alpha.
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA)
+
+    def _end_scene_copy(self, *args):
+        # As reset_gl_context left the window when the scene was drawn on it.
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
     def _view_cube_hud_proj(self):
         """Square ortho projection for the HUD viewport (independent of zoom/pan)."""
@@ -913,7 +986,7 @@ class GCodeViewer(Widget):
             self._view_cube_cb_reset = Callback(self._reset_view_cube_gl)
 
     def _view_cube_gl_origin(self):
-        """Bottom-left of the GL drawable area (same origin as setup_gl_context)."""
+        """Bottom-left of the viewer in window coordinates, for touches."""
         return self.pos[0] + self.off_x, self.pos[1] + self.off_y
 
     def _view_cube_widget_rect(self):
@@ -926,7 +999,7 @@ class GCodeViewer(Widget):
         return x, y, size, size
 
     def _view_cube_screen_rect(self):
-        """Cube HUD bounds in window coordinates for glViewport."""
+        """Cube HUD bounds in window coordinates, for touches."""
         ox, oy = self._view_cube_gl_origin()
         x, y, size, _ = self._view_cube_widget_rect()
         return int(ox + x), int(oy + y), size, size
@@ -954,7 +1027,8 @@ class GCodeViewer(Widget):
         return ndc_x, ndc_y
 
     def _setup_view_cube_gl(self, *args):
-        x, y, w, h = self._view_cube_screen_rect()
+        # Drawn into the scene buffer, whose origin is the viewer's corner.
+        x, y, w, h = self._view_cube_widget_rect()
         glViewport(int(x), int(y), int(w), int(h))
         glEnable(GL_DEPTH_TEST)
         glClear(GL_DEPTH_BUFFER_BIT)
@@ -965,7 +1039,7 @@ class GCodeViewer(Widget):
 
     def _reset_view_cube_gl(self, *args):
         glDisable(GL_DEPTH_TEST)
-        glViewport(0, 0, int(Window.size[0]), int(Window.size[1]))
+        glViewport(0, 0, *self._scene_pixel_size())
 
     def _handle_view_cube_touch(self, touch):
         if not self._view_cube_active():
@@ -987,13 +1061,13 @@ class GCodeViewer(Widget):
         return True
 
     def _raise_view_cube_to_top(self):
-        if self.viewcubemesh in self.canvas.children:
-            self.canvas.remove(self.viewcubemesh)
-        self.canvas.add(self.viewcubemesh)
+        if self.viewcubemesh in self._scene.children:
+            self._scene.remove(self.viewcubemesh)
+        self._scene.add(self.viewcubemesh)
 
     def _remove_view_cube_from_canvas(self):
-        if self.viewcubemesh in self.canvas.children:
-            self.canvas.remove(self.viewcubemesh)
+        if self.viewcubemesh in self._scene.children:
+            self._scene.remove(self.viewcubemesh)
 
     def _get_line_vertex_fmt(self):
         return [
@@ -1025,17 +1099,17 @@ class GCodeViewer(Widget):
             self.cb = Callback(None)
 
     def _add_canvas_children(self):
-        self.canvas.add(self.gridmesh)
+        self._scene.add(self.gridmesh)
         if self.bed_visible:
-            self.canvas.add(self.bedmesh)
+            self._scene.add(self.bedmesh)
         if self.stock_visible or self.simulate_cut:
-            self.canvas.add(self.stockmesh)
-            self.canvas.add(self.carvedmesh)
-        self.canvas.add(self.linemesh)
-        self.canvas.add(self.pointermesh)
-        self.canvas.add(self.axisxmesh)
-        self.canvas.add(self.axisymesh)
-        self.canvas.add(self.axiszmesh)
+            self._scene.add(self.stockmesh)
+            self._scene.add(self.carvedmesh)
+        self._scene.add(self.linemesh)
+        self._scene.add(self.pointermesh)
+        self._scene.add(self.axisxmesh)
+        self._scene.add(self.axisymesh)
+        self._scene.add(self.axiszmesh)
         self._raise_view_cube_to_top()
         self._update_view_cube_uniforms()
         self._viewer_meshes_active = True
@@ -1085,22 +1159,22 @@ class GCodeViewer(Widget):
         self.pointer_mesh_instrs = []
         self._active_tool_number = None
         self.linemesh.clear()
-        self.canvas.remove(self.linemesh)
-        self.canvas.remove(self.gridmesh)
-        if self.bedmesh in self.canvas.children:
-            self.canvas.remove(self.bedmesh)
-        if self.stockmesh in self.canvas.children:
-            self.canvas.remove(self.stockmesh)
-        if self.carvedmesh in self.canvas.children:
-            self.canvas.remove(self.carvedmesh)
+        self._scene.remove(self.linemesh)
+        self._scene.remove(self.gridmesh)
+        if self.bedmesh in self._scene.children:
+            self._scene.remove(self.bedmesh)
+        if self.stockmesh in self._scene.children:
+            self._scene.remove(self.stockmesh)
+        if self.carvedmesh in self._scene.children:
+            self._scene.remove(self.carvedmesh)
         self._clear_carved_meshes()
-        self.canvas.remove(self.pointermesh)
+        self._scene.remove(self.pointermesh)
         self.pointermesh.clear()
-        self.canvas.remove(self.axisxmesh)
+        self._scene.remove(self.axisxmesh)
         self.axisxmesh.clear()
-        self.canvas.remove(self.axisymesh)
+        self._scene.remove(self.axisymesh)
         self.axisymesh.clear()
-        self.canvas.remove(self.axiszmesh)
+        self._scene.remove(self.axiszmesh)
         self.axiszmesh.clear()
         self._remove_view_cube_from_canvas()
         self.display_count = 0
@@ -1280,7 +1354,7 @@ class GCodeViewer(Widget):
             if self.is_4_axis:
                 self.rotate_line_or_knife = True
 
-            with self.canvas:
+            with self._scene:
                 with self.linemesh:
                     self.cb = Callback(self.setup_gl_context)
                     for mesh in self.meshmanager.meshes:
@@ -1366,7 +1440,7 @@ class GCodeViewer(Widget):
             self.update_view()
             self._scene_dirty = True
             # force update
-            self.canvas.ask_update()
+            self._scene.ask_update()
 
     def update_proj(self):
         asp = self.size[0] / max(self.size[1], 1.0)
@@ -1425,7 +1499,7 @@ class GCodeViewer(Widget):
         self._update_view_cube_uniforms()
 
     def setup_gl_context(self, *args):
-        glViewport(self.pos[0] + self.off_x, self.pos[1] + self.off_y, self.size[0], self.size[1])
+        glViewport(0, 0, *self._scene_pixel_size())
         glEnable(GL_DEPTH_TEST)
 
     def reset_gl_context(self, *args):
@@ -1435,8 +1509,8 @@ class GCodeViewer(Widget):
         glDisable(GL_DEPTH_TEST)
         glDisable(GL_CULL_FACE)
         glEnable(GL_BLEND)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-        glViewport(0, 0, Window.size[0], Window.size[1])
+        self._scene_blend()
+        glViewport(0, 0, *self._scene_pixel_size())
 
     # get total segment count
     def get_total_seg_count(self):
@@ -1452,6 +1526,7 @@ class GCodeViewer(Widget):
     def set_display_offset(self, offx, offy):
         self.off_x = offx
         self.off_y = offy
+        self._place_scene_rect()
         self._scene_dirty = True
 
     # set displaying limit
@@ -2088,23 +2163,23 @@ class GCodeViewer(Widget):
         show_stock = self.stock_visible or self.simulate_cut
         show_voxels = self._carved_stock_visible()
         for mesh in (self.stockmesh, self.carvedmesh):
-            if mesh in self.canvas.children:
-                self.canvas.remove(mesh)
+            if mesh in self._scene.children:
+                self._scene.remove(mesh)
         if not show_stock:
             self._clear_carved_meshes()
             return
         try:
-            if getattr(self, "bedmesh", None) is not None and self.bedmesh in self.canvas.children:
-                idx = self.canvas.children.index(self.bedmesh) + 1
+            if getattr(self, "bedmesh", None) is not None and self.bedmesh in self._scene.children:
+                idx = self._scene.children.index(self.bedmesh) + 1
             else:
-                idx = self.canvas.children.index(self.gridmesh) + 1
-            self.canvas.insert(idx, self.stockmesh)
+                idx = self._scene.children.index(self.gridmesh) + 1
+            self._scene.insert(idx, self.stockmesh)
             if show_voxels:
-                self.canvas.insert(idx + 1, self.carvedmesh)
+                self._scene.insert(idx + 1, self.carvedmesh)
         except ValueError:
-            self.canvas.add(self.stockmesh)
+            self._scene.add(self.stockmesh)
             if show_voxels:
-                self.canvas.add(self.carvedmesh)
+                self._scene.add(self.carvedmesh)
         self._raise_view_cube_to_top()
 
     def set_bed(
@@ -2169,15 +2244,15 @@ class GCodeViewer(Widget):
     def _ensure_bed_on_canvas(self) -> None:
         if not self._viewer_meshes_active:
             return
-        if self.bedmesh in self.canvas.children:
-            self.canvas.remove(self.bedmesh)
+        if self.bedmesh in self._scene.children:
+            self._scene.remove(self.bedmesh)
         if not self.bed_visible:
             return
         try:
-            idx = self.canvas.children.index(self.gridmesh) + 1
-            self.canvas.insert(idx, self.bedmesh)
+            idx = self._scene.children.index(self.gridmesh) + 1
+            self._scene.insert(idx, self.bedmesh)
         except ValueError:
-            self.canvas.add(self.bedmesh)
+            self._scene.add(self.bedmesh)
         self._raise_view_cube_to_top()
 
     def _rebuild_bed_mesh(self) -> None:
@@ -2207,7 +2282,7 @@ class GCodeViewer(Widget):
         glDisable(GL_CULL_FACE)
         glDepthMask(GL_TRUE)
         glEnable(GL_BLEND)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        self._scene_blend()
 
     def _wcs_rotation_matrix(self, rotation_angle_deg: float):
         angle = float(rotation_angle_deg or 0.0)
@@ -2323,7 +2398,7 @@ class GCodeViewer(Widget):
         glEnable(GL_CULL_FACE)
         glCullFace(GL_FRONT)
         glEnable(GL_BLEND)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        self._scene_blend()
         # Translucent AABB must not stamp depth or toolpath/voxels disappear.
         glDepthMask(GL_FALSE)
         self.stockmesh["use_lighting"] = 1.0
@@ -2790,6 +2865,9 @@ class GCodeViewer(Widget):
 
         self.g_old_curosr = self.g_cursor
         self.g_wheel_data = 0
+        # Draw the scene buffer again on the next frame; until the scene next
+        # changes, window redraws only copy it.
+        self._scene.ask_update()
         self._scene_dirty = False
 
     # mouse event
