@@ -14,6 +14,13 @@ MACHINE_CONFIG_FILES = {
 
 MAX_CONFIG_DOWNLOAD_ATTEMPTS = 3
 
+# How long the automatic config load (updateStatus) waits after a failed
+# attempt before it tries again. A failed transfer leaves the machine busy
+# for about a second (Player::download_command waits 1s before it sends
+# its reason), so a retry sent straight away arrives while it is still
+# finishing the last one.
+CONFIG_DOWNLOAD_RETRY_DELAY_S = 3.0
+
 # How long apply_machine_setting_changes() waits for each config-set's
 # reply (Controller.set_config_value_and_wait) before treating it as a
 # failed write.
@@ -3021,6 +3028,36 @@ class ManualCMDPage(Screen):
     pass
 
 
+def _discard_file(path):
+    """Delete ``path`` if it is there. A file that cannot be deleted (on
+    Windows, one another handle still holds open) is logged and left
+    behind: the next download of the same file truncates it on open, and
+    its digest only suppresses a download when it matches the machine's.
+    Returns False when the file is still there."""
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning("Could not delete %s: %s", path, exc)
+        return False
+    return True
+
+
+def _move_download_into_place(tmp_path, local_path):
+    """Put a finished download at ``local_path``, replacing what was there.
+    When the move fails (on Windows, another handle holding either file
+    open), copy instead and delete ``tmp_path`` if that is possible. Raises
+    OSError only when the copy fails too."""
+    try:
+        os.replace(tmp_path, local_path)
+        return
+    except OSError as exc:
+        logger.warning("Could not move %s to %s (%s); copying it instead", tmp_path, local_path, exc)
+    shutil.copyfile(tmp_path, local_path)
+    _discard_file(tmp_path)
+
+
 class Makera(RelativeLayout):
     holding = 0
     pausing = 0
@@ -3088,6 +3125,22 @@ class Makera(RelativeLayout):
     downloading_config = False
     # The Apply waiting on its config.txt read-back (ApplyReadback), if any.
     _apply_readback = None
+    # A config.txt download (download_config_file) is running, from its
+    # start until finishLoadConfig has dealt with its result. Only one runs
+    # at a time.
+    _config_download_running = False
+    # Counts config downloads, so a late report from a worker that died
+    # (_config_download_worker) can tell whether its download already ended.
+    _config_download_number = 0
+    # A config download asked for while one was running: a 1-tuple holding
+    # the ApplyReadback waiting on it (or None). Started when the running
+    # one ends.
+    _config_download_queued = None
+    # The operator pressed Cancel on the running config download.
+    _config_download_canceled = False
+    # time.time() before which the automatic config load does not try again
+    # after a failed attempt (CONFIG_DOWNLOAD_RETRY_DELAY_S).
+    _config_download_retry_at = 0.0
 
     setting_list = {}
     setting_type_list = {}
@@ -5578,16 +5631,50 @@ class Makera(RelativeLayout):
             )
 
     # -----------------------------------------------------------------------
-    def download_config_file(self):
+    def download_config_file(self, readback=None):
+        """Download /sd/config.txt and load it (finishLoadConfig). Runs on
+        the main thread. One config download at a time: asked for while
+        one is running, it starts once that one has ended. ``readback`` is
+        the ApplyReadback waiting on this download, if any."""
+        if self._config_download_running:
+            self._config_download_queued = (readback,)
+            return
+        self._config_download_running = True
+        self._config_download_number += 1
+        self._config_download_canceled = False
+        self._apply_readback = readback
         self.downloading_size = 1024 * 5
         self.downloading_config = True
         remote_path = "/sd/config.txt"
         self.downloading_file = remote_path
         local_path = self._machine_config_cache_path()
-        self._start_link_worker(self.doDownload, remote_path, local_path, automatic=True)
+        self._start_link_worker(self._config_download_worker, remote_path, local_path, self._config_download_number)
+
+    def _config_download_worker(self, remote_path, local_path, number):
+        """Worker thread for download_config_file. doDownload reports how
+        the download went to finishLoadConfig itself. Should it raise
+        instead, the download is reported as failed here, so it still ends:
+        the popup closes, config_loading is cleared and a later attempt can
+        start."""
+        try:
+            self.doDownload(remote_path, local_path, automatic=True)
+        except Exception as exc:
+            logger.exception("Config download of %s failed", remote_path)
+            Clock.schedule_once(self.progressFinish, 0)
+            Clock.schedule_once(partial(self._config_download_died, number, str(exc)), 0.2)
+
+    def _config_download_died(self, number, reason, *_args):
+        """Main-thread end of a config download whose worker raised: report
+        it as failed, unless finishLoadConfig has already ended it."""
+        if self._config_download_running and self._config_download_number == number:
+            self.finishLoadConfig(False, error=tr._("Download config file error!") + "\n" + reason)
 
     # -----------------------------------------------------------------------
-    def finishLoadConfig(self, success, *args):
+    def finishLoadConfig(self, success, *args, error=None):
+        """Main-thread end of a config download (doDownload). ``error`` is
+        what to tell the operator when it failed."""
+        self._config_download_running = False
+        queued, self._config_download_queued = self._config_download_queued, None
         self.downloading_config = False
         readback, self._apply_readback = self._apply_readback, None
         if success:
@@ -5649,17 +5736,40 @@ class Makera(RelativeLayout):
                 self.config_loading = False
         else:
             self.config_loading = False
-            self._config_download_failures += 1
-            if readback is None:
-                self.controller.log.put((Controller.MSG_ERROR, tr._("Download config file error")))
-            if self._config_download_failures >= MAX_CONFIG_DOWNLOAD_ATTEMPTS:
-                logger.error(
-                    "Giving up config download after %s failed attempts",
-                    self._config_download_failures,
-                )
+            canceled, self._config_download_canceled = self._config_download_canceled, False
+            if canceled:
+                # The operator stopped it: no automatic attempt on this
+                # connection. Connecting again starts a new one.
+                self._config_download_failures = MAX_CONFIG_DOWNLOAD_ATTEMPTS
+                error = None
+                if readback is None:
+                    self.controller.log.put(
+                        (
+                            Controller.MSG_NORMAL,
+                            tr._("Loading config.txt was cancelled. Disconnect and connect again to load it."),
+                        )
+                    )
+            else:
+                self._config_download_failures += 1
+                self._config_download_retry_at = time.time() + CONFIG_DOWNLOAD_RETRY_DELAY_S
+                if readback is None:
+                    self.controller.log.put((Controller.MSG_ERROR, tr._("Download config file error")))
+                if self._config_download_failures >= MAX_CONFIG_DOWNLOAD_ATTEMPTS:
+                    logger.error(
+                        "Giving up config download after %s failed attempts",
+                        self._config_download_failures,
+                    )
+                    if error:
+                        error += "\n\n" + tr._(
+                            "The machine settings could not be loaded. Disconnect and connect again to try again."
+                        )
+            if error and readback is None:
+                Clock.schedule_once(partial(self.show_message_popup, error, False), 0)
             # self.controller.close()
         if readback is not None:
             self._report_apply_readback(readback, success)
+        if queued is not None:
+            self.download_config_file(readback=queued[0])
 
         # Preserve selected file only when reconnecting to the same machine.
         # finishLoadConfig() can be called on reconnect; resume-at-line depends on
@@ -5678,6 +5788,23 @@ class Makera(RelativeLayout):
             self.clear_selection()
             self.apply_bed_settings()
         self.updateStatus()
+
+    def _automatic_config_load_due(self, app, now):
+        """Whether updateStatus should start loading config.txt now: once
+        per connection, with the machine idle, no config download already
+        running, and after a failed attempt only once
+        CONFIG_DOWNLOAD_RETRY_DELAY_S has passed, up to
+        MAX_CONFIG_DOWNLOAD_ATTEMPTS attempts."""
+        return (
+            not app.playing
+            and not self.config_loaded
+            and not self.config_loading
+            and not self._config_download_running
+            and not self._config_apply_failed
+            and self._config_download_failures < MAX_CONFIG_DOWNLOAD_ATTEMPTS
+            and now >= self._config_download_retry_at
+            and app.state == "Idle"
+        )
 
     def _get_current_machine_connection_key(self):
         """Return a stable identifier for the current machine connection."""
@@ -5802,19 +5929,22 @@ class Makera(RelativeLayout):
         # Only use a temp file for MD5 skip when it is a copy of the real local file.
         # Orphan .tmp leftovers must not suppress a real download.
         if os.path.exists(local_path):
-            shutil.copyfile(local_path, tmp_filename)
-        elif os.path.exists(tmp_filename):
             try:
-                os.remove(tmp_filename)
-            except OSError:
-                pass
+                shutil.copyfile(local_path, tmp_filename)
+            except OSError as exc:
+                # Only costs the unchanged-file check: the whole file is
+                # downloaded again.
+                logger.warning("Could not copy %s for the unchanged-file check: %s", local_path, exc)
+                _discard_file(tmp_filename)
+        elif os.path.exists(tmp_filename):
+            _discard_file(tmp_filename)
 
         if show_progress:
             Clock.schedule_once(
                 partial(
                     self.progressStart,
                     tr._("Load config...") if self.downloading_config else (tr._("Checking") + " \n%s" % local_path),
-                    None if self.downloading_config else self.cancelProcessingFile,
+                    self.cancelProcessingFile,
                 ),
                 0,
             )
@@ -5857,103 +5987,124 @@ class Makera(RelativeLayout):
 
         self.heartbeat_time = time.time()
 
-        if download_result is None:
-            if os.path.exists(tmp_filename):
-                os.remove(tmp_filename)
-            if last_file_error:
-                self.controller.log.put((Controller.MSG_ERROR, last_file_error))
-            # show message popup
-            md5_failed = bool(
-                getattr(getattr(getattr(self.controller, "stream", None), "modem", None), "download_md5_failed", False)
-            )
-            readback = self._apply_readback if apply_config else None
-            if readback is not None:
-                readback.reason = self._readback_failure_reason(md5_failed)
-            if apply_config:
-                Clock.schedule_once(partial(self.finishLoadConfig, False), 0.1)
-                error_msg = (
-                    tr._(
-                        "Download config file error! The file MD5 hash doesn't match what is expected. "
-                        "Possibly corruption occured during transfer or on SD card."
+        # From here on nothing may escape: a raised error would end the
+        # worker thread with the progress popup still up and, for a config
+        # download, finishLoadConfig never called, which leaves
+        # config_loading set and blocks every later config load.
+        config_finish_scheduled = False
+        try:
+            if download_result is None:
+                _discard_file(tmp_filename)
+                if last_file_error:
+                    self.controller.log.put((Controller.MSG_ERROR, last_file_error))
+                # show message popup
+                md5_failed = bool(
+                    getattr(
+                        getattr(getattr(self.controller, "stream", None), "modem", None), "download_md5_failed", False
                     )
-                    if md5_failed
-                    else tr._("Download config file error!")
                 )
-                if readback is None:
-                    Clock.schedule_once(partial(self.show_message_popup, error_msg, False), 0.2)
-            else:
-                error_msg = (
-                    tr._(
-                        "Download file error! MD5 hash doesn't match what is expected. "
-                        "Possible corruption during transfer or on SD card."
-                    )
-                    if md5_failed
-                    else tr._("Download file error!")
-                )
-                Clock.schedule_once(partial(self.show_message_popup, error_msg, False), 0)
-        elif download_result >= 0:
-            if download_result > 0:
-                # download success
-                if os.path.exists(local_path):
-                    os.remove(local_path)
-                os.rename(tmp_filename, local_path)
-            else:
-                # MD5 matched: firmware reports "Download canceled by Controller!" for this
-                # intentional FILE_CAN; keep/promote the local cache instead of re-fetching.
-                if not os.path.exists(local_path) and os.path.exists(tmp_filename):
-                    os.rename(tmp_filename, local_path)
-                elif os.path.exists(tmp_filename):
-                    os.remove(tmp_filename)
+                readback = self._apply_readback if apply_config else None
+                if readback is not None:
+                    readback.reason = self._readback_failure_reason(md5_failed)
                 if apply_config:
-                    logger.info("Config unchanged (MD5 match), using cached file")
-                    self.controller.log.put(
-                        (Controller.MSG_NORMAL, tr._("Config unchanged (MD5 match), using cached file"))
+                    error_msg = (
+                        tr._(
+                            "Download config file error! The file MD5 hash doesn't match what is expected. "
+                            "Possibly corruption occured during transfer or on SD card."
+                        )
+                        if md5_failed
+                        else tr._("Download config file error!")
                     )
+                    # finishLoadConfig shows error_msg, unless an Apply is
+                    # waiting on this download and reports it instead.
+                    Clock.schedule_once(partial(self.finishLoadConfig, False, error=error_msg), 0.1)
+                    config_finish_scheduled = True
+                else:
+                    error_msg = (
+                        tr._(
+                            "Download file error! MD5 hash doesn't match what is expected. "
+                            "Possible corruption during transfer or on SD card."
+                        )
+                        if md5_failed
+                        else tr._("Download file error!")
+                    )
+                    Clock.schedule_once(partial(self.show_message_popup, error_msg, False), 0)
+            elif download_result >= 0:
+                if download_result > 0:
+                    # download success
+                    _move_download_into_place(tmp_filename, local_path)
+                else:
+                    # MD5 matched: firmware reports "Download canceled by Controller!" for this
+                    # intentional FILE_CAN; keep/promote the local cache instead of re-fetching.
+                    if not os.path.exists(local_path) and os.path.exists(tmp_filename):
+                        _move_download_into_place(tmp_filename, local_path)
+                    else:
+                        _discard_file(tmp_filename)
+                    if apply_config:
+                        logger.info("Config unchanged (MD5 match), using cached file")
+                        self.controller.log.put(
+                            (Controller.MSG_NORMAL, tr._("Config unchanged (MD5 match), using cached file"))
+                        )
+                if apply_config:
+                    if show_progress:
+                        Clock.schedule_once(partial(self.progressUpdate, 100, "", True), 0)
+                    Clock.schedule_once(partial(self.finishLoadConfig, True), 0.1)
+                    config_finish_scheduled = True
+
+                    if show_progress:
+                        Clock.schedule_once(
+                            partial(self.progressUpdate, 100, tr._("Synchronize version and time..."), True), 0
+                        )
+                    Clock.schedule_once(self.controller.queryTime, 0.1)
+                    if app is None or not app.model:
+                        Clock.schedule_once(self.controller.queryModel, 0.2)
+                    if not self.fw_version:
+                        Clock.schedule_once(self.controller.queryVersion, 0.3)
+                    self.filetype = ""
+                    Clock.schedule_once(self.controller.queryFtype, 0.4)
+                    # Schedule a one off diagnostic command to get the machine's extended state
+                    Clock.schedule_once(self.controller.viewDiagnoseReport, 0.5)
+                    # Baud upgrade after config + sync commands have had time to finish.
+                    Clock.schedule_once(self.attempt_usb_baud_upgrade_if_eligible, 2.0)
+                elif open_after:
+                    if show_progress:
+                        Clock.schedule_once(
+                            partial(self.progressUpdate, 0, tr._("Open cached file") + " \n%s" % local_path, True), 0
+                        )
+                    # Opening the file is handed to the main thread, after the
+                    # progress update above; _finish_downloaded_file_open then
+                    # loads it on a worker thread of its own.
+                    Clock.schedule_once(partial(self._finish_downloaded_file_open, remote_path, local_path))
+                elif decompress:
+                    if self._decompress_downloaded_file_in_place(local_path):
+                        self._ingest_machine_gcode_thumbnail(remote_path, local_path)
+
+                if not was_config_download and not was_backup:
+                    self.update_recent_remote_dir_list(os.path.dirname(remote_path))
+
+            elif download_result < 0:
+                _discard_file(tmp_filename)
+                self.controller.log.put((Controller.MSG_NORMAL, tr._("Downloading is canceled manually.")))
+                if apply_config:
+                    self._config_download_canceled = True
+                    Clock.schedule_once(partial(self.finishLoadConfig, False), 0)
+                    config_finish_scheduled = True
+        except Exception as exc:
+            logger.exception("Could not finish downloading %s", remote_path)
+            download_result = None
             if apply_config:
-                if show_progress:
-                    Clock.schedule_once(partial(self.progressUpdate, 100, "", True), 0)
-                Clock.schedule_once(partial(self.finishLoadConfig, True), 0.1)
-
-                if show_progress:
-                    Clock.schedule_once(
-                        partial(self.progressUpdate, 100, tr._("Synchronize version and time..."), True), 0
-                    )
-                Clock.schedule_once(self.controller.queryTime, 0.1)
-                if app is None or not app.model:
-                    Clock.schedule_once(self.controller.queryModel, 0.2)
-                if not self.fw_version:
-                    Clock.schedule_once(self.controller.queryVersion, 0.3)
-                self.filetype = ""
-                Clock.schedule_once(self.controller.queryFtype, 0.4)
-                # Schedule a one off diagnostic command to get the machine's extended state
-                Clock.schedule_once(self.controller.viewDiagnoseReport, 0.5)
-                # Baud upgrade after config + sync commands have had time to finish.
-                Clock.schedule_once(self.attempt_usb_baud_upgrade_if_eligible, 2.0)
-            elif open_after:
-                if show_progress:
-                    Clock.schedule_once(
-                        partial(self.progressUpdate, 0, tr._("Open cached file") + " \n%s" % local_path, True), 0
-                    )
-                # Opening the file is handed to the main thread, after the
-                # progress update above; _finish_downloaded_file_open then
-                # loads it on a worker thread of its own.
-                Clock.schedule_once(partial(self._finish_downloaded_file_open, remote_path, local_path))
-            elif decompress:
-                if self._decompress_downloaded_file_in_place(local_path):
-                    self._ingest_machine_gcode_thumbnail(remote_path, local_path)
-
-            if not was_config_download and not was_backup:
-                self.update_recent_remote_dir_list(os.path.dirname(remote_path))
-
-        elif download_result < 0:
-            if os.path.exists(tmp_filename):
-                os.remove(tmp_filename)
-            self.controller.log.put((Controller.MSG_NORMAL, tr._("Downloading is canceled manually.")))
-            if apply_config:
-                Clock.schedule_once(partial(self.finishLoadConfig, False), 0)
-
-        if show_progress:
-            Clock.schedule_once(self.progressFinish, 0.1)
+                if not config_finish_scheduled:
+                    readback = self._apply_readback
+                    if readback is not None:
+                        readback.reason = str(exc)
+                    error_msg = tr._("Download config file error!") + "\n" + str(exc)
+                    Clock.schedule_once(partial(self.finishLoadConfig, False, error=error_msg), 0.1)
+            else:
+                error_msg = tr._("Download file error!") + "\n" + str(exc)
+                Clock.schedule_once(partial(self.show_message_popup, error_msg, False), 0)
+        finally:
+            if show_progress:
+                Clock.schedule_once(self.progressFinish, 0.1)
         return download_result
 
     def onFirmwareDetected(self, version, *args):
@@ -8520,6 +8671,7 @@ class Makera(RelativeLayout):
                     self.config_loading = False
                     self._config_apply_failed = False
                     self._config_download_failures = 0
+                    self._config_download_retry_at = 0.0
                     self.fw_version = ""
                     self.fw_version_query_attempts = 0
                     Clock.schedule_once(lambda *_: self._refresh_firmware_update_state(), 0)
@@ -8626,14 +8778,7 @@ class Makera(RelativeLayout):
                 self.controller.apply_session_lights(True)
 
             # load config, only one time per connection
-            if (
-                not app.playing
-                and not self.config_loaded
-                and not self.config_loading
-                and not self._config_apply_failed
-                and self._config_download_failures < MAX_CONFIG_DOWNLOAD_ATTEMPTS
-                and app.state == "Idle"
-            ):
+            if self._automatic_config_load_due(app, now):
                 if not app.model or not self.fw_version:
                     if now - self.machine_metadata_query_time > 1:
                         self.check_model_metadata()
@@ -9947,8 +10092,7 @@ class Makera(RelativeLayout):
         modem = getattr(getattr(self.controller, "stream", None), "modem", None)
         if modem is not None:
             modem.last_file_error = None
-        self._apply_readback = readback
-        self.download_config_file()
+        self.download_config_file(readback=readback)
 
     def _readback_failure_reason(self, md5_failed):
         """Why reading config.txt back failed, in words for the settings
