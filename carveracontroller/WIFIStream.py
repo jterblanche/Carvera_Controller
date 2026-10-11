@@ -64,11 +64,17 @@ class MachineDetector:
                     # a beacon from firmware that predates it, in which case
                     # "no old controller known present" is the safe default.
                     old_controller_present = len(fields) > 4 and fields[4] == "1"
+                    # "busy" means busy to this controller. Field 4 says
+                    # someone is connected, which keeps old controllers
+                    # away; this controller can still join unless field 5
+                    # says an old controller is there. Without field 5
+                    # (older firmware), field 4 decides, as before.
+                    busy = old_controller_present if len(fields) > 4 else fields[3] == "1"
                     entry = {
                         "machine": fields[0],
                         "ip": fields[1],
                         "port": int(fields[2]),
-                        "busy": fields[3] == "1",
+                        "busy": busy,
                         "old_controller_present": old_controller_present,
                     }
                     # Keyed by (name, ip) together, not name alone: two
@@ -94,6 +100,11 @@ class MachineDetector:
             return self.machine_list
         except:
             print(sys.exc_info()[1])
+
+    @staticmethod
+    def scan_label(machine):
+        """The machine's line in the Wi-Fi scan list."""
+        return machine["machine"] + ("(Busy)" if machine["busy"] else "")
 
     def is_old_controller_present(self, ip):
         """Whether the last-discovered beacon for ``ip`` reported an old

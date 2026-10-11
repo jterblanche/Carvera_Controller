@@ -4707,7 +4707,7 @@ class Makera(RelativeLayout):
         else:
             for machine in machines:
                 btn = MachineButton(
-                    text=machine["machine"] + ("(Busy)" if machine["busy"] else ""),
+                    text=self.machine_detector.scan_label(machine),
                     ip=machine["ip"],
                     port=machine["port"],
                     size_hint_y=None,

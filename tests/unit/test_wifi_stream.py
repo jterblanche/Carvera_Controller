@@ -334,3 +334,27 @@ def test_two_machines_sharing_a_name_get_separate_entries_not_one_flip_flopping_
     assert len(detector.machine_list) == 2
     ips = {entry["ip"] for entry in detector.machine_list}
     assert ips == {"10.0.0.5", "10.0.0.9"}
+
+
+def _scan_label_for(payload: bytes) -> str:
+    detector = _detector_with_packet(payload)
+    detector.check_for_responses()
+    return MachineDetector.scan_label(detector.machine_list[0])
+
+
+def test_scan_shows_no_busy_when_only_new_controllers_are_connected():
+    """Field 4 is set because someone is connected, but field 5 says no old
+    controller is among them, so this controller can still join."""
+    assert _scan_label_for(b"Carvera,10.0.0.5,2222,1,0") == "Carvera"
+
+
+def test_scan_shows_busy_when_an_old_controller_is_connected():
+    assert _scan_label_for(b"Carvera,10.0.0.5,2222,1,1") == "Carvera(Busy)"
+
+
+def test_scan_shows_busy_from_firmware_without_the_fifth_field_when_busy_is_set():
+    assert _scan_label_for(b"Carvera,10.0.0.5,2222,1") == "Carvera(Busy)"
+
+
+def test_scan_shows_no_busy_from_firmware_without_the_fifth_field_when_busy_is_clear():
+    assert _scan_label_for(b"Carvera,10.0.0.5,2222,0") == "Carvera"
