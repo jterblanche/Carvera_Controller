@@ -44,6 +44,15 @@ EVENT_KIND_CONTROL_CHANGED = 5
 EVENT_KIND_CLIENT_JOINED = 6
 EVENT_KIND_CLIENT_LEFT = 7
 EVENT_KIND_JOB_START = 8
+# Sent once a second, while another controller's file transfer runs, to
+# every identified controller but that one. Firmware without it sends
+# nothing at all to the others meanwhile (machine/peer_transfer.py).
+EVENT_KIND_TRANSFER_IN_PROGRESS = 9
+
+# The direction byte of a transfer-in-progress event, as the transferring
+# controller sees it.
+TRANSFER_DOWNLOADING = 0
+TRANSFER_UPLOADING = 1
 
 # Job-start event `phase` values. Hashing comes first, while the machine
 # computes the file's MD5: it carries the size but no checksum and no time
@@ -409,3 +418,14 @@ def _decode_id_and_name(payload: bytes) -> tuple[int, str] | None:
     if name_len > _MAX_NAME_BYTES or offset + name_len > len(payload):
         return None
     return client_id, payload[offset : offset + name_len].decode("utf-8", errors="replace")
+
+
+def decode_transfer_in_progress_event(payload: bytes) -> int | None:
+    """Decode one event (`0x68`) payload as a transfer-in-progress event:
+    kind(1) + direction(1), ``TRANSFER_DOWNLOADING`` or
+    ``TRANSFER_UPLOADING``. Returns the direction byte as sent (a later
+    firmware may use another value), or None for another kind or a payload
+    cut short. Bytes after the direction are ignored."""
+    if len(payload) < 2 or payload[0] != EVENT_KIND_TRANSFER_IN_PROGRESS:
+        return None
+    return payload[1]
