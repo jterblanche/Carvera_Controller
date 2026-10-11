@@ -25,8 +25,8 @@ from carveracontroller.main import ConnectedControllerRow, StatusDropDown
 KV_PATH = Path(__file__).resolve().parents[2] / "carveracontroller" / "makera.kv"
 
 
-def _row(name, *, is_self=False, has_control=False):
-    return ClientRow(name=name, has_control=has_control, is_self=is_self)
+def _row(name, *, is_self=False, has_control=False, link=""):
+    return ClientRow(name=name, has_control=has_control, is_self=is_self, link=link)
 
 
 def _bare_drop_down():
@@ -57,10 +57,23 @@ def test_set_connected_controllers_builds_one_row_per_controller():
     children = list(reversed(drop_down.connected_controllers_container.children))
     assert len(children) == 2
     assert all(isinstance(child, ConnectedControllerRow) for child in children)
-    assert children[0].text == "Office PC (you) — in control"
+    assert children[0].text == "Office PC (you) — Has Control"
     assert children[0].has_control is True
     assert children[1].text == "Workshop Laptop"
     assert children[1].has_control is False
+
+
+def test_set_connected_controllers_shows_the_link_and_has_control():
+    drop_down = _bare_drop_down()
+    rows = (
+        _row("PC", is_self=True, has_control=True, link="USB"),
+        _row("PC", link="WiFi"),
+    )
+
+    drop_down.set_connected_controllers(rows)
+
+    children = list(reversed(drop_down.connected_controllers_container.children))
+    assert [child.text for child in children] == ["PC (USB) (you) — Has Control", "PC (WiFi)"]
 
 
 def test_set_connected_controllers_truncates_a_long_name_with_an_ellipsis():
@@ -119,6 +132,33 @@ def test_status_drop_down_has_a_fixed_width_wide_enough_for_long_rows(_stub_runn
     drop_down = StatusDropDown()
     assert drop_down.auto_width is False
     assert drop_down.width >= dp(220)
+
+
+def test_status_drop_down_widens_to_fit_its_widest_row_and_back(_stub_running_app):
+    drop_down = StatusDropDown()
+    min_width = drop_down.min_width
+    long_row = _row("A" * 31, is_self=True, has_control=True, link="WiFi - 192.168.100.200")
+
+    drop_down.set_connected_controllers((long_row, _row("PC", link="USB")))
+
+    widest = drop_down.connected_controllers_container.children[-1]
+    assert drop_down.width > min_width
+    assert drop_down.width >= widest.width_for_one_line()
+
+    drop_down.set_connected_controllers((_row("PC", link="USB"),))
+    assert drop_down.width == min_width
+
+
+def test_connected_controller_row_is_cut_short_rather_than_wrapped(_stub_running_app):
+    one_line = ConnectedControllerRow(text="PC (USB)")
+    one_line.width = dp(260)
+    one_line.texture_update()
+
+    row = ConnectedControllerRow(text="A Very Long Controller Name (WiFi - 192.168.100.200) (you) — Has Control")
+    row.width = dp(120)
+    row.texture_update()
+
+    assert row.texture_size[1] == one_line.texture_size[1]
 
 
 def test_release_control_label_is_bound_to_wrap_within_its_own_width(_stub_running_app):

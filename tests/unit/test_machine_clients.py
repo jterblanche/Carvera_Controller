@@ -6,7 +6,7 @@ from carveracontroller.machine.clients import (
     rows_for_display,
     truncate_name,
 )
-from carveracontroller.protocols.handshake import ClientEntry
+from carveracontroller.protocols.handshake import LINK_USB, LINK_WIFI, ClientEntry
 
 SELF_ID = 1
 OTHER_ID = 2
@@ -23,8 +23,8 @@ def test_rows_for_display_puts_the_controlling_entry_first():
     rows = rows_for_display(_entries(), own_id=SELF_ID)
 
     assert rows == (
-        ClientRow(name="Office PC", has_control=True, is_self=True),
-        ClientRow(name="Workshop Laptop", has_control=False, is_self=False),
+        ClientRow(name="Office PC", has_control=True, is_self=True, link="WiFi"),
+        ClientRow(name="Workshop Laptop", has_control=False, is_self=False, link="WiFi"),
     )
 
 
@@ -37,6 +37,96 @@ def test_rows_for_display_marks_self():
 
 def test_rows_for_display_empty():
     assert rows_for_display((), own_id=SELF_ID) == ()
+
+
+# -- link labels: how each controller is connected, and its IP address
+# when two WiFi controllers show the same name.
+
+
+def _links(entries, own_id=SELF_ID):
+    return [(row.name, row.link) for row in rows_for_display(entries, own_id)]
+
+
+def test_rows_show_usb_and_wifi_for_the_same_name():
+    entries = (
+        ClientEntry(id=1, name="PC", link=LINK_WIFI, has_control=False, ip="192.168.1.23"),
+        ClientEntry(id=2, name="PC", link=LINK_USB, has_control=False),
+    )
+
+    assert _links(entries) == [("PC", "USB"), ("PC", "WiFi")]
+
+
+def test_rows_show_the_ip_when_two_wifi_controllers_share_a_name():
+    entries = (
+        ClientEntry(id=1, name="PC", link=LINK_WIFI, has_control=False, ip="192.168.1.57"),
+        ClientEntry(id=2, name="PC", link=LINK_WIFI, has_control=False, ip="192.168.1.23"),
+        ClientEntry(id=3, name="PC", link=LINK_USB, has_control=False),
+    )
+
+    assert _links(entries) == [("PC", "USB"), ("PC", "WiFi - 192.168.1.23"), ("PC", "WiFi - 192.168.1.57")]
+
+
+def test_rows_show_no_ip_for_wifi_controllers_with_different_names():
+    entries = (
+        ClientEntry(id=1, name="Office PC", link=LINK_WIFI, has_control=False, ip="192.168.1.23"),
+        ClientEntry(id=2, name="Shop PC", link=LINK_WIFI, has_control=False, ip="192.168.1.57"),
+    )
+
+    assert _links(entries) == [("Office PC", "WiFi"), ("Shop PC", "WiFi")]
+
+
+def test_rows_show_the_ip_when_names_only_differ_past_the_shown_length():
+    entries = (
+        ClientEntry(id=1, name="A" * 25 + "1", link=LINK_WIFI, has_control=False, ip="10.0.0.1"),
+        ClientEntry(id=2, name="A" * 25 + "2", link=LINK_WIFI, has_control=False, ip="10.0.0.2"),
+    )
+
+    assert sorted(link for _, link in _links(entries)) == ["WiFi - 10.0.0.1", "WiFi - 10.0.0.2"]
+
+
+def test_rows_show_wifi_alone_when_the_machine_sends_no_ip():
+    # Firmware from before the client list carried addresses.
+    entries = (
+        ClientEntry(id=1, name="PC", link=LINK_WIFI, has_control=False),
+        ClientEntry(id=2, name="PC", link=LINK_WIFI, has_control=False),
+    )
+
+    assert _links(entries) == [("PC", "WiFi"), ("PC", "WiFi")]
+
+
+def test_rows_show_no_link_for_an_unknown_link_value():
+    entries = (ClientEntry(id=1, name="PC", link=7, has_control=False),)
+
+    assert _links(entries) == [("PC", "")]
+
+
+def test_rows_keep_the_controlling_entry_first_whatever_its_link():
+    entries = (
+        ClientEntry(id=1, name="PC", link=LINK_USB, has_control=False),
+        ClientEntry(id=2, name="PC", link=LINK_WIFI, has_control=True, ip="192.168.1.23"),
+    )
+
+    rows = rows_for_display(entries, own_id=1)
+
+    assert [(row.link, row.has_control, row.is_self) for row in rows] == [("WiFi", True, False), ("USB", False, True)]
+
+
+def test_row_display_text_puts_the_link_after_the_name():
+    row = ClientRow(name="PC", has_control=True, is_self=True, link="USB")
+    text = row_display_text(row, you_suffix=" (you)", control_suffix=" — Has Control")
+    assert text == "PC (USB) (you) — Has Control"
+
+
+def test_row_display_text_with_the_ip():
+    row = ClientRow(name="PC", has_control=False, is_self=False, link="WiFi - 192.168.1.23")
+    text = row_display_text(row, you_suffix=" (you)", control_suffix=" — Has Control")
+    assert text == "PC (WiFi - 192.168.1.23)"
+
+
+def test_row_display_text_truncates_the_name_but_not_the_link():
+    row = ClientRow(name="A" * 31, has_control=False, is_self=False, link="WiFi - 10.0.0.1")
+    text = row_display_text(row, you_suffix=" (you)", control_suffix=" — Has Control", max_name_len=20)
+    assert text == "A" * 19 + "… (WiFi - 10.0.0.1)"
 
 
 # -- truncate_name / row_display_text: the status drop-down's rows -- a
@@ -63,25 +153,25 @@ def test_truncate_name_ellipsises_names_over_the_limit():
 
 def test_row_display_text_plain_other_controller():
     row = ClientRow(name="Workshop Laptop", has_control=False, is_self=False)
-    assert row_display_text(row, you_suffix=" (you)", control_suffix=" — in control") == "Workshop Laptop"
+    assert row_display_text(row, you_suffix=" (you)", control_suffix=" — Has Control") == "Workshop Laptop"
 
 
 def test_row_display_text_marks_self_and_control():
     row = ClientRow(name="Office PC", has_control=True, is_self=True)
-    text = row_display_text(row, you_suffix=" (you)", control_suffix=" — in control")
-    assert text == "Office PC (you) — in control"
+    text = row_display_text(row, you_suffix=" (you)", control_suffix=" — Has Control")
+    assert text == "Office PC (you) — Has Control"
 
 
 def test_row_display_text_marks_control_without_self():
     row = ClientRow(name="Workshop Laptop", has_control=True, is_self=False)
-    text = row_display_text(row, you_suffix=" (you)", control_suffix=" — in control")
-    assert text == "Workshop Laptop — in control"
+    text = row_display_text(row, you_suffix=" (you)", control_suffix=" — Has Control")
+    assert text == "Workshop Laptop — Has Control"
 
 
 def test_row_display_text_truncates_long_names_before_appending_suffixes():
     row = ClientRow(name="A" * 31, has_control=True, is_self=True)
-    text = row_display_text(row, you_suffix=" (you)", control_suffix=" — in control", max_name_len=20)
-    assert text == ("A" * 19 + "…" + " (you)" + " — in control")
+    text = row_display_text(row, you_suffix=" (you)", control_suffix=" — Has Control", max_name_len=20)
+    assert text == ("A" * 19 + "…" + " (you)" + " — Has Control")
 
 
 def test_holder_from_client_list_names_the_entry_that_has_control():

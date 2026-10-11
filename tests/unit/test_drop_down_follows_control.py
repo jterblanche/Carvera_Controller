@@ -1,4 +1,4 @@
-"""The status drop-down's "in control" mark follows control as it moves.
+"""The status drop-down's "Has Control" mark follows control as it moves.
 
 Each row's mark comes from the controller's connected_clients. Those come
 from client-list replies, which the controller requests only when it
@@ -123,7 +123,7 @@ def _joined(machine_factory, controller_, root, clock):
         client_list_entries=[(OTHER_ID, "Demo", 0, False), (IDENTITY.id, IDENTITY.name, 0, False)],
     )
     controller_.open(CONN_WIFI, m.address())
-    assert m.wait_until(_rows_read(root, clock, ["Demo", "PC (you)"]), timeout=2.0)
+    assert m.wait_until(_rows_read(root, clock, ["Demo (WiFi)", "PC (WiFi) (you)"]), timeout=2.0)
     return m
 
 
@@ -133,29 +133,29 @@ def test_taking_control_marks_this_controllers_own_row(machine, controller, scre
 
     m.send_control_changed_event(IDENTITY.id, b"PC")
 
-    assert m.wait_until(_rows_read(root, clock, ["Demo", "PC (you) — in control"]), timeout=2.0)
+    assert m.wait_until(_rows_read(root, clock, ["Demo (WiFi)", "PC (WiFi) (you) — Has Control"]), timeout=2.0)
 
 
 def test_another_controller_taking_control_moves_the_mark_to_its_row(machine, controller, screen):
     root, clock = screen
     m = _joined(machine, controller, root, clock)
     m.send_control_changed_event(IDENTITY.id, b"PC")
-    assert m.wait_until(_rows_read(root, clock, ["Demo", "PC (you) — in control"]), timeout=2.0)
+    assert m.wait_until(_rows_read(root, clock, ["Demo (WiFi)", "PC (WiFi) (you) — Has Control"]), timeout=2.0)
 
     m.send_control_changed_event(OTHER_ID, b"Demo")
 
-    assert m.wait_until(_rows_read(root, clock, ["Demo — in control", "PC (you)"]), timeout=2.0)
+    assert m.wait_until(_rows_read(root, clock, ["Demo (WiFi) — Has Control", "PC (WiFi) (you)"]), timeout=2.0)
 
 
 def test_control_released_clears_every_mark(machine, controller, screen):
     root, clock = screen
     m = _joined(machine, controller, root, clock)
     m.send_control_changed_event(OTHER_ID, b"Demo")
-    assert m.wait_until(_rows_read(root, clock, ["Demo — in control", "PC (you)"]), timeout=2.0)
+    assert m.wait_until(_rows_read(root, clock, ["Demo (WiFi) — Has Control", "PC (WiFi) (you)"]), timeout=2.0)
 
     m.send_control_changed_event(0, b"")
 
-    assert m.wait_until(_rows_read(root, clock, ["Demo", "PC (you)"]), timeout=2.0)
+    assert m.wait_until(_rows_read(root, clock, ["Demo (WiFi)", "PC (WiFi) (you)"]), timeout=2.0)
 
 
 def test_control_moving_sends_no_client_list_request(machine, controller, screen):
@@ -164,7 +164,7 @@ def test_control_moving_sends_no_client_list_request(machine, controller, screen
     requests_after_join = m.client_list_requests
 
     m.send_control_changed_event(OTHER_ID, b"Demo")
-    assert m.wait_until(_rows_read(root, clock, ["Demo — in control", "PC (you)"]), timeout=2.0)
+    assert m.wait_until(_rows_read(root, clock, ["Demo (WiFi) — Has Control", "PC (WiFi) (you)"]), timeout=2.0)
     time.sleep(0.2)
 
     assert m.client_list_requests == requests_after_join
