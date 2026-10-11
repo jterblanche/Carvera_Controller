@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 import threading
+from array import array
 from math import *
 from typing import Any
 
@@ -406,32 +407,50 @@ AXIS_OBJ_PATH = _gcode_viewer_asset("axis.obj")
 
 
 class MeshManager:
+    """Per-point toolpath data, kept in typed arrays rather than lists.
+
+    A list holds a pointer plus a separate float object for every number
+    (about 32 bytes each); an array holds the bare number (4 or 8 bytes).
+    A large file has millions of points and ten or more numbers per point,
+    so this is most of the memory a drawn file costs.
+
+    clear() replaces the arrays instead of emptying them: the drawn meshes
+    keep views into the old ``vertices`` (an array with views on it cannot
+    be resized), and the line-time estimate thread keeps reading the old
+    arrays until it finishes.
+    """
+
     def __init__(self):
+        self._new_buffers()
+
+    def _new_buffers(self):
         ##data container
 
-        self.positions = []
+        # positions after rotation for the A axis
+        self.positions = array("d")
         # raw positions (unrotated G-code coordinates)
-        self.raw_positions = []
+        self.raw_positions = array("d")
         # all lengths
-        self.lengths = []
+        self.lengths = array("d")
         # vertex type
-        self.vertex_types = []
-        # raw numbers
-        self.raw_linenumbers = []
+        self.vertex_types = array("f")
+        # line number in the G-code file per vertex
+        self.raw_linenumbers = array("q")
         # feed rate (mm/min) per vertex, from CNC parser
-        self.raw_feed_rates = []
+        self.raw_feed_rates = array("d")
         # spindle RPM / laser S (0–1 PWM fraction in laser mode) per vertex
-        self.raw_spindle_speeds = []
+        self.raw_spindle_speeds = array("d")
         # active tool number per vertex, used to pick the tool mesh to display
-        self.raw_tools = []
+        self.raw_tools = array("q")
         # angles of vertices [4 axis]
-        self.angles_of_vertices = []
+        self.angles_of_vertices = array("d")
 
-        # mesh container
+        # mesh container: [vertex view, index view] per line_strip mesh
         self.meshes = []
 
-        # vertices
-        self.vertices = []
+        # vertices, in the format the toolpath shader reads (Kivy uses a
+        # float array in place, without copying it into a list)
+        self.vertices = array("f")
         ##  bounding area
 
         # record the max size of area
@@ -448,32 +467,7 @@ class MeshManager:
         self.is_4_axis = None
 
     def clear(self):
-        self.positions.clear()
-        self.raw_positions.clear()
-        # all lengths
-        self.lengths.clear()
-        # vertex type
-        self.vertex_types.clear()
-        # raw numbers
-        self.raw_linenumbers.clear()
-        self.raw_feed_rates.clear()
-        self.raw_spindle_speeds.clear()
-        self.raw_tools.clear()
-        # angles of vertices [4 axis]
-        self.angles_of_vertices.clear()
-        # mesh container
-        self.meshes.clear()
-        # vertices
-        self.vertices.clear()
-
-        # move to origin
-        self.area_size = 0.0
-        self.min_pt = [float("inf"), float("inf"), float("inf")]
-        self.max_pt = [float("-inf"), float("-inf"), float("-inf")]
-        self.area_center_sum = [0, 0, 0]
-        self.area_center_sum_index = 0
-        self.position_scale = 1.0  # same to scale_invert
-        self.is_4_axis = None
+        self._new_buffers()
 
     def get_pt_count(self):
         return len(self.positions)
@@ -547,11 +541,11 @@ class MeshManager:
         # push this vertex to container
         self.vertices.extend(vertex)
         self.vertex_types.append(1.0 if linedata[4] > 0.5 else 2.0)  # line type[red | green]
-        self.raw_linenumbers.append(vertex[6])
+        self.raw_linenumbers.append(int(vertex[6]))
         self.raw_feed_rates.append(feed)
         speed = float(linedata[8]) if len(linedata) > 8 else 0.0
         self.raw_spindle_speeds.append(speed)
-        self.raw_tools.append(vertex[9])
+        self.raw_tools.append(int(vertex[9]))
         self.angles_of_vertices.append(angle)
 
     def generate_meshes(self):
@@ -568,18 +562,21 @@ class MeshManager:
             self.vertices[vertex_float_num * i + 1] = self.positions[3 * i + 1] * self.position_scale
             self.vertices[vertex_float_num * i + 2] = self.positions[3 * i + 2] * self.position_scale
 
-        # 1 calculate lengths
-        self.lengths = [0] * vertex_count
+        # 1 calculate lengths, from the scaled positions in double precision
+        # (self.vertices holds them as 32-bit floats, for the shader)
+        self.lengths = array("d", bytes(8 * vertex_count))
+        positions = self.positions
+        scale = self.position_scale
         for i in range(1, vertex_count):
             pos1 = [
-                self.vertices[vertex_float_num * (i - 1) + 0],
-                self.vertices[vertex_float_num * (i - 1) + 1],
-                self.vertices[vertex_float_num * (i - 1) + 2],
+                positions[3 * (i - 1) + 0] * scale,
+                positions[3 * (i - 1) + 1] * scale,
+                positions[3 * (i - 1) + 2] * scale,
             ]
             pos2 = [
-                self.vertices[vertex_float_num * (i) + 0],
-                self.vertices[vertex_float_num * (i) + 1],
-                self.vertices[vertex_float_num * (i) + 2],
+                positions[3 * i + 0] * scale,
+                positions[3 * i + 1] * scale,
+                positions[3 * i + 2] * scale,
             ]
 
             cur_line_len = vec3_distance(pos1, pos2)
@@ -591,17 +588,18 @@ class MeshManager:
 
         self.seg_mesh_vertex_count = MESH_LINE_CHUNK
 
-        # 3 construct meshes
+        # 3 construct meshes: views into self.vertices (no copies), all
+        # sharing one index array (Kivy takes unsigned shorts in place)
         self.meshes.clear()
         mesh_start_id = 0
         mesh_end_id = min(self.seg_mesh_vertex_count, vertex_count)  # not included
+        vertex_view = memoryview(self.vertices)
+        index_view = memoryview(array("H", range(min(self.seg_mesh_vertex_count, vertex_count))))
 
         while True:
             # process each mesh
-            indices = []
-            for i in range(mesh_end_id - mesh_start_id):
-                indices.append(i)
-            mesh = [self.vertices[vertex_float_num * mesh_start_id : vertex_float_num * mesh_end_id], indices]
+            indices = index_view[: mesh_end_id - mesh_start_id]
+            mesh = [vertex_view[vertex_float_num * mesh_start_id : vertex_float_num * mesh_end_id], indices]
 
             self.meshes.append(mesh)
 
@@ -1076,6 +1074,12 @@ class GCodeViewer(Widget):
         self.raw_feed_rates = []
         self.raw_spindle_speeds = []
         self.raw_tools = []
+        # Let go of the rest of the old file's per-point data too, so it is
+        # freed now rather than once the next file has finished loading
+        # (MeshManager.clear replaces its arrays instead of emptying them).
+        self.raw_positions = []
+        self.raw_linenumbers = []
+        self.angles_of_vertices = []
         self._tool_meshes = {}
         self._default_tool_mesh = None
         self.pointer_mesh_instrs = []
@@ -1528,10 +1532,13 @@ class GCodeViewer(Widget):
             self.line_times = []
             self.total_time = 0.0
             self._invalidate_legend_durations()
-        raw_positions = list(self.raw_positions)
-        raw_linenumbers = list(self.raw_linenumbers)
-        raw_feed_rates = list(self.raw_feed_rates)
-        angles = list(self.angles_of_vertices)
+        # No copies: a loaded file's arrays are never changed in place
+        # (MeshManager.clear and clearDisplay replace them), so the worker
+        # can read these while a new file loads.
+        raw_positions = self.raw_positions
+        raw_linenumbers = self.raw_linenumbers
+        raw_feed_rates = self.raw_feed_rates
+        angles = self.angles_of_vertices
         limits = _axis_limits_from_app() or dict(DEFAULT_AXIS_LIMITS)
         viewer = self
         PROGRESS_INTERVAL = 100 if show_progress else 0
@@ -3062,10 +3069,10 @@ def _compute_line_times_worker(
     `angles` is optional per-vertex A (degrees), same length as raw_linenumbers.
     `limits` is optional {x,y,z,a,seek} max rates (mm/min; A in deg/min).
     progress_callback(percent) is called every progress_interval segments; use 0 to disable.
-    Returns list of cumulative times (line_times).
+    Returns the cumulative times (line_times), as an array of doubles.
     """
     n = len(raw_linenumbers)
-    line_times = [0.0]
+    line_times = array("d", [0.0])
     use_angles = angles is not None and len(angles) >= n
     for i in range(1, n):
         pos1 = [
