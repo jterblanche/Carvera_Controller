@@ -64,6 +64,12 @@ MACHINE_METADATA_QUERY_MAX_ATTEMPTS = 3
 DECOMPRESS_TIMEOUT_FLOOR_SEC = 15
 DECOMPRESS_TIMEOUT_PER_BLOCK_SEC = 1.0
 
+# A hidden partial file of an open (_replace_file) not written to for this
+# long was left by an open that never finished, and the next open of the
+# same file removes it. An open still running writes to it at least every
+# few seconds.
+STALE_PARTIAL_FILE_S = 60
+
 
 def is_android():
     return "ANDROID_ARGUMENT" in os.environ or "ANDROID_PRIVATE" in os.environ or "ANDROID_APP_PATH" in os.environ
@@ -10935,6 +10941,7 @@ class Makera(RelativeLayout):
         raises, only the hidden file is removed. Returns what `fill`
         returned."""
         folder, filename = os.path.split(os.path.abspath(filepath))
+        self._remove_stale_partial_files(folder, filename)
         partial_path = os.path.join(folder, ".%s.%s.tmp" % (filename, secrets.token_hex(4)))
         # O_EXCL: never reuse a file that is already there.
         os.close(os.open(partial_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666))
@@ -10954,6 +10961,31 @@ class Makera(RelativeLayout):
                     os.remove(partial_path)
                 except OSError:
                     logger.warning("Could not remove partial file %s", partial_path)
+
+    # -----------------------------------------------------------------------
+    def _remove_stale_partial_files(self, folder, filename):
+        """Remove the hidden partial files of `filename` that _replace_file
+        left behind when the app stopped part way (a crash, a kill, a power
+        cut), so they do not pile up beside the user's file. One written to
+        in the last STALE_PARTIAL_FILE_S seconds is left alone: another
+        controller on this computer may be opening the same file now."""
+        pattern = re.compile(r"\.%s\.[0-9a-f]{8}\.tmp\Z" % re.escape(filename))
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            return
+        now = time.time()
+        for name in names:
+            if not pattern.match(name):
+                continue
+            path = os.path.join(folder, name)
+            try:
+                if now - os.path.getmtime(path) < STALE_PARTIAL_FILE_S or not os.path.isfile(path):
+                    continue
+                os.remove(path)
+                logger.info("Removed %s, left by an open that did not finish", path)
+            except OSError:
+                logger.warning("Could not remove partial file %s", path)
 
     # -----------------------------------------------------------------------
     def _decompress_over(self, lzpath, filepath):
