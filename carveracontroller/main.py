@@ -10789,7 +10789,7 @@ class Makera(RelativeLayout):
         self.gcode_cannot_visualise = True
 
     # ------------------------------------------------------------------------
-    def _end_failed_load(self, *args, message=None):
+    def _end_failed_load(self, *args, message=None, failed_path=None):
         """Clear loading_file on the main thread for a load_gcode_file that
         stopped without reaching load_end. load_start, which sets it, runs
         through the same Clock and was scheduled first, so a failure that
@@ -10800,12 +10800,33 @@ class Makera(RelativeLayout):
 
         Closes the progress popup the open path showed (it cannot be closed
         by hand: Cancel is disabled until the first batch is drawn) and, if
-        `message` is given, tells the user why the file did not open."""
+        `message` is given, tells the user why the file did not open.
+
+        `failed_path` is given when the file could not be read at all: a
+        local file being previewed is then no longer the current file
+        (_unselect_failed_preview)."""
         self.loading_file = False
         self._last_loaded_file_key = None
         self.progress_popup.dismiss()
+        if failed_path:
+            self._unselect_failed_preview(failed_path)
         if message:
             self.show_message_popup(message, False)
+
+    # ------------------------------------------------------------------------
+    def _unselect_failed_preview(self, path):
+        """The local file at `path` was opened for preview (no machine file
+        selected) and could not be read, so nothing of it is on screen: it
+        stops being the current file, and the file browser stops naming it.
+        A machine file stays selected (it is still on the machine), and so
+        does a file selected since this one was opened."""
+        app = App.get_running_app()
+        if app is None or getattr(app, "selected_remote_filename", ""):
+            return
+        if getattr(app, "selected_local_filename", "") != path:
+            return
+        app.selected_local_filename = ""
+        self.apply_bed_settings()
 
     # ------------------------------------------------------------------------
     def load_error(self, error_msg, *args):
@@ -11003,11 +11024,11 @@ class Makera(RelativeLayout):
                     tr._("This file is compressed and could not be decompressed. It may be damaged.")
                     + "\n%s" % filepath
                 )
-                Clock.schedule_once(partial(self._end_failed_load, message=message), 0)
+                Clock.schedule_once(partial(self._end_failed_load, message=message, failed_path=filepath), 0)
                 return False
             if not self._verify_deferred_download_md5(partial_path):
                 # The checksum check has already scheduled its own message.
-                Clock.schedule_once(self._end_failed_load, 0)
+                Clock.schedule_once(partial(self._end_failed_load, failed_path=filepath), 0)
                 return False
             return True
 
@@ -11033,6 +11054,7 @@ class Makera(RelativeLayout):
         self.gcode_viewer.tool_unit_scale = 1.0
         Clock.schedule_once(self.load_start)
         f = None
+        read = False
         try:
             with open(filepath, "rb") as f:
                 # 读取文件开头的两个字节
@@ -11056,6 +11078,7 @@ class Makera(RelativeLayout):
             self.lines = f.readlines()
             self.selected_file_line_count = len(self.lines)
             f.close()
+            read = True
 
             # Detect tools/stock metadata and set document unit if available
             self.document_unit = detect_document_unit(self.lines)
@@ -11129,7 +11152,7 @@ class Makera(RelativeLayout):
         except Exception:
             logger.error(sys.exc_info()[1])
             self.heartbeat_time = time.time()
-            Clock.schedule_once(self._end_failed_load, 0)
+            Clock.schedule_once(partial(self._end_failed_load, failed_path=None if read else filepath), 0)
             if f:
                 f.close()
             Clock.schedule_once(self._mark_gcode_cannot_visualise, 0)
