@@ -15,8 +15,11 @@ firmware reports Idle whenever its motion queue is empty, which also
 happens mid-job (a tool change, a probe, the start-of-job routine). Where
 the status report carries the player's playing flag (the fourth value of
 its P: field), a fetch is released only after SETTLE_SAMPLES consecutive
-observations of Idle with the flag at 0. Where it does not, the state
-word decides on its own, on the first Idle report.
+status reports of Idle with the flag at 0. Each report counts once, however
+often the caller looks at it: the screen refreshes more often than reports
+arrive, and right after a play-started event it can still be showing the
+last report from before the job started. Where the firmware does not report
+the flag, the state word decides on its own, on the first Idle report.
 
 Pure decision logic, no I/O: the caller (main.py) owns actually fetching
 the file, drawing it, and reading the machine's current Idle-ness from its
@@ -43,12 +46,13 @@ RETRY_BACKOFF_S = 10.0
 # from the machine, not the same stuck one.
 MAX_FETCH_ATTEMPTS = 3
 
-# Consecutive due_fetch calls that must see the machine Idle with the
+# Consecutive status reports that must show the machine Idle with the
 # player stopped before a fetch is released, when the firmware reports the
 # player flag. More than one, because the call made as the
 # upload-finished/play-started event arrives sees the status report taken
-# before the event. The count restarts at every event, so at least one
-# report taken after the event has to agree.
+# before the event. The count restarts at every event, and a report already
+# counted before it does not count again, so at least one report taken
+# after the event has to agree.
 SETTLE_SAMPLES = 2
 
 
@@ -87,6 +91,9 @@ class PassiveFetchTracker:
     _failing_path: str | None = field(default=None, init=False, repr=False)
     _fail_count: int = field(default=0, init=False, repr=False)
     _settled_samples: int = field(default=0, init=False, repr=False)
+    # The number of the last status report counted in _settled_samples;
+    # see ``due_fetch``.
+    _last_report: int | None = field(default=None, init=False, repr=False)
     # The digest from the most recent upload-finished event that carried
     # one, and the path it named; see ``checksum_for``.
     _announced_path: str | None = field(default=None, init=False, repr=False)
@@ -114,7 +121,9 @@ class PassiveFetchTracker:
             self._failing_path = None
             self._fail_count = 0
 
-    def due_fetch(self, is_idle: bool, now: float | None = None, playing: bool | None = None) -> str | None:
+    def due_fetch(
+        self, is_idle: bool, now: float | None = None, playing: bool | None = None, report: int | None = None
+    ) -> str | None:
         """Call whenever the machine's Idle-ness is (re)observed, e.g. on
         every status update. Returns the path to fetch right now, clearing
         the pending request -- or None if nothing is pending, the machine
@@ -124,15 +133,22 @@ class PassiveFetchTracker:
         ``playing`` is the player flag from the same status report (see
         ``player_flag``), or None when the firmware does not report it.
         With a flag, the machine is settled once SETTLE_SAMPLES consecutive
-        calls since the last published event saw it Idle and not playing;
-        without one, on any call that sees it Idle.
+        status reports since the last published event showed it Idle and
+        not playing; without one, on any call that sees it Idle.
+        ``report`` numbers the status report the call reads (one more for
+        every report received): a call reading the same report as the call
+        before it adds nothing to the count, so looking at one report
+        twice never settles the machine. Without it, every call counts as
+        a report of its own.
         The caller should call ``mark_loaded`` once the fetch actually
         completes, or ``note_fetch_failed`` if it does not -- never nothing,
         or a slow fetch could be retriggered while still in flight."""
         if playing is None:
             settled = is_idle
         else:
-            self._settled_samples = self._settled_samples + 1 if is_idle and not playing else 0
+            if report is None or report != self._last_report:
+                self._last_report = report
+                self._settled_samples = self._settled_samples + 1 if is_idle and not playing else 0
             settled = self._settled_samples >= SETTLE_SAMPLES
         if not settled or self._pending_path is None:
             return None

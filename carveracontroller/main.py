@@ -7333,7 +7333,10 @@ class Makera(RelativeLayout):
         status report's P: field is passed alongside the state word, since
         the firmware also reports Idle mid-job; it is trusted at 0 only on
         firmware that reports it, the same test updateStatus uses for
-        app.playing.
+        app.playing. So is the number of the status report it comes from:
+        this is called more often than reports arrive, and the call made
+        just after a play-started event still sees the last report from
+        before the job started, so each report counts only once.
 
         Nothing starts while this controller's own upload, download or
         load command (a listing, delete, rename, ...) has the link: the
@@ -7356,8 +7359,11 @@ class Makera(RelativeLayout):
         reports_flag = (
             app is not None and app.is_community_firmware and app.fw_version_digitized >= Utils.digitize_v("2.1.0")
         )
+        # Read before the flag: a report parsed in between is then counted
+        # under the older number, never an older report under a newer one.
+        report = getattr(self.controller, "status_reports", None)
         playing = player_flag(CNC.vars.get("is_playing", 0), reports_flag)
-        path = self._passive_fetch.due_fetch(is_idle, now=time.monotonic(), playing=playing)
+        path = self._passive_fetch.due_fetch(is_idle, now=time.monotonic(), playing=playing, report=report)
         if path is None:
             return
         self._auto_fetch_in_progress = True
