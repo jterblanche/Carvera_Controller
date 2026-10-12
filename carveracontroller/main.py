@@ -1753,10 +1753,12 @@ def tool_confirm_button_text(*, has_control, control_holder_id, control_holder_n
 
 
 class ApplyReadback:
-    """Settings whose config-set the machine acknowledged, waiting for
-    /sd/config.txt to be read back to confirm the card holds them.
+    """One Apply waiting for /sd/config.txt to be read back to confirm
+    what the card holds.
 
-    ``sent`` lists the keys written. ``refused`` is the text naming the
+    ``sent`` lists the keys written, the ones whose config-set the machine
+    acknowledged; it is empty when it refused them all. ``refused`` is the
+    text naming the
     settings in the same Apply that the machine refused, or None when it
     accepted them all. ``reason`` says why the read-back failed, when it
     does."""
@@ -10081,15 +10083,24 @@ class Makera(RelativeLayout):
         for the whole wait.
         """
         pending = dict(self.setting_change_list)
+        # The page's values from before this Apply, to go back to for any
+        # setting the machine refuses. Taken now: the settings page takes
+        # a new snapshot of its values as soon as this returns
+        # (ConfigPopup._apply_changes), long before the machine answers.
+        originals = {
+            (widget.section, widget.key): self.config_popup.get_original(widget.section, widget.key)
+            for widget in self.config_popup._all_setting_items()
+            if widget.key in pending
+        }
         self.setting_change_list.clear()
         self.config_popup.btn_apply.disabled = True
         threading.Thread(
             target=self._apply_machine_setting_changes_worker,
-            args=(pending,),
+            args=(pending, originals),
             daemon=True,
         ).start()
 
-    def _apply_machine_setting_changes_worker(self, pending):
+    def _apply_machine_setting_changes_worker(self, pending, originals):
         """Off the Kivy main thread (see apply_machine_setting_changes):
         send each key and wait for its own reply before sending the next,
         then hand the result back to the main thread via Clock.schedule_once
@@ -10099,28 +10110,29 @@ class Makera(RelativeLayout):
             success, message = self.controller.set_config_value_and_wait(key, value, timeout=CONFIG_SET_REPLY_TIMEOUT_S)
             if not success:
                 failures.append((key, message))
-        Clock.schedule_once(partial(self._finish_apply_machine_setting_changes, pending, failures), 0)
+        Clock.schedule_once(partial(self._finish_apply_machine_setting_changes, pending, failures, originals), 0)
 
-    def _finish_apply_machine_setting_changes(self, pending, failures, *_args):
+    def _finish_apply_machine_setting_changes(self, pending, failures, originals, *_args):
         """Runs on the Kivy main thread, scheduled by the worker above.
         Reports success only when every key was acknowledged. On any
-        failure: name the failed settings and the firmware's reason (or
-        the timeout), revert just those widgets to their pre-Apply value --
-        the card's own value, since that write never landed -- and leave
-        the snapshot for keys that did succeed pointing at their new,
-        now-applied value, so a later Apply does not treat them as still
-        pending. Either way, re-read config.txt afterwards
-        (download_config_file, the same path the settings page uses to
-        load it) so the page reflects whatever is actually on the card
-        rather than what this attempt assumed."""
+        failure: name the failed settings and the firmware's reason (the
+        refusal, the busy reply, or the timeout), revert just those
+        settings to their pre-Apply value in ``originals`` -- the card's
+        own value, since that write never landed -- and leave the snapshot
+        for keys that did succeed pointing at their new, now-applied
+        value, so a later Apply does not treat them as still pending.
+        Either way, re-read config.txt afterwards (download_config_file,
+        the same path the settings page uses to load it) so the page
+        reflects whatever is actually on the card rather than what this
+        attempt assumed, and show the result once that has ended."""
         failed_keys = {key for key, _reason in failures}
         for widget in self.config_popup._all_setting_items():
             if widget.key not in pending:
                 continue
             if widget.key in failed_keys:
-                original = self.config_popup.get_original(widget.section, widget.key)
+                original = originals.get((widget.section, widget.key))
                 if original is not None:
-                    widget.value = original
+                    self._revert_setting_widget(widget, original)
             else:
                 # Succeeded: the card now holds this value, so the
                 # snapshot must too, or the next Apply would see a change
@@ -10133,14 +10145,29 @@ class Makera(RelativeLayout):
                 reasons=reasons
             )
         sent = [key for key in pending if key not in failed_keys]
-        if sent:
-            # The result is shown once config.txt has been read back
-            # (_report_apply_readback).
-            self._start_apply_readback(ApplyReadback(sent, refused))
-            return
-        self.message_popup.lb_content.text = refused
-        self.message_popup.open()
-        self.download_config_file()
+        # The result is shown once config.txt has been read back
+        # (_report_apply_readback), also when every setting was refused:
+        # a read-back the machine turns away too is then reported with
+        # the refusal, in one popup, not as a config load error.
+        self._start_apply_readback(ApplyReadback(sent, refused))
+
+    def _revert_setting_widget(self, widget, value):
+        """Put a machine setting the machine refused back to ``value``, its
+        value from before Apply. First in the settings page's config, where
+        Apply wrote the refused value (ConfigPopup._apply_changes): the page
+        only counts a change that differs from the config, so choosing the
+        refused value again would otherwise not be noticed. Then in the
+        widget, which is what the page shows, and in the snapshot Apply
+        compares against."""
+        config = getattr(getattr(widget, "panel", None), "config", None)
+        if config is not None:
+            config.set(widget.section, widget.key, value)
+        loading, self.config_loading = self.config_loading, True
+        try:
+            widget.value = value
+        finally:
+            self.config_loading = loading
+        self.config_popup._widget_snapshot[(widget.section, widget.key)] = value
 
     def _start_apply_readback(self, readback):
         """Read /sd/config.txt back to confirm the settings in ``readback``.
@@ -10171,7 +10198,10 @@ class Makera(RelativeLayout):
         now shows what the card holds and the Apply result is shown as it
         is. When it was not, the settings were sent and acknowledged but
         are not confirmed: say so, without calling them applied, and offer
-        to read config.txt again."""
+        to read config.txt again. When the machine refused every setting,
+        nothing was sent: the page went back to its values from before
+        Apply, which the failed read-back could not confirm either, so the
+        refusal is shown with the same offer."""
         if read_back:
             self.message_popup.lb_content.text = readback.refused or tr._(
                 "Settings applied, need machine reset to take effect !"
@@ -10179,20 +10209,23 @@ class Makera(RelativeLayout):
             self.message_popup.open()
             return
         reason = readback.reason or tr._("the machine did not send the file")
-        self.controller.log.put(
-            (
-                Controller.MSG_ERROR,
-                tr._("Settings sent but not confirmed: could not read config.txt back ({reason})").format(
-                    reason=reason
-                ),
+        if readback.sent:
+            log_line = tr._("Settings sent but not confirmed: could not read config.txt back ({reason})")
+            text = tr._(
+                "Sent to the machine, but could not be confirmed: {keys}\n\n"
+                "Reading config.txt back from the machine failed: {reason}\n\n"
+                "Do not rely on the new value until it is confirmed. "
+                "Check again reads config.txt from the machine once more."
             )
-        )
-        text = tr._(
-            "Sent to the machine, but could not be confirmed: {keys}\n\n"
-            "Reading config.txt back from the machine failed: {reason}\n\n"
-            "Do not rely on the new value until it is confirmed. "
-            "Check again reads config.txt from the machine once more."
-        ).format(keys=", ".join(readback.sent), reason=reason)
+        else:
+            log_line = tr._("Could not read config.txt back after Apply ({reason})")
+            text = tr._(
+                "Reading config.txt back from the machine failed: {reason}\n\n"
+                "The page shows the values it had before Apply. "
+                "Check again reads config.txt from the machine once more."
+            )
+        self.controller.log.put((Controller.MSG_ERROR, log_line.format(reason=reason)))
+        text = text.format(keys=", ".join(readback.sent), reason=reason)
         if readback.refused:
             text = readback.refused + "\n\n" + text
         self.confirm_popup.lb_title.text = tr._("Settings not confirmed")

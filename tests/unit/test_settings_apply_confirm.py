@@ -12,10 +12,13 @@ link, must not look identical to success. These pin:
   - the settings page reports "Settings applied" only when every key
     succeeded, otherwise names the failed settings and the firmware's
     reason and reverts just those widgets;
-  - config.txt is always re-read afterwards, success or partial failure,
-    and when any setting was sent the result is shown only once that
-    read-back has ended: a read-back that fails says the values were sent
-    but not confirmed and offers to read again;
+  - config.txt is always re-read afterwards, success or failure, and the
+    result is shown only once that read-back has ended: a read-back that
+    fails says the values were sent but not confirmed (or, when every
+    setting was refused, gives the refusal) and offers to read again;
+  - the machine's busy reply, while another controller's file transfer
+    runs, is the answer to a config-set, and a refused setting goes back
+    to its value from before Apply;
   - the wait happens off the Kivy main thread.
 """
 
@@ -212,7 +215,13 @@ def test_one_refused_names_it_and_reverts_the_widget(monkeypatch):
     root = _makera({"multi_client.mode": "single_user"}, widgets, originals, controller_)
 
     root.apply_machine_setting_changes()
+    # The result is shown once config.txt has been read back.
+    root.message_popup.open.assert_not_called()
+    readback = root.download_config_file.call_args.kwargs["readback"]
+    assert readback.sent == []
+    root._report_apply_readback(readback, True)
 
+    root.message_popup.open.assert_called_once()
     text = root.message_popup.lb_content.text
     assert "multi_client.mode" in text
     assert "Refused" in text
@@ -231,6 +240,7 @@ def test_timeout_is_reported_as_a_failure_and_reverts_the_widget(monkeypatch):
     root = _makera({"multi_client.mode": "single_user"}, widgets, originals, controller_)
 
     root.apply_machine_setting_changes()
+    root._report_apply_readback(root.download_config_file.call_args.kwargs["readback"], True)
 
     text = root.message_popup.lb_content.text
     assert "multi_client.mode" in text
@@ -482,3 +492,146 @@ def test_config_load_failure_outside_apply_is_still_reported(tmp_path, monkeypat
     root.confirm_popup.open.assert_not_called()
     shown = [str(c.args[0]) for c in root.show_message_popup.call_args_list]
     assert any("Download config file error" in text for text in shown), shown
+
+
+# -- Apply while another controller's file transfer runs -------------------
+#
+# Replays what the machine sent on 12 Oct 2026, while another controller was
+# downloading a file from the card and this one pressed Apply to change
+# multi_client.passive_rights from watch_stop_upload to watch_stop:
+#
+#   tx config-set sd multi_client.passive_rights watch_stop
+#   rx error:Busy -- a file transfer is in progress, retry when it finishes  (60 ms later)
+#   tx download /sd/config.txt                                              (the read-back)
+#   rx error:Busy -- a file transfer is in progress, retry when it finishes
+#
+# The busy reply is the machine's answer: the setting was not written and
+# why. The page must say so, go back to the value the machine still has, and
+# a read-back that the machine turns away the same way must offer to check
+# again rather than show a config load error.
+
+BUSY = "error:Busy -- a file transfer is in progress, retry when it finishes"
+STALL = "the machine stopped sending for 30 s"
+
+
+def test_busy_reply_answers_the_config_set_at_once(machine, controller):
+    m = _connect(machine, controller)
+    result = {}
+
+    def _run():
+        result["value"] = controller.set_config_value_and_wait("multi_client.passive_rights", "watch_stop", timeout=3.0)
+
+    start = time.monotonic()
+    t = threading.Thread(target=_run)
+    t.start()
+    assert m.wait_until(lambda: len(m.frames_of_type(PTYPE_CTRL_MULTI)) > 0)
+    m.send_normal_info(BUSY.encode() + b"\r\n")
+    t.join(timeout=3.0)
+    elapsed = time.monotonic() - start
+
+    assert not t.is_alive()
+    assert result["value"] == (False, BUSY)
+    assert elapsed < 1.5, "the busy reply must end the wait, not the timeout"
+
+
+def _busy_host(tmp_path, monkeypatch, readback_error):
+    """_readback_host for the 12 Oct case: the machine answers the
+    config-set with its busy reply, and the read-back download fails with
+    ``readback_error`` recorded as the transfer's reason."""
+    root, controller_, modem = _readback_host(tmp_path, monkeypatch, [None])
+    controller_.set_config_value_and_wait.return_value = (False, BUSY)
+
+    def _refused(tmp_filename, md5, progress_cb):
+        modem.last_file_error = readback_error
+
+    controller_.stream.download.side_effect = _refused
+    widgets = [_widget("Machine - Basic", "multi_client.passive_rights", "watch_stop")]
+    root.config_popup = _FakeConfigPopup(
+        widgets, {("Machine - Basic", "multi_client.passive_rights"): "watch_stop_upload"}
+    )
+    root.setting_change_list = {"multi_client.passive_rights": "watch_stop"}
+    return root, controller_, widgets
+
+
+@pytest.mark.parametrize("readback_error", [BUSY, STALL], ids=["busy", "stall"])
+def test_busy_refusal_is_shown_and_busy_readback_offers_to_check_again(tmp_path, monkeypatch, readback_error):
+    """The read-back fails with the machine's busy reply when a transfer
+    that sees it ends at once, or with a stall reason when it waits for
+    the stall timer instead; either way it is the same offer."""
+    root, controller_, widgets = _busy_host(tmp_path, monkeypatch, readback_error)
+
+    root.apply_machine_setting_changes()
+
+    shown = _everything_shown(root, controller_)
+    assert not any("Download config file error" in text for text in shown), shown
+    assert not any("no reply" in text for text in shown), shown
+    assert not any("Settings applied" in text for text in shown), shown
+    root.show_message_popup.assert_not_called()
+    root.confirm_popup.open.assert_called_once()
+    assert root.confirm_popup.lb_title.text == "Settings not confirmed"
+    assert root.confirm_popup.confirm_text == "Check again"
+    text = root.confirm_popup.lb_content.text
+    assert "multi_client.passive_rights: " + BUSY in text
+    assert readback_error in text
+    assert widgets[0].value == "watch_stop_upload"
+
+
+def test_busy_refusal_then_check_again_that_reads_the_file_shows_the_refusal(tmp_path, monkeypatch):
+    root, controller_, _widgets = _busy_host(tmp_path, monkeypatch, BUSY)
+
+    root.apply_machine_setting_changes()
+    controller_.stream.download.side_effect = lambda tmp_filename, md5, progress_cb: _config_file(tmp_filename)
+    root.confirm_popup.confirm()  # Check again, once the other transfer has ended
+
+    root.confirm_popup.open.assert_called_once()
+    root.message_popup.open.assert_called_once()
+    assert BUSY in root.message_popup.lb_content.text
+    assert "Settings applied" not in root.message_popup.lb_content.text
+    root.load_machine_config.assert_called_once()
+
+
+class _PanelConfig:
+    """The settings panel's config: only set() is used."""
+
+    def __init__(self, values):
+        self.values = dict(values)
+
+    def set(self, section, key, value):
+        self.values[(section, key)] = value
+
+
+def test_refused_setting_shows_the_machines_value_after_the_settings_page_apply(tmp_path, monkeypatch):
+    """Through the settings page's own Apply (ConfigPopup._apply_changes),
+    which takes a new snapshot of the page as soon as Apply returns, before
+    the machine has answered. A refused setting must still go back to the
+    value the machine has, in the widget, in the page's config and in the
+    snapshot, so the page neither shows the refused value as applied nor
+    loses track of it on reopening."""
+    from carveracontroller.main import ConfigPopup
+
+    root, controller_, _widgets = _busy_host(tmp_path, monkeypatch, BUSY)
+    scheduled = []
+    monkeypatch.setattr("carveracontroller.main.Clock.schedule_once", lambda cb, t=0: scheduled.append(cb))
+    monkeypatch.setattr("carveracontroller.main.App.get_running_app", lambda: SimpleNamespace(root=root, state="Idle"))
+    monkeypatch.setattr("carveracontroller.main.Config.write", lambda *a, **k: None)
+    controller_.can_write_machine_settings = True
+    root.controller_setting_change_list = {}
+
+    key = ("Machine - Basic", "multi_client.passive_rights")
+    panel = SimpleNamespace(config=_PanelConfig({key: "watch_stop_upload"}))
+    widget = SimpleNamespace(section=key[0], key=key[1], value="watch_stop", panel=panel)
+    popup = _FakeConfigPopup([widget], {key: "watch_stop_upload"})
+    root.config_popup = popup
+
+    ConfigPopup._apply_changes(popup)
+    # Apply has returned and the page has taken its new snapshot; the
+    # machine's answer is handled after that.
+    assert popup._widget_snapshot[key] == "watch_stop"
+    while scheduled:
+        scheduled.pop(0)(0)
+
+    assert widget.value == "watch_stop_upload"
+    assert panel.config.values[key] == "watch_stop_upload"
+    assert popup.get_original(*key) == "watch_stop_upload"
+    assert root.setting_change_list == {}
+    root.confirm_popup.open.assert_called_once()

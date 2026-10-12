@@ -1027,10 +1027,14 @@ class Controller:
         Returns (success, message). success is True only for the
         firmware's own "<key> has been set to <value>" line (Configurator::
         config_set_command); False for any error: line -- including the
-        control refusal "error:Refused -- <holder> has control" -- any
-        other config-set outcome line (not enough space, bad source), or a
-        timeout with no reply at all. See _check_config_reply, which
-        resolves this from parseLine on the reading thread.
+        control refusal "error:Refused -- <holder> has control" and the
+        machine's busy reply while it runs another controller's file
+        transfer (machine/peer_transfer.py), which it sends in place of any
+        reply to the discarded config-set -- any other config-set outcome
+        line (not enough space, bad source), or a timeout with no reply at
+        all. See _check_config_reply, which resolves this from parseLine
+        (and _on_peer_transfer_frame, for the busy reply) on the reading
+        thread.
         """
         if not key or not value:
             return False, "missing key or value"
@@ -3002,9 +3006,11 @@ class Controller:
 
         The machine's busy reply (machine/peer_transfer.py) starts or
         continues that transfer and is handled here: returns True, and
-        nothing else sees it. Only the first news of a transfer, and one
-        that answers a command of this controller's, reach the console; the
-        rest answer _advance_heartbeat's probes. A listing or other load
+        nothing else sees it, except a config-set still waiting for its
+        reply, which it ends as refused (_check_config_reply). Only the
+        first news of a transfer, and one that answers a command of this
+        controller's, reach the console; the rest answer
+        _advance_heartbeat's probes. A listing or other load
         command still waiting for its reply was turned away, so it goes
         again when the transfer ends, and the reply is not taken for
         listing data. Any other frame ends the transfer and is handled as
@@ -3034,6 +3040,9 @@ class Controller:
         if message.kind == MessageKind.LINE and is_transfer_busy_reply(message.text):
             if self._peer_transfer.on_busy_reply():
                 self.log.put((self.MSG_ERROR, message.text.strip()))
+            # A config-set waiting for its reply was discarded with
+            # everything else, and this is the only answer it will get.
+            self._check_config_reply(message.text)
             if self.loadNUM != 0 and self._load_command and not (self.loadEOF or self.loadERR):
                 self._resend_load_command = True
             return True
