@@ -10,6 +10,7 @@ import os
 import queue
 import stat
 import struct
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -110,3 +111,41 @@ def test_decompressed_file_keeps_the_original_file_permissions(monkeypatch, tmp_
 
     assert path.read_text(encoding="utf-8") == GCODE
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o664
+
+
+def _leftover(tmp_path, name, age_s):
+    """A hidden partial file as _replace_file names them, last written
+    `age_s` seconds ago."""
+    path = tmp_path / name
+    path.write_bytes(b"")
+    stamp = time.time() - age_s
+    os.utime(path, (stamp, stamp))
+    return path
+
+
+def test_opening_a_file_removes_what_a_crashed_open_of_it_left_behind(monkeypatch, tmp_path):
+    """A crash while decompressing left the hidden partial file beside the
+    user's file. Opening that file again removes it; a partial file another
+    open may still be writing (written to recently), and anything not named
+    like one of this file's partial files, is left alone."""
+    stale = _leftover(tmp_path, ".job.nc.21d93b83.tmp", age_s=600)
+    live = _leftover(tmp_path, ".job.nc.0a1b2c3d.tmp", age_s=1)
+    other_file = _leftover(tmp_path, ".other.nc.21d93b83.tmp", age_s=600)
+    not_ours = _leftover(tmp_path, ".job.nc.backup.tmp", age_s=600)
+
+    _root, path = _open(monkeypatch, tmp_path, _compress(GCODE))
+
+    assert path.read_text(encoding="utf-8") == GCODE
+    assert not stale.exists()
+    assert live.exists() and other_file.exists() and not_ours.exists()
+
+
+def test_a_failed_open_also_removes_what_a_crashed_open_left_behind(monkeypatch, tmp_path):
+    stale = _leftover(tmp_path, ".job.nc.21d93b83.tmp", age_s=600)
+    original = _compress(GCODE, checksum_offset=1)
+
+    _root, path = _open(monkeypatch, tmp_path, original)
+
+    assert path.read_bytes() == original
+    assert _folder(tmp_path) == [".lz", "job.nc"]
+    assert not stale.exists()
