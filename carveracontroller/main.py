@@ -377,6 +377,7 @@ from .machine.computer_part import computer_part_for_this_process, new_launch_pa
 from .machine.identity import load_identity, set_name, with_id
 from .machine.job_start import JobStartAction, JobStartTracker, may_cancel_held_start
 from .machine.local_copies import LocalCopyStore
+from .machine.lz_block import DamagedBlock, check_block
 from .machine.passive_fetch import PassiveFetchTracker, player_flag, published_upload_path
 from .protocols.handshake import (
     JOB_START_CANCELLED,
@@ -7847,9 +7848,14 @@ class Makera(RelativeLayout):
                     if not block:
                         break
                     blocksize = struct.unpack(">I", block)[0]
+                    if read_size + BLOCK_HEADER_SIZE + blocksize > file_size - 2:
+                        raise DamagedBlock("block of %d bytes runs past the end of the file" % blocksize)
                     read_size += BLOCK_HEADER_SIZE + blocksize
                     # 读取块数据
                     block = f_in.read(blocksize)
+                    # The native decompressor trusts the block, so a damaged
+                    # one could crash the app: check it first.
+                    check_block(block, BLOCK_SIZE)
                     # 解压缩数据
                     decompressed_block = quicklz.decompress(block)
                     # 计算sum和
