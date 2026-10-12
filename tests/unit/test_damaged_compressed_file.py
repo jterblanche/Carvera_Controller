@@ -224,6 +224,91 @@ def test_the_check_says_what_is_wrong(block, reason):
         check_block(block, 4096)
 
 
+def _reference_walk(block):
+    """The walk of check_block as a line-by-line copy of
+    qlz_decompress_core (QuickLZ 1.4.1, level 3, with QLZ_MEMORY_SAFE), one
+    literal step at a time, for a compressed block with a 9-byte header.
+    True if the block passes."""
+    bitlut = (4, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0)
+    src = 9
+    size = int.from_bytes(block[5:9], "little")
+    last_source_byte = len(block) - 1
+    last_destination_byte = size - 1
+    last_matchstart = last_destination_byte - 6 - 4
+    dst = 0
+    cword_val = 1
+    while True:
+        if cword_val == 1:
+            if src + 4 - 1 > last_source_byte:
+                return False
+            cword_val = int.from_bytes(block[src : src + 4], "little")
+            src += 4
+        if src + 4 - 1 > last_source_byte:
+            return False
+        fetch = int.from_bytes(block[src : src + 4], "little")
+        if cword_val & 1:
+            cword_val >>= 1
+            if fetch & 3 == 0:
+                offset, matchlen, src = (fetch & 0xFF) >> 2, 3, src + 1
+            elif fetch & 2 == 0:
+                offset, matchlen, src = (fetch & 0xFFFF) >> 2, 3, src + 2
+            elif fetch & 1 == 0:
+                offset, matchlen, src = (fetch & 0xFFFF) >> 6, ((fetch >> 2) & 15) + 3, src + 2
+            elif fetch & 127 != 3:
+                offset, matchlen, src = (fetch >> 7) & 0x1FFFF, ((fetch >> 2) & 0x1F) + 2, src + 3
+            else:
+                offset, matchlen, src = fetch >> 15, ((fetch >> 7) & 255) + 3, src + 4
+            if dst - offset < 0 or dst - offset > dst - 2 - 1:
+                return False
+            if matchlen > last_destination_byte - dst - 4 + 1:
+                return False
+            dst += matchlen
+        elif dst < last_matchstart:
+            step = bitlut[cword_val & 0xF]
+            dst += step
+            src += step
+            cword_val >>= step
+        else:
+            while dst <= last_destination_byte:
+                if cword_val == 1:
+                    src += 4
+                    cword_val = 1 << 31
+                if src >= last_source_byte + 1:
+                    return False
+                dst += 1
+                src += 1
+                cword_val >>= 1
+            return True
+
+
+def _passes(block):
+    try:
+        check_block(block, 4096)
+    except DamagedBlock:
+        return False
+    return True
+
+
+def test_the_check_agrees_with_quicklz_own_checks():
+    """check_block takes a run of literal bytes in one step where QuickLZ
+    takes up to 4 at a time; on blocks damaged at random they must still
+    pass and fail alike."""
+    rng = random.Random(2026)
+    gcode = "".join("G1 X%.3f Y%.3f F1000\n" % (rng.random() * 100, rng.random() * 100) for _ in range(3000)).encode()
+    outcomes = set()
+    for _ in range(3000):
+        start = rng.randrange(len(gcode) - 4096)
+        block = bytearray(quicklz.compress(gcode[start : start + rng.randrange(300, 4097)]))
+        for _ in range(rng.randrange(1, 6)):
+            block[rng.randrange(9, len(block))] = rng.randrange(256)
+        if rng.random() < 0.1:
+            block[9:13] = bytes(4)  # a control word of 0: all literals
+        expected = _reference_walk(bytes(block))
+        assert _passes(bytes(block)) is expected, bytes(block).hex()
+        outcomes.add(expected)
+    assert outcomes == {True, False}
+
+
 def test_damaged_blocks_that_pass_the_check_decompress_without_crashing(tmp_path):
     """The check is sound: blocks made by damaging real ones at random, and
     that it lets through, are all given to the native decompressor in one

@@ -22,7 +22,6 @@ _MINOFFSET = 2
 _UNCONDITIONAL_MATCHLEN = 6
 _UNCOMPRESSED_END = 4
 _CWORD_LEN = 4
-_BITLUT = (4, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0)
 
 # The first byte of a block is 01SSLLHC: S streaming buffer (0 here), L the
 # compression level (3), H a 9-byte rather than 3-byte header, C compressed.
@@ -119,8 +118,16 @@ def _walk(block: bytes, src: int, size: int) -> None:
                 raise DamagedBlock("match of %d bytes at %d runs past the end of %d" % (matchlen, dst, size))
             dst += matchlen
         elif dst < last_matchstart:
-            # Copies 4 bytes and keeps the literal ones among them.
-            step = _BITLUT[cword_val & 0xF]
+            # The native code takes a run of literal bytes at most 4 at a
+            # time (its bitlut table), copying 4 bytes each time and reading
+            # 4 at each step's start, while dst is before last_matchstart.
+            # Taken here in one go: the whole run, or the part of it before
+            # last_matchstart. A control word of 0 is all literals.
+            run = (cword_val & -cword_val).bit_length() - 1 if cword_val else size
+            steps = min((run + 3) // 4, (last_matchstart - dst + 3) // 4)
+            step = run if steps == (run + 3) // 4 else 4 * steps
+            if src + 4 * (steps - 1) + 3 > last_source_byte:
+                raise DamagedBlock("data runs past the end of the block")
             dst += step
             src += step
             cword_val >>= step
