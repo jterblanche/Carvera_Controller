@@ -378,6 +378,7 @@ from .machine.identity import load_identity, set_name, with_id
 from .machine.job_start import JobStartAction, JobStartTracker, may_cancel_held_start
 from .machine.local_copies import LocalCopyStore
 from .machine.passive_fetch import PassiveFetchTracker, player_flag, published_upload_path
+from .machine.peer_transfer import is_transfer_busy_reply
 from .protocols.handshake import (
     JOB_START_CANCELLED,
     JOB_START_HASHING,
@@ -6021,7 +6022,11 @@ class Makera(RelativeLayout):
         try:
             if download_result is None:
                 _discard_file(tmp_filename)
-                if last_file_error:
+                # The machine's busy reply is on the console already: the
+                # controller shows it on learning the machine is busy with
+                # another controller's transfer.
+                busy = is_transfer_busy_reply(last_file_error or "")
+                if last_file_error and not busy:
                     self.controller.log.put((Controller.MSG_ERROR, last_file_error))
                 # show message popup
                 md5_failed = bool(
@@ -6054,7 +6059,18 @@ class Makera(RelativeLayout):
                         if md5_failed
                         else tr._("Download file error!")
                     )
-                    Clock.schedule_once(partial(self.show_message_popup, error_msg, False), 0)
+                    if automatic:
+                        # Nobody asked for this download (a passive fetch),
+                        # and its caller tries again later: the console
+                        # says it failed, a popup would only interrupt.
+                        self.controller.log.put((Controller.MSG_ERROR, error_msg + " " + remote_path))
+                    else:
+                        # Refused because another controller's transfer is
+                        # running: the machine's own words say so, and to
+                        # try again when it ends.
+                        if busy:
+                            error_msg = last_file_error
+                        Clock.schedule_once(partial(self.show_message_popup, error_msg, False), 0)
             elif download_result >= 0:
                 if download_result > 0:
                     # download success
@@ -6125,6 +6141,8 @@ class Makera(RelativeLayout):
                         readback.reason = str(exc)
                     error_msg = tr._("Download config file error!") + "\n" + str(exc)
                     Clock.schedule_once(partial(self.finishLoadConfig, False, error=error_msg), 0.1)
+            elif automatic:
+                self.controller.log.put((Controller.MSG_ERROR, tr._("Download file error!") + " " + remote_path))
             else:
                 error_msg = tr._("Download file error!") + "\n" + str(exc)
                 Clock.schedule_once(partial(self.show_message_popup, error_msg, False), 0)
@@ -7474,11 +7492,17 @@ class Makera(RelativeLayout):
         (_run_held_for_passive_fetch); no other fetch can start before it,
         see _check_passive_fetch. Called on the fetch's own thread when the
         download fails, and on the main thread once a downloaded file has
-        been drawn, hence the lock shared with _hold_for_passive_fetch."""
+        been drawn, hence the lock shared with _hold_for_passive_fetch.
+
+        While another controller's file transfer keeps the machine busy
+        (the fetch was turned away with the machine's busy reply, say),
+        the held actions stay held, and the waiting message stays up,
+        until that transfer ends (on_peer_transfer_finished): run now,
+        they would only be held again for it."""
         with self._held_for_passive_fetch_lock:
             self._auto_fetch_in_progress = False
             held = bool(self._held_for_passive_fetch)
-        if held:
+        if held and not getattr(self.controller, "peer_transfer_active", False):
             Clock.schedule_once(self._run_held_for_passive_fetch)
 
     def on_peer_transfer_finished(self):
@@ -8254,9 +8278,13 @@ class Makera(RelativeLayout):
         elif not upload_result:
             if firmware:
                 self._log_firmware("SD transfer failed", error=True)
-            if last_file_error:
+            # The machine's busy reply is on the console already (see
+            # doDownload) and is shown in place of the generic error.
+            busy = is_transfer_busy_reply(last_file_error or "")
+            if last_file_error and not busy:
                 self.controller.log.put((Controller.MSG_ERROR, last_file_error))
-            Clock.schedule_once(partial(self.show_message_popup, tr._("Upload file error!"), False), 0)
+            error_msg = last_file_error if busy else tr._("Upload file error!")
+            Clock.schedule_once(partial(self.show_message_popup, error_msg, False), 0)
         else:
             # copy file to application directory if needed
             remote_path = os.path.join(
