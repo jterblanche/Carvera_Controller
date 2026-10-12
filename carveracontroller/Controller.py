@@ -349,6 +349,11 @@ class Controller:
         self.thread = None
 
         self.posUpdate = False  # Update position
+        # Status reports parsed on this link so far, counted after each
+        # one's values are in CNC.vars: tells a later reader whether it is
+        # looking at a new report or one it has already seen
+        # (machine/passive_fetch.py's due_fetch).
+        self.status_reports = 0
         self.diagnoseUpdate = False
         self._probeUpdate = False  # Update probe
         self._gUpdate = False  # Update $G
@@ -2032,6 +2037,7 @@ class Controller:
         if "H" in d:
             CNC.vars["halt_reason"] = int(d["H"][0])
 
+        self.status_reports += 1
         self.posUpdate = True
 
     def parseBigParentheses(self, line):

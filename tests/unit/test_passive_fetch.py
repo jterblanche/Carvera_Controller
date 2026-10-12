@@ -211,6 +211,55 @@ def test_a_publish_restarts_the_settle_count():
     assert t.pending_path == "/sd/job.nc"
 
 
+def test_one_report_looked_at_twice_counts_once():
+    """The screen refreshes more often than status reports arrive. Seeing
+    the same report again adds nothing to the count."""
+    t = PassiveFetchTracker()
+    t.note_published_file("/sd/job.nc")
+    for _ in range(passive_fetch.SETTLE_SAMPLES + 2):
+        assert t.due_fetch(is_idle=True, playing=False, report=1) is None
+    for report in range(2, passive_fetch.SETTLE_SAMPLES):
+        assert t.due_fetch(is_idle=True, playing=False, report=report) is None
+    assert t.due_fetch(is_idle=True, playing=False, report=passive_fetch.SETTLE_SAMPLES) == "/sd/job.nc"
+
+
+def test_the_report_from_before_a_play_started_event_never_releases_the_fetch():
+    """A job started while the machine was Idle with the player stopped.
+    Every look at the last report from before the event, however many,
+    leaves the fetch waiting; the first report after it shows the player
+    playing, and the fetch waits for the job to end."""
+    t = PassiveFetchTracker()
+    assert t.due_fetch(is_idle=True, playing=False, report=40) is None
+    t.note_published_file("/sd/job.nc")
+    for _ in range(5):
+        assert t.due_fetch(is_idle=True, playing=False, report=40) is None
+    for report in range(41, 50):
+        assert t.due_fetch(is_idle=True, playing=True, report=report) is None
+    assert t.due_fetch(is_idle=True, playing=False, report=50) is None
+    assert t.due_fetch(is_idle=True, playing=False, report=51) == "/sd/job.nc"
+
+
+def test_a_report_counted_before_the_event_does_not_count_again_after_it():
+    t = PassiveFetchTracker()
+    t.due_fetch(is_idle=True, playing=False, report=7)
+    t.note_published_file("/sd/job.nc")
+    assert t.due_fetch(is_idle=True, playing=False, report=7) is None
+    assert t.due_fetch(is_idle=True, playing=False, report=8) is None
+    assert t.due_fetch(is_idle=True, playing=False, report=9) == "/sd/job.nc"
+
+
+def test_a_settled_fetch_waiting_out_its_backoff_is_released_on_the_same_report():
+    """Once the machine is settled, the backoff alone decides: a look at
+    the report already counted releases the retry when the backoff ends."""
+    t = PassiveFetchTracker()
+    t.note_published_file("/sd/job.nc")
+    t.due_fetch(is_idle=True, playing=False, report=1, now=0.0)
+    assert t.due_fetch(is_idle=True, playing=False, report=2, now=0.0) == "/sd/job.nc"
+    t.note_fetch_failed("/sd/job.nc", now=0.0)
+    assert t.due_fetch(is_idle=True, playing=False, report=2, now=1.0) is None
+    assert t.due_fetch(is_idle=True, playing=False, report=2, now=RETRY_BACKOFF_S) == "/sd/job.nc"
+
+
 def test_not_playing_but_not_idle_still_waits():
     """Jogging or an alarm with no job playing: the state word still has to
     say Idle, as without the flag."""

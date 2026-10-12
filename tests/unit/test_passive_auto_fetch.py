@@ -27,6 +27,7 @@ from unittest.mock import MagicMock
 
 from carveracontroller import Utils
 from carveracontroller.CNC import CNC
+from carveracontroller.Controller import Controller
 from carveracontroller.machine.job_start import JobStartTracker
 from carveracontroller.machine.local_copies import LocalCopyStore
 from carveracontroller.machine.passive_fetch import (
@@ -305,6 +306,56 @@ def test_an_idle_report_mid_job_does_not_start_a_fetch(monkeypatch, tmp_path):
         Makera._check_passive_fetch(root, is_idle=True)
 
     assert started == [("/sd/job.nc",)]
+
+
+# Two status reports as the machine sent them on 12 Oct: the last one
+# before a held start ended with Start now, and the first one after the
+# play-started event. The state word is Idle in both.
+_REPORT_BEFORE_PLAY = (
+    "<Idle|MPos:-2.0000,-2.0000,-2.0000,0.4995,0.0000|WPos:285.4047,203.0147,21.0062,0.4995,0.0000|R:-0.5940|G:0"
+    "|F:0.0,4000.0,100.0|S:0.0,10000.0,100.0,0,18.3,22.2,0,0,0|T:3,33.300,-1,0|W:0.00|L:0, 0, 0, 0.0,100.0"
+    "|P:0,0,121,0,0|C:2,1,0,1>"
+)
+_REPORT_AFTER_PLAY = _REPORT_BEFORE_PLAY.replace("P:0,0,121,0,0", "P:0,0,0,1,4")
+
+
+def test_each_status_report_is_counted_once_parsed():
+    controller = Controller(CNC(), lambda _line: None, False)
+    before = controller.status_reports
+
+    controller.parseBracketAngle(_REPORT_BEFORE_PLAY)
+    assert controller.status_reports == before + 1
+    assert CNC.vars["is_playing"] == 0
+
+    controller.parseBracketAngle(_REPORT_AFTER_PLAY)
+    assert controller.status_reports == before + 2
+    assert CNC.vars["is_playing"] == 1
+
+
+def test_looking_again_at_the_report_from_before_play_started_does_not_fetch(monkeypatch, tmp_path):
+    """The screen refreshes more often than reports arrive. Right after a
+    play-started event it can look at the last report from before the job
+    two or more times: that is still one report, and no fetch starts on
+    it. The next report shows the player playing."""
+    root = _passive_host(tmp_path)
+    root.controller.status_reports = 40
+    started = []
+    monkeypatch.setattr(
+        "carveracontroller.main.threading.Thread",
+        lambda target=None, args=(), **kwargs: started.append(args) or MagicMock(),
+    )
+    _status_with_player_flag(monkeypatch, 0)
+    root._passive_fetch.note_published_file("/sd/job.nc")
+
+    for _ in range(5):
+        Makera._check_passive_fetch(root, is_idle=True)
+    assert started == []
+
+    root.controller.status_reports += 1
+    monkeypatch.setitem(CNC.vars, "is_playing", 1)
+    Makera._check_passive_fetch(root, is_idle=True)
+    assert started == []
+    assert root._passive_fetch.pending_path == "/sd/job.nc"
 
 
 def test_on_passive_file_published_blanks_a_stale_selection(monkeypatch, tmp_path):
