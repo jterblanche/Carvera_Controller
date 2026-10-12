@@ -58,6 +58,9 @@ HANG_LIMIT_S = 5.0
 TEST_STALL_TIMEOUT_S = 0.5
 
 AUTOMATIC_REFUSAL = b"error:Refused -- not allowed as an automatic command\r\n"
+# The machine's answer to anything from this controller while it runs
+# another controller's transfer (machine/peer_transfer.py).
+BUSY_REPLY = b"error:Busy -- a file transfer is in progress, retry when it finishes\r\n"
 
 
 def _control_changed(holder_id, holder_name):
@@ -365,6 +368,59 @@ def test_refused_download_ends_at_once_and_says_why(machines, controller, tmp_pa
     assert controller.stream.modem.last_file_error == AUTOMATIC_REFUSAL.decode().strip()
 
 
+@pytest.mark.parametrize("automatic", [False, True], ids=["manual", "automatic"])
+def test_download_turned_away_as_busy_ends_at_once(machines, controller, tmp_path, automatic):
+    """Two passive controllers fetch the same new file at the same moment:
+    the machine serves one and answers the other with its busy reply. That
+    download must end at once, without FILE_CAN (the machine would discard
+    it and answer with the busy reply again), with the reply as the reason,
+    and the controller must know the machine is busy, as it would had the
+    reply come outside a transfer: the reply on the console, once."""
+    peer = SilentDownloadPeer(reply=BUSY_REPLY)
+    m = _connect(machines, controller, peer)
+    _drain_log(controller)
+
+    finished, result, elapsed, worker = _run_bounded(lambda: _download(controller, tmp_path, automatic=automatic))
+    if not finished:
+        controller.stream.cancel_process()
+        worker.join(10)
+        pytest.fail(f"download turned away as busy still waiting after {HANG_LIMIT_S}s")
+
+    assert result is None
+    assert elapsed < 1.5
+    assert controller.stream.modem.last_file_error == BUSY_REPLY.decode().strip()
+    assert controller.peer_transfer_active
+    busy_lines = [text for _kind, text in _drain_log(controller) if text == BUSY_REPLY.decode().strip()]
+    assert len(busy_lines) == 1
+    time.sleep(0.3)
+    assert m.frames_of_type(PTYPE_FILE_CAN) == []
+
+
+def test_upload_turned_away_as_busy_ends_at_once(machines, controller, tmp_path):
+    def busy_upload(conn, ptype, payload):
+        """Answers the upload command with the busy reply, and discards
+        everything of the transfer's."""
+        if ptype == PTYPE_FILE_START and payload.startswith(b"upload"):
+            conn.sendall(build_frame(PTYPE_NORMAL_INFO, BUSY_REPLY))
+            return True
+        return PTYPE_FILE_START <= ptype <= PTYPE_FILE_CAN
+
+    m = _connect(machines, controller, busy_upload)
+
+    finished, result, elapsed, worker = _run_bounded(lambda: _upload(controller, tmp_path))
+    if not finished:
+        controller.stream.cancel_process()
+        worker.join(10)
+        pytest.fail(f"upload turned away as busy still waiting after {HANG_LIMIT_S}s")
+
+    assert result is None
+    assert elapsed < 1.5
+    assert controller.stream.modem.last_file_error == BUSY_REPLY.decode().strip()
+    assert controller.peer_transfer_active
+    time.sleep(0.3)
+    assert m.frames_of_type(PTYPE_FILE_CAN) == []
+
+
 # -- the passive fetch in main.py ----------------------------------------------
 
 
@@ -384,12 +440,13 @@ def _passive_host(tmp_path, controller):
     return root
 
 
-@pytest.mark.parametrize("reply", [None, AUTOMATIC_REFUSAL], ids=["stalled", "refused"])
+@pytest.mark.parametrize("reply", [None, AUTOMATIC_REFUSAL, BUSY_REPLY], ids=["stalled", "refused", "busy"])
 def test_passive_fetch_that_fails_to_start_is_not_left_in_progress(machines, controller, tmp_path, monkeypatch, reply):
     """The passive fetch runs doDownload on a worker thread and is marked
     in progress until it returns. A download that never ended would leave
     it marked forever, so no later fetch could start. It must end, say why
-    on the console, and leave the file queued for a later attempt."""
+    on the console, and leave the file queued for a later attempt. Nobody
+    asked for it, so no popup: the console says which download failed."""
     monkeypatch.setattr("carveracontroller.XMODEM.TRANSFER_STALL_TIMEOUT_S", TEST_STALL_TIMEOUT_S, raising=False)
     monkeypatch.setattr("carveracontroller.main.App.get_running_app", lambda: None)
     scheduled = []
@@ -411,6 +468,42 @@ def test_passive_fetch_that_fails_to_start_is_not_left_in_progress(machines, con
     assert root._passive_fetch.pending_path == "/sd/gcodes/job.nc"  # retried later
     assert controller.paused is False
     errors = [text for kind, text in _drain_log(controller) if kind == Controller.MSG_ERROR]
-    expected = AUTOMATIC_REFUSAL.decode().strip() if reply else "has not answered the file transfer"
-    assert any(expected in text for text in errors)
-    assert any(getattr(cb, "func", None) is root.show_message_popup for cb in scheduled)
+    expected = reply.decode().strip() if reply else "has not answered the file transfer"
+    assert len([text for text in errors if expected in text]) == 1
+    assert "Download file error! /sd/gcodes/job.nc" in errors
+    assert not any(getattr(cb, "func", None) is root.show_message_popup for cb in scheduled)
+
+
+@pytest.mark.parametrize(
+    ("reply", "popup"),
+    [(BUSY_REPLY, BUSY_REPLY.decode().strip()), (AUTOMATIC_REFUSAL, "Download file error!")],
+    ids=["busy", "refused"],
+)
+def test_manual_download_turned_away_shows_the_reason_when_busy(
+    machines, controller, tmp_path, monkeypatch, reply, popup
+):
+    """A download the operator asked for still ends in a popup. Turned
+    away because another controller's transfer is running, the popup gives
+    the machine's busy reply, which says to try again when it finishes;
+    any other failure keeps the generic message."""
+    monkeypatch.setattr("carveracontroller.main.App.get_running_app", lambda: None)
+    scheduled = []
+    monkeypatch.setattr("carveracontroller.main.Clock.schedule_once", lambda cb, *a, **kw: scheduled.append(cb))
+    peer = SilentDownloadPeer(reply=reply)
+    _connect(machines, controller, peer)
+    root = _passive_host(tmp_path, controller)
+
+    finished, result, _elapsed, worker = _run_bounded(
+        lambda: Makera.doDownload(
+            root, "/sd/gcodes/job.nc", str(tmp_path / "job.nc"), show_progress=False, open_after=False
+        )
+    )
+    if not finished:
+        controller.stream.cancel_process()
+        worker.join(10)
+        pytest.fail(f"manual download still waiting after {HANG_LIMIT_S}s")
+
+    assert result is None
+    popups = [cb for cb in scheduled if getattr(cb, "func", None) is root.show_message_popup]
+    assert len(popups) == 1
+    assert popups[0].args[0] == popup

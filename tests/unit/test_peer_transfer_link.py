@@ -471,6 +471,41 @@ def test_held_actions_dropped_when_the_link_closes_during_the_transfer(run_clock
     assert root._held_for_passive_fetch == ()
 
 
+def test_held_actions_wait_out_the_transfer_that_turned_our_fetch_away(run_clock_now):
+    """Our passive fetch was turned away with the busy reply while the
+    operator waited for it. Its end does not run the waiting actions, only
+    for them to be held again: they stay held, and the waiting message
+    stays up, until the other controller's transfer ends."""
+    root = _held_actions_host(peer_transfer_active=False)
+    root._auto_fetch_in_progress = True
+    action = MagicMock()
+    assert root._hold_for_passive_fetch(action) is True
+    root.progressStart.assert_called_once()
+
+    root.controller.peer_transfer_active = True  # the busy reply, handed on
+    root._passive_fetch_finished()
+    assert root._auto_fetch_in_progress is False
+    action.assert_not_called()
+    root.progressFinish.assert_not_called()
+
+    root.controller.peer_transfer_active = False
+    root.on_peer_transfer_finished()
+    action.assert_called_once_with()
+    root.progressFinish.assert_called_once()
+    root.progressStart.assert_called_once()
+
+
+def test_held_actions_run_when_our_fetch_ends_without_a_transfer(run_clock_now):
+    root = _held_actions_host(peer_transfer_active=False)
+    root._auto_fetch_in_progress = True
+    action = MagicMock()
+    root._hold_for_passive_fetch(action)
+
+    root._passive_fetch_finished()
+    action.assert_called_once_with()
+    root.progressFinish.assert_called_once()
+
+
 def test_no_fetch_of_ours_starts_during_the_transfer():
     root = _held_actions_host(peer_transfer_active=True)
     assert root._link_busy_for_passive_fetch() is True
