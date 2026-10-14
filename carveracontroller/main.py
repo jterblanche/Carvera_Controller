@@ -64,6 +64,12 @@ MACHINE_METADATA_QUERY_MAX_ATTEMPTS = 3
 DECOMPRESS_TIMEOUT_FLOOR_SEC = 15
 DECOMPRESS_TIMEOUT_PER_BLOCK_SEC = 1.0
 
+# A hidden partial file of an open (_replace_file) not written to for this
+# long was left by an open that never finished, and the next open of the
+# same file removes it. An open still running writes to it at least every
+# few seconds.
+STALE_PARTIAL_FILE_S = 60
+
 
 def is_android():
     return "ANDROID_ARGUMENT" in os.environ or "ANDROID_PRIVATE" in os.environ or "ANDROID_APP_PATH" in os.environ
@@ -377,6 +383,7 @@ from .machine.computer_part import computer_part_for_this_process, new_launch_pa
 from .machine.identity import load_identity, set_name, with_id
 from .machine.job_start import JobStartAction, JobStartTracker, may_cancel_held_start
 from .machine.local_copies import LocalCopyStore
+from .machine.lz_block import DamagedBlock, check_block
 from .machine.passive_fetch import PassiveFetchTracker, player_flag, published_upload_path
 from .machine.peer_transfer import is_transfer_busy_reply
 from .protocols.handshake import (
@@ -7879,9 +7886,14 @@ class Makera(RelativeLayout):
                     if not block:
                         break
                     blocksize = struct.unpack(">I", block)[0]
+                    if read_size + BLOCK_HEADER_SIZE + blocksize > file_size - 2:
+                        raise DamagedBlock("block of %d bytes runs past the end of the file" % blocksize)
                     read_size += BLOCK_HEADER_SIZE + blocksize
                     # 读取块数据
                     block = f_in.read(blocksize)
+                    # The native decompressor trusts the block, so a damaged
+                    # one could crash the app: check it first.
+                    check_block(block, BLOCK_SIZE)
                     # 解压缩数据
                     decompressed_block = quicklz.decompress(block)
                     # 计算sum和
@@ -10844,7 +10856,7 @@ class Makera(RelativeLayout):
         self.gcode_cannot_visualise = True
 
     # ------------------------------------------------------------------------
-    def _end_failed_load(self, *args, message=None):
+    def _end_failed_load(self, *args, message=None, failed_path=None):
         """Clear loading_file on the main thread for a load_gcode_file that
         stopped without reaching load_end. load_start, which sets it, runs
         through the same Clock and was scheduled first, so a failure that
@@ -10855,12 +10867,33 @@ class Makera(RelativeLayout):
 
         Closes the progress popup the open path showed (it cannot be closed
         by hand: Cancel is disabled until the first batch is drawn) and, if
-        `message` is given, tells the user why the file did not open."""
+        `message` is given, tells the user why the file did not open.
+
+        `failed_path` is given when the file could not be read at all: a
+        local file being previewed is then no longer the current file
+        (_unselect_failed_preview)."""
         self.loading_file = False
         self._last_loaded_file_key = None
         self.progress_popup.dismiss()
+        if failed_path:
+            self._unselect_failed_preview(failed_path)
         if message:
             self.show_message_popup(message, False)
+
+    # ------------------------------------------------------------------------
+    def _unselect_failed_preview(self, path):
+        """The local file at `path` was opened for preview (no machine file
+        selected) and could not be read, so nothing of it is on screen: it
+        stops being the current file, and the file browser stops naming it.
+        A machine file stays selected (it is still on the machine), and so
+        does a file selected since this one was opened."""
+        app = App.get_running_app()
+        if app is None or getattr(app, "selected_remote_filename", ""):
+            return
+        if getattr(app, "selected_local_filename", "") != path:
+            return
+        app.selected_local_filename = ""
+        self.apply_bed_settings()
 
     # ------------------------------------------------------------------------
     def load_error(self, error_msg, *args):
@@ -10996,6 +11029,7 @@ class Makera(RelativeLayout):
         raises, only the hidden file is removed. Returns what `fill`
         returned."""
         folder, filename = os.path.split(os.path.abspath(filepath))
+        self._remove_stale_partial_files(folder, filename)
         partial_path = os.path.join(folder, ".%s.%s.tmp" % (filename, secrets.token_hex(4)))
         # O_EXCL: never reuse a file that is already there.
         os.close(os.open(partial_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666))
@@ -11017,6 +11051,31 @@ class Makera(RelativeLayout):
                     logger.warning("Could not remove partial file %s", partial_path)
 
     # -----------------------------------------------------------------------
+    def _remove_stale_partial_files(self, folder, filename):
+        """Remove the hidden partial files of `filename` that _replace_file
+        left behind when the app stopped part way (a crash, a kill, a power
+        cut), so they do not pile up beside the user's file. One written to
+        in the last STALE_PARTIAL_FILE_S seconds is left alone: another
+        controller on this computer may be opening the same file now."""
+        pattern = re.compile(r"\.%s\.[0-9a-f]{8}\.tmp\Z" % re.escape(filename))
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            return
+        now = time.time()
+        for name in names:
+            if not pattern.match(name):
+                continue
+            path = os.path.join(folder, name)
+            try:
+                if now - os.path.getmtime(path) < STALE_PARTIAL_FILE_S or not os.path.isfile(path):
+                    continue
+                os.remove(path)
+                logger.info("Removed %s, left by an open that did not finish", path)
+            except OSError:
+                logger.warning("Could not remove partial file %s", path)
+
+    # -----------------------------------------------------------------------
     def _decompress_over(self, lzpath, filepath):
         """Decompress the QuickLZ file `lzpath` and put the result at
         `filepath`, the compressed file being opened, but only once the
@@ -11032,11 +11091,11 @@ class Makera(RelativeLayout):
                     tr._("This file is compressed and could not be decompressed. It may be damaged.")
                     + "\n%s" % filepath
                 )
-                Clock.schedule_once(partial(self._end_failed_load, message=message), 0)
+                Clock.schedule_once(partial(self._end_failed_load, message=message, failed_path=filepath), 0)
                 return False
             if not self._verify_deferred_download_md5(partial_path):
                 # The checksum check has already scheduled its own message.
-                Clock.schedule_once(self._end_failed_load, 0)
+                Clock.schedule_once(partial(self._end_failed_load, failed_path=filepath), 0)
                 return False
             return True
 
@@ -11062,6 +11121,7 @@ class Makera(RelativeLayout):
         self.gcode_viewer.tool_unit_scale = 1.0
         Clock.schedule_once(self.load_start)
         f = None
+        read = False
         try:
             with open(filepath, "rb") as f:
                 # 读取文件开头的两个字节
@@ -11085,6 +11145,7 @@ class Makera(RelativeLayout):
             self.lines = f.readlines()
             self.selected_file_line_count = len(self.lines)
             f.close()
+            read = True
 
             # Detect tools/stock metadata and set document unit if available
             self.document_unit = detect_document_unit(self.lines)
@@ -11158,7 +11219,7 @@ class Makera(RelativeLayout):
         except Exception:
             logger.error(sys.exc_info()[1])
             self.heartbeat_time = time.time()
-            Clock.schedule_once(self._end_failed_load, 0)
+            Clock.schedule_once(partial(self._end_failed_load, failed_path=None if read else filepath), 0)
             if f:
                 f.close()
             Clock.schedule_once(self._mark_gcode_cannot_visualise, 0)

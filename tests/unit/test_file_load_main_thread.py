@@ -20,6 +20,7 @@ import carveracontroller.main as main_module
 from carveracontroller.CNC import CNC
 from carveracontroller.machine.local_copies import LocalCopyStore
 from carveracontroller.main import Makera
+from carveracontroller.ui.file_browser.sources import current_file_banner, is_local_preview
 
 LOAD_TIMEOUT_S = 30
 
@@ -207,6 +208,7 @@ def _fail_fast_host(monkeypatch, guard, scheduled):
 
     root.load_start = load_start
     root.loading_file = False
+    root.apply_bed_settings = guard.wrap("apply_bed_settings")
     return root
 
 
@@ -302,6 +304,60 @@ def test_corrupt_compressed_file_closes_the_progress_popup_and_says_why(monkeypa
     assert root.message_popup.is_open is True
     assert "could not be decompressed" in root.message_popup.lb_content.text
     assert root.message_popup.btn_ok.disabled is False
+
+
+def test_failed_preview_leaves_no_file_named_as_the_current_one(monkeypatch, tmp_path):
+    """Before the preview nothing was selected; after it fails, the file
+    browser's header, row badge and buttons must be as they were, not name
+    the damaged file as the current one in preview."""
+    guard = _Guard()
+    scheduled = queue.Queue()
+    root = _fail_fast_host(monkeypatch, guard, scheduled)
+    path = tmp_path / "broken.nc"
+    path.write_bytes(b"\x00\x00not a quicklz stream")
+
+    _open_from_file_browser(monkeypatch, root, scheduled, str(path))
+
+    app = main_module.App.get_running_app()
+    assert (app.selected_remote_filename, app.selected_local_filename) == ("", "")
+    assert current_file_banner(app.selected_remote_filename, app.selected_local_filename, translate=str) == (
+        "None",
+        "",
+        False,
+    )
+    assert is_local_preview(app.selected_remote_filename, app.selected_local_filename) is False
+    assert "apply_bed_settings" in guard.names()
+
+
+def test_failed_load_of_a_machine_file_leaves_the_machine_file_selected(monkeypatch, tmp_path):
+    guard = _Guard()
+    scheduled = queue.Queue()
+    root = _fail_fast_host(monkeypatch, guard, scheduled)
+    path = tmp_path / "job.nc"
+    path.write_bytes(b"\x00\x00not a quicklz stream")
+    app = SimpleNamespace(
+        total_pages=0, curr_page=1, selected_remote_filename="/sd/gcodes/job.nc", selected_local_filename=str(path)
+    )
+    monkeypatch.setattr("carveracontroller.main.App.get_running_app", lambda: app)
+
+    _fail_before_main_thread_runs(root, scheduled, str(path))
+
+    assert (app.selected_remote_filename, app.selected_local_filename) == ("/sd/gcodes/job.nc", str(path))
+
+
+def test_failed_preview_does_not_unselect_a_file_selected_since(monkeypatch, tmp_path):
+    guard = _Guard()
+    scheduled = queue.Queue()
+    root = _fail_fast_host(monkeypatch, guard, scheduled)
+    path = tmp_path / "broken.nc"
+    path.write_bytes(b"\x00\x00not a quicklz stream")
+    other = str(tmp_path / "other.nc")
+    app = SimpleNamespace(total_pages=0, curr_page=1, selected_remote_filename="", selected_local_filename=other)
+    monkeypatch.setattr("carveracontroller.main.App.get_running_app", lambda: app)
+
+    _fail_before_main_thread_runs(root, scheduled, str(path))
+
+    assert app.selected_local_filename == other
 
 
 def test_checksum_mismatch_after_decompress_closes_the_progress_popup(monkeypatch, tmp_path):
