@@ -96,6 +96,17 @@ def row_display_text(
     return text
 
 
+def list_label(entry: ClientEntry, entries: tuple[ClientEntry, ...]) -> str:
+    """How the connected-controllers list labels `entry`, without the "you"
+    and control marks: its (possibly truncated) name, then its link in
+    brackets when known. For naming a controller elsewhere the same way."""
+    return row_display_text(
+        ClientRow(name=entry.name, has_control=False, is_self=False, link=link_label(entry, entries)),
+        you_suffix="",
+        control_suffix="",
+    )
+
+
 def holder_from_client_list(entries: tuple[ClientEntry, ...]) -> tuple[int, str]:
     """Who the client list says holds control right now: the id and name of
     the one entry whose ``has_control`` is true, or ``(0, "")`` -- the
