@@ -14,6 +14,7 @@ from carveracontroller.protocols.handshake import (
     EVENT_KIND_PLAY_STARTED,
     HELLO_ACCEPTED,
     HELLO_FEATURE_JOB_START_WAIT,
+    HELLO_FEATURE_KEEP_WAITING,
     JOB_START_CANCELLED,
     JOB_START_HASHING,
     JOB_START_REASON_STARTER_LEFT,
@@ -103,7 +104,7 @@ def test_encode_hello_without_features_keeps_the_old_layout():
 def test_the_hello_this_controller_sends_says_it_takes_part():
     negotiator = HelloNegotiator(identity=ControllerIdentity(id=5, name="Demo"), link=0)
     parsed = _parse(negotiator.on_valid_frame(0.0))
-    assert parsed.payload[-1] == HELLO_FEATURE_JOB_START_WAIT
+    assert parsed.payload[-1] == HELLO_FEATURE_JOB_START_WAIT | HELLO_FEATURE_KEEP_WAITING
 
 
 def test_negotiator_records_whether_the_machine_holds_starts():

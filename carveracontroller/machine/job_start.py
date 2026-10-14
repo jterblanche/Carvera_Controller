@@ -14,6 +14,14 @@ the hold is cancelled if it disconnects or the machine halts. The event
 then says "starting" or "cancelled" once. Those can also come straight
 after hashing (Start now, a cancel, or every awaited controller gone).
 
+A machine with hello feature 0x02 does not start the job when the limit
+runs out while a controller is still not ready, if the starting controller
+advertised 0x02 too: it keeps the start held in phase "timed out", sent
+once a second with no time left, until the starting controller sends
+``start-now``, ``keep-waiting`` (back to "waiting" with the whole limit)
+or ``abort``, or every awaited controller is ready (then it starts, as
+within the limit). Awaited controllers go on preparing meanwhile.
+
 This tracker turns those events into what this controller has to do:
 
 - prepare (draw the announced file from a local copy, or fetch it) the
@@ -42,7 +50,7 @@ import math
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
-from ..protocols.handshake import JOB_START_HASHING, JOB_START_WAITING, JobStartEvent
+from ..protocols.handshake import JOB_START_HASHING, JOB_START_TIMED_OUT, JOB_START_WAITING, JobStartEvent
 
 # The wait after a failed attempt before the next one: doubled after each
 # failure of the same start, up to the maximum.
@@ -55,8 +63,13 @@ MIN_SECONDS_LEFT_TO_RETRY = 3
 
 # How long past the machine's limit a hold is still shown with no further
 # event. The start can come later than the limit only while a download is
-# running on the machine, and a stalled download is ended after 10 s.
+# running on the machine, and a stalled download is ended after 10 s. A
+# start held after its wait ran out has no limit: it is dropped when no
+# event has come for this long, unless a file transfer is running.
 STALE_AFTER_LIMIT_S = 15.0
+
+# The phases in which the machine still holds the start.
+_HELD_PHASES = (JOB_START_WAITING, JOB_START_HASHING, JOB_START_TIMED_OUT)
 
 # The machine's multi_client.passive_rights values that let a controller
 # without control stop a job, and the value the machine uses when the
@@ -98,6 +111,7 @@ class JobStartTracker:
     own_id: int
     _event: JobStartEvent | None = field(default=None, init=False, repr=False)
     _deadline: float = field(default=0.0, init=False, repr=False)
+    _last_event_at: float = field(default=0.0, init=False, repr=False)
     _preparing_for: int = field(default=0, init=False, repr=False)
     _ready_for: int = field(default=0, init=False, repr=False)
     _failures: int = field(default=0, init=False, repr=False)
@@ -120,6 +134,12 @@ class JobStartTracker:
         return self._event is not None and self._event.phase == JOB_START_HASHING
 
     @property
+    def timed_out(self) -> bool:
+        """True while a start is held after its wait ran out, for the
+        starting controller to choose what happens."""
+        return self._event is not None and self._event.phase == JOB_START_TIMED_OUT
+
+    @property
     def ready_sent(self) -> bool:
         """True while a start is held for which this controller has sent
         ready."""
@@ -134,8 +154,8 @@ class JobStartTracker:
         """Take a job-start event. A "starting" or "cancelled" event ends
         the hold. A hashing event holds it but asks nothing. A waiting event
         updates the countdown and says what to do (see the module
-        docstring)."""
-        if event.phase not in (JOB_START_WAITING, JOB_START_HASHING):
+        docstring), and so does a timed-out event, which has no countdown."""
+        if event.phase not in _HELD_PHASES:
             self.clear()
             return JobStartAction.NONE
         if self._event is None or self._event.start_id != event.start_id:
@@ -145,6 +165,7 @@ class JobStartTracker:
             self._retry_after = 0.0
         self._event = event
         self._deadline = now + event.seconds_left
+        self._last_event_at = now
         if event.phase == JOB_START_HASHING:
             return JobStartAction.NONE
         if event.starter_id == self.own_id or self.own_id not in event.not_ready_ids:
@@ -153,7 +174,10 @@ class JobStartTracker:
             return JobStartAction.RESEND_READY
         if self._preparing_for == event.start_id:
             return JobStartAction.NONE
-        if self._failures and (now < self._retry_after or event.seconds_left < MIN_SECONDS_LEFT_TO_RETRY):
+        if self._failures and (
+            now < self._retry_after
+            or (event.phase == JOB_START_WAITING and event.seconds_left < MIN_SECONDS_LEFT_TO_RETRY)
+        ):
             return JobStartAction.NONE
         return JobStartAction.PREPARE
 
@@ -204,16 +228,25 @@ class JobStartTracker:
             return 0
         return max(0, math.ceil(self._deadline - now))
 
-    def stale(self, now: float) -> bool:
+    def stale(self, now: float, transfer_running: bool = False) -> bool:
         """True when a held start has had no event for well past its limit,
-        so its "starting" or "cancelled" event was lost."""
-        return self._event is not None and now > self._deadline + STALE_AFTER_LIMIT_S
+        so its "starting" or "cancelled" event was lost. A start held after
+        its wait ran out has no limit: it is stale when its once-a-second
+        events have stopped for STALE_AFTER_LIMIT_S, and never while
+        `transfer_running` (the machine sends no events during a file
+        transfer)."""
+        if self._event is None:
+            return False
+        if self._event.phase == JOB_START_TIMED_OUT:
+            return not transfer_running and now > self._last_event_at + STALE_AFTER_LIMIT_S
+        return now > self._deadline + STALE_AFTER_LIMIT_S
 
     def clear(self) -> None:
         """Forget the held start (it started, was cancelled, or the
         connection closed)."""
         self._event = None
         self._deadline = 0.0
+        self._last_event_at = 0.0
         self._preparing_for = 0
         self._ready_for = 0
         self._failures = 0

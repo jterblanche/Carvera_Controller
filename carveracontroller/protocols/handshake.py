@@ -34,6 +34,12 @@ HELLO_MODE_MULTI_USER = 1
 # until the controllers that take part are ready. Firmware without the wait
 # ignores the byte in the hello and sends a three-byte ack, read as 0.
 HELLO_FEATURE_JOB_START_WAIT = 0x01
+# Bit 1. In the hello: this controller can show the choice when a held
+# start's wait runs out (Start now, Keep waiting, Cancel). In the ack: the
+# machine then keeps the job held (phase timed out) instead of starting it,
+# but only for a job started by a controller that set this bit; for any
+# other the limit starts the job as before.
+HELLO_FEATURE_KEEP_WAITING = 0x02
 
 # Event (`0x68`) `kind` bytes this controller decodes. The machine defines
 # two more (3, job ended; 4, alarm/halt) that this controller does not act
@@ -58,14 +64,18 @@ TRANSFER_UPLOADING = 1
 # computes the file's MD5: it carries the size but no checksum and no time
 # left, and the first waiting event that follows carries the MD5 and starts
 # the time limit. Starting or cancelled can also follow hashing directly,
-# then with no checksum.
+# then with no checksum. Timed out (machines with HELLO_FEATURE_KEEP_WAITING)
+# follows waiting when the limit runs out while a controller is still not
+# ready: the start stays held for the starter's choice, with reason 0 and
+# no time left, sent once a second; keep-waiting returns it to waiting.
 JOB_START_WAITING = 0
 JOB_START_STARTING = 1
 JOB_START_CANCELLED = 2
 JOB_START_HASHING = 3
+JOB_START_TIMED_OUT = 4
 
-# Job-start event `reason` values: 0 with phase waiting; 1 to 3 with phase
-# starting; 4 to 6 with phase cancelled.
+# Job-start event `reason` values: 0 with phase waiting or timed out; 1 to
+# 3 with phase starting; 4 to 6 with phase cancelled.
 JOB_START_REASON_WAITING = 0
 JOB_START_REASON_ALL_READY = 1
 JOB_START_REASON_TIME_LIMIT = 2

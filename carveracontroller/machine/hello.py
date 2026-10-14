@@ -19,6 +19,7 @@ from ..protocols.handshake import (
     HELLO_ACCEPTED,
     HELLO_BUSY,
     HELLO_FEATURE_JOB_START_WAIT,
+    HELLO_FEATURE_KEEP_WAITING,
     HELLO_MODE_SINGLE_USER,
     HELLO_REJECTED_IDENTITY_CONNECTED,
     HelloAck,
@@ -224,6 +225,13 @@ class HelloNegotiator:
         return self._identified and bool(self._ack_features & HELLO_FEATURE_JOB_START_WAIT)
 
     @property
+    def machine_supports_keep_waiting(self) -> bool:
+        """True once an accepted ack says the machine keeps a held start
+        held when its wait runs out, for the starter to choose (Start now,
+        Keep waiting, Cancel), and accepts ``keep-waiting``."""
+        return self._identified and bool(self._ack_features & HELLO_FEATURE_KEEP_WAITING)
+
+    @property
     def frame_seen(self) -> bool:
         """Whether a CRC-valid frame has ever arrived on this link (i.e.
         whether on_valid_frame has fired and the ack-wait deadline has
@@ -374,14 +382,14 @@ class HelloNegotiator:
             self._ack_wait_from = now
             self._window_from = now
         self._last_hello_sent_at = now
-        # Always says this controller takes part in the job-start wait:
-        # firmware without the wait ignores the byte. The launch part is the
-        # same in every hello of this start; firmware without the identity
-        # check ignores it.
+        # Always says this controller takes part in the job-start wait and
+        # can choose when its wait runs out: firmware without them ignores
+        # the bits. The launch part is the same in every hello of this
+        # start; firmware without the identity check ignores it.
         return encode_hello(
             self.identity.id,
             self.identity.name.encode("utf-8"),
             self.link,
-            features=HELLO_FEATURE_JOB_START_WAIT,
+            features=HELLO_FEATURE_JOB_START_WAIT | HELLO_FEATURE_KEEP_WAITING,
             launch=self.identity.launch,
         )

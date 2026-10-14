@@ -3420,9 +3420,20 @@ class Controller:
         negotiator = self._hello
         return negotiator is not None and negotiator.machine_holds_starts
 
+    @property
+    def machine_supports_keep_waiting(self):
+        """True once the machine's hello ack says it keeps a held start
+        held when its wait runs out and accepts keep-waiting."""
+        negotiator = self._hello
+        return negotiator is not None and negotiator.machine_supports_keep_waiting
+
     def startNowCommand(self):
         """Start a held job at once."""
         self.executeCommand("start-now\n")
+
+    def keepWaitingCommand(self):
+        """Wait the full time again for a held job whose wait ran out."""
+        self.executeCommand("keep-waiting\n")
 
     def _on_published_line(self, source_id, source_name, text):
         """A command's own text or its reply, published by the machine to
