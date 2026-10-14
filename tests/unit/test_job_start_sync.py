@@ -859,6 +859,43 @@ def test_hashing_straight_to_starting_shows_the_job_without_its_toolpath(tmp_pat
     assert any("Demo" in text for text in _logged(root))
 
 
+def test_start_now_before_this_controller_has_the_file_fetches_only_after_the_job(tmp_path, app):
+    """Start now during hashing, as on 12 Oct: the machine reports Idle
+    with the player stopped right up to the play-started event, and the
+    screen refreshes from that last report again before the next one
+    arrives. No download starts until the player has stopped (the machine
+    turns one away while a job plays), and then exactly one, unprompted."""
+    root = _host(tmp_path)
+    root.controller.status_reports = 40
+    Makera.on_job_start_event(root, _hashing())
+    Makera.on_job_start_event(
+        root,
+        _event(phase=JOB_START_STARTING, reason=JOB_START_REASON_START_NOW, seconds_left=0, checksum=b""),
+    )
+    Makera.on_passive_file_published(root, PATH, b"", size=SIZE, played=True)
+    for _ in range(3):
+        Makera._check_passive_fetch(root, app.state == "Idle")
+    root.doDownload.assert_not_called()
+
+    def report(is_playing):
+        CNC.vars["is_playing"] = is_playing
+        root.controller.status_reports += 1
+        Makera._check_passive_fetch(root, app.state == "Idle")
+
+    for _ in range(10):
+        report(1)
+    root.doDownload.assert_not_called()
+    assert root._passive_fetch.pending_path == PATH
+
+    report(0)
+    report(0)
+
+    root.doDownload.assert_called_once()
+    assert root.doDownload.call_args.args[0] == PATH
+    assert root.doDownload.call_args.kwargs["automatic"] is True
+    root.show_message_popup.assert_not_called()
+
+
 def test_hashing_straight_to_cancelled_closes_the_check_and_says_why(tmp_path, app):
     root = _host(tmp_path)
     Makera.on_job_start_event(root, _hashing())
