@@ -23,6 +23,7 @@ from carveracontroller.protocols.handshake import (
     HELLO_ACCEPTED,
     HELLO_BUSY,
     HELLO_FEATURE_JOB_START_WAIT,
+    HELLO_FEATURE_KEEP_WAITING,
     HELLO_REJECTED_CAP,
     HELLO_REJECTED_IDENTITY_CONNECTED,
     LINK_WIFI,
@@ -61,7 +62,7 @@ def test_hello_carries_the_launch_part_after_the_features_byte():
     name_len = payload[9]
     link_at = 10 + name_len
     assert payload[link_at] == LINK_WIFI
-    assert payload[link_at + 1] == HELLO_FEATURE_JOB_START_WAIT
+    assert payload[link_at + 1] == HELLO_FEATURE_JOB_START_WAIT | HELLO_FEATURE_KEEP_WAITING
     assert payload[link_at + 2 :] == LAUNCH.to_bytes(8, "big")
 
 
@@ -71,7 +72,12 @@ def test_hello_keeps_every_older_field_where_it_was():
     _negotiator, frame = started()
     with_launch = payload_of(frame)
     before = payload_of(
-        encode_hello(IDENTITY.id, IDENTITY.name.encode(), LINK_WIFI, features=HELLO_FEATURE_JOB_START_WAIT)
+        encode_hello(
+            IDENTITY.id,
+            IDENTITY.name.encode(),
+            LINK_WIFI,
+            features=HELLO_FEATURE_JOB_START_WAIT | HELLO_FEATURE_KEEP_WAITING,
+        )
     )
 
     assert with_launch[: len(before)] == before
@@ -89,7 +95,7 @@ def test_identity_without_a_launch_part_sends_the_hello_as_before():
     _negotiator, frame = started(ControllerIdentity(id=1, name="A"))
     payload = payload_of(frame)
 
-    assert payload[-1] == HELLO_FEATURE_JOB_START_WAIT
+    assert payload[-1] == HELLO_FEATURE_JOB_START_WAIT | HELLO_FEATURE_KEEP_WAITING
     assert len(payload) == 1 + 8 + 1 + 1 + 1 + 1
 
 

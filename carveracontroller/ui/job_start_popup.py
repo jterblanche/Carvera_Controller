@@ -5,6 +5,11 @@ Every connected controller shows the countdown, and before it that the
 machine is checking the file. Only the controller that started the job
 gets Start now. Cancel is shown on every controller the machine accepts an
 abort from (see machine/job_start.py's may_cancel_held_start).
+
+When the wait runs out on a machine that then keeps the start held (phase
+timed out), the controller that started the job gets Start now, Keep
+waiting and Cancel; every other controller sees that the wait ran out and
+who is not synced yet, with only the Cancel it already had.
 """
 
 from __future__ import annotations
@@ -75,6 +80,50 @@ def checking_text(path: str, is_starter: bool, can_cancel: bool = False) -> str:
     return "\n\n".join(lines)
 
 
+def timed_out_text(
+    path: str,
+    not_synced: Iterable[str],
+    is_starter: bool,
+    can_cancel: bool = False,
+    keep_waiting: bool = False,
+    starter_name: str | None = None,
+) -> str:
+    """The text once the wait has run out and the start is held for the
+    starting controller's choice: which file, that it has not started,
+    which controllers are not synced yet, and either the choice (on the
+    starter, with Keep waiting when the machine accepts it) or who makes
+    it (on the others, with Cancel if they have it)."""
+    names = ", ".join(not_synced)
+    lines = [tr._("The wait for the other controllers ran out. {} has not started.").format(_file_name(path))]
+    if names:
+        lines.append(tr._("Not synced yet: {}.").format(names))
+    if is_starter and keep_waiting:
+        lines.append(
+            tr._(
+                "Press Start now to start without them, Keep waiting to wait the full time again, "
+                "or Cancel to stop the job."
+            )
+        )
+        lines.append(
+            tr._("Until you choose, the job stays held. It starts by itself once every controller has synced.")
+        )
+        return "\n\n".join(lines)
+    if is_starter:
+        lines.append(_buttons_line(True, True))
+        return "\n\n".join(lines)
+    if starter_name:
+        lines.append(
+            tr._("{} pressed Play and chooses whether to start now, keep waiting or cancel.").format(starter_name)
+        )
+    else:
+        lines.append(tr._("The controller that pressed Play chooses whether to start now, keep waiting or cancel."))
+    lines.append(tr._("The job starts by itself once every controller has synced."))
+    buttons = _buttons_line(False, can_cancel)
+    if buttons:
+        lines.append(buttons)
+    return "\n\n".join(lines)
+
+
 def cancelled_text(path: str, reason: int) -> str:
     """The message shown on every controller when a held start is
     cancelled, with the reason the machine gave."""
@@ -116,13 +165,20 @@ def no_toolpath_progress_text(path: str, played_lines: int, played_seconds: floa
 
 
 class JobStartPopup(Popup):
-    """The countdown. ``update`` refreshes the text and shows or hides each
-    button; ``on_start_now`` and ``on_cancel`` are called from the
-    buttons."""
+    """The countdown. ``update`` refreshes the text and title and shows or
+    hides each button; ``on_start_now``, ``on_keep_waiting`` and
+    ``on_cancel`` are called from the buttons."""
 
-    def __init__(self, on_start_now: Callable[[], None], on_cancel: Callable[[], None], **kwargs) -> None:
+    def __init__(
+        self,
+        on_start_now: Callable[[], None],
+        on_cancel: Callable[[], None],
+        on_keep_waiting: Callable[[], None] | None = None,
+        **kwargs,
+    ) -> None:
         self._on_start_now = on_start_now
         self._on_cancel = on_cancel
+        self._on_keep_waiting = on_keep_waiting
         content = BoxLayout(orientation="vertical", padding=dp(15), spacing=dp(10))
         self.lb_content = Label(halign="center", valign="middle")
         self.lb_content.bind(size=lambda inst, val: setattr(inst, "text_size", val))
@@ -130,6 +186,8 @@ class JobStartPopup(Popup):
         self.buttons = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(10))
         self.btn_start_now = Button(text=tr._("Start now"))
         self.btn_start_now.bind(on_release=lambda *_: self._on_start_now())
+        self.btn_keep_waiting = Button(text=tr._("Keep waiting"))
+        self.btn_keep_waiting.bind(on_release=lambda *_: self._keep_waiting())
         self.btn_cancel = Button(text=tr._("Cancel"))
         self.btn_cancel.bind(on_release=lambda *_: self._on_cancel())
         self.buttons.add_widget(self.btn_start_now)
@@ -144,24 +202,45 @@ class JobStartPopup(Popup):
         )
         self.showing = False
 
-    def update(self, text: str, show_start_now: bool, show_cancel: bool) -> None:
+    def update(
+        self,
+        text: str,
+        show_start_now: bool,
+        show_cancel: bool,
+        show_keep_waiting: bool = False,
+        title: str | None = None,
+    ) -> None:
         self.lb_content.text = text
-        self._show_button(self.btn_start_now, show_start_now, index=1)
-        self._show_button(self.btn_cancel, show_cancel, index=0)
-        show_any = show_start_now or show_cancel
-        self.buttons.disabled = not show_any
-        self.buttons.opacity = 1 if show_any else 0
+        self.title = title if title is not None else tr._("Job about to start")
+        self._show_buttons(
+            [
+                button
+                for button, show in (
+                    (self.btn_start_now, show_start_now),
+                    (self.btn_keep_waiting, show_keep_waiting),
+                    (self.btn_cancel, show_cancel),
+                )
+                if show
+            ]
+        )
         if not self.showing:
             self.showing = True
             self.open()
 
-    def _show_button(self, button: Button, show: bool, index: int) -> None:
-        """Put `button` in the row (Start now left of Cancel) or take it
-        out, so a lone Cancel fills the row."""
-        if show and button.parent is None:
-            self.buttons.add_widget(button, index=index)
-        elif not show and button.parent is not None:
-            self.buttons.remove_widget(button)
+    def _show_buttons(self, wanted: list[Button]) -> None:
+        """Put exactly `wanted` in the row, left to right in the order
+        Start now, Keep waiting, Cancel, so a lone Cancel fills the row; hide
+        the row when it is empty."""
+        if list(reversed(self.buttons.children)) != wanted:
+            self.buttons.clear_widgets()
+            for button in wanted:
+                self.buttons.add_widget(button)
+        self.buttons.disabled = not wanted
+        self.buttons.opacity = 1 if wanted else 0
+
+    def _keep_waiting(self) -> None:
+        if self._on_keep_waiting is not None:
+            self._on_keep_waiting()
 
     def close(self) -> None:
         if self.showing:

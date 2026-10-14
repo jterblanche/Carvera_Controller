@@ -90,12 +90,16 @@ class _FakePopup:
         self.texts = []
         self.buttons = []  # whether Start now was shown, per update
         self.cancels = []  # whether Cancel was shown, per update
+        self.keep_waitings = []  # whether Keep waiting was shown, per update
+        self.titles = []
 
-    def update(self, text, show_start_now, show_cancel):
+    def update(self, text, show_start_now, show_cancel, show_keep_waiting=False, title=None):
         self.showing = True
         self.texts.append(text)
         self.buttons.append(show_start_now)
         self.cancels.append(show_cancel)
+        self.keep_waitings.append(show_keep_waiting)
+        self.titles.append(title)
 
     def close(self):
         self.showing = False
@@ -171,7 +175,9 @@ def _host(tmp_path, own_id=DEMO, has_control=False, multi_user=True, holder=PC, 
         ),
         send_job_start_ready=MagicMock(return_value=True),
         startNowCommand=MagicMock(),
+        keepWaitingCommand=MagicMock(),
         abortCommand=MagicMock(),
+        machine_supports_keep_waiting=True,
         log=MagicMock(),
     )
 
@@ -919,10 +925,11 @@ def test_hashing_straight_to_cancelled_closes_the_check_and_says_why(tmp_path, a
 class _PopupWithButtons(_FakePopup):
     made: list = []
 
-    def __init__(self, on_start_now, on_cancel):
+    def __init__(self, on_start_now, on_cancel, on_keep_waiting=None):
         super().__init__()
         self.on_start_now = on_start_now
         self.on_cancel = on_cancel
+        self.on_keep_waiting = on_keep_waiting
         _PopupWithButtons.made.append(self)
 
 

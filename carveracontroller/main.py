@@ -378,7 +378,7 @@ from .GcodeViewer import (
     GCodeViewer,
 )
 from .machine.busy_state import machine_is_busy
-from .machine.clients import row_display_text, rows_for_display
+from .machine.clients import list_label, row_display_text, rows_for_display
 from .machine.computer_part import computer_part_for_this_process, new_launch_part
 from .machine.identity import load_identity, set_name, with_id
 from .machine.job_start import JobStartAction, JobStartTracker, may_cancel_held_start
@@ -392,6 +392,7 @@ from .protocols.handshake import (
     JOB_START_REASON_START_NOW,
     JOB_START_REASON_TIME_LIMIT,
     JOB_START_STARTING,
+    JOB_START_TIMED_OUT,
     JOB_START_WAITING,
     TRANSFER_DOWNLOADING,
     TRANSFER_UPLOADING,
@@ -405,6 +406,7 @@ from .ui.job_start_popup import (
     no_toolpath_progress_text,
     not_loaded_text,
     started_without_text,
+    timed_out_text,
 )
 from .ui.PlayProgressBar import (
     next_tool_change_after_line,
@@ -7112,7 +7114,10 @@ class Makera(RelativeLayout):
         is listed as not ready, draw the file from a local copy or fetch it,
         then report ready (or report ready again, if a ready was already
         sent and lost). Ready is only ever sent for a drawing whose size and
-        MD5 are the announced ones. When the hold ends: close the countdown,
+        MD5 are the announced ones. After the wait has run out on a machine
+        that keeps the start held (timed out): the same, but the dialog says
+        the wait ran out, and the starter chooses (Start now, Keep waiting,
+        Cancel). When the hold ends: close the countdown,
         say why if the job will not start, and if the job starts before this
         controller has the file drawn, show the job without its toolpath
         (_show_job_without_toolpath)."""
@@ -7124,7 +7129,7 @@ class Makera(RelativeLayout):
         if event.phase == JOB_START_HASHING:
             self._show_job_start_countdown()
             return
-        if event.phase == JOB_START_WAITING:
+        if event.phase in (JOB_START_WAITING, JOB_START_TIMED_OUT):
             self._show_job_start_countdown()
             if action is JobStartAction.RESEND_READY:
                 self.controller.send_job_start_ready(event.start_id)
@@ -7296,7 +7301,9 @@ class Makera(RelativeLayout):
             return
         if self._job_start_popup is None:
             self._job_start_popup = JobStartPopup(
-                on_start_now=self.controller.startNowCommand, on_cancel=self.controller.abortCommand
+                on_start_now=self.controller.startNowCommand,
+                on_cancel=self.controller.abortCommand,
+                on_keep_waiting=self.controller.keepWaitingCommand,
             )
         is_starter = self._job_start.is_starter
         can_cancel = self._may_cancel_held_start()
@@ -7308,6 +7315,32 @@ class Makera(RelativeLayout):
                 self._job_start_clock = Clock.schedule_interval(self._tick_job_start_countdown, 1.0)
             return
         waiting = [i for i in event.not_ready_ids if i != self.identity.id]
+        if self._job_start.timed_out:
+            # Keep waiting only where the machine accepts keep-waiting; a
+            # machine without it never sends this phase. Controllers are
+            # named by their labels in the connected-controllers list.
+            keep_waiting = is_starter and bool(self.controller.machine_supports_keep_waiting)
+            labels = self._client_labels(waiting)
+            if self.identity.id in event.not_ready_ids:
+                labels.insert(0, tr._("this controller"))
+            starter_known = any(entry.id == event.starter_id for entry in self.controller.connected_clients)
+            self._job_start_popup.update(
+                timed_out_text(
+                    event.path,
+                    labels,
+                    is_starter,
+                    can_cancel,
+                    keep_waiting=keep_waiting,
+                    starter_name=self._client_labels([event.starter_id])[0] if starter_known else None,
+                ),
+                show_start_now=is_starter,
+                show_cancel=can_cancel,
+                show_keep_waiting=keep_waiting,
+                title=tr._("Job held: the wait ran out"),
+            )
+            if self._job_start_clock is None:
+                self._job_start_clock = Clock.schedule_interval(self._tick_job_start_countdown, 1.0)
+            return
         names = self._client_names(waiting)
         if self.identity.id in event.not_ready_ids:
             names.insert(0, tr._("this controller"))
@@ -7318,6 +7351,17 @@ class Makera(RelativeLayout):
         )
         if self._job_start_clock is None:
             self._job_start_clock = Clock.schedule_interval(self._tick_job_start_countdown, 1.0)
+
+    def _client_labels(self, client_ids):
+        """The connected-controllers list's label for each of `client_ids`
+        (name and link, machine/clients.py's list_label), or "another
+        controller" for one not in the list."""
+        entries = tuple(self.controller.connected_clients)
+        by_id = {entry.id: entry for entry in entries}
+        return [
+            list_label(by_id[client_id], entries) if client_id in by_id else tr._("another controller")
+            for client_id in client_ids
+        ]
 
     def _may_cancel_held_start(self):
         """Whether the machine accepts abort from this controller during
@@ -7337,7 +7381,12 @@ class Makera(RelativeLayout):
         """Count down between events, which the machine does not send while
         a file transfer runs. Closes the countdown if the job is playing or
         the hold's end was never heard of."""
-        if self._job_start.held and (self._machine_reports_playing() or self._job_start.stale(time.monotonic())):
+        # The machine sends no event while a file transfer runs, and a start
+        # held after its wait ran out has no limit to count to.
+        transfer_running = self._auto_fetch_in_progress or bool(getattr(self.controller, "peer_transfer_active", False))
+        if self._job_start.held and (
+            self._machine_reports_playing() or self._job_start.stale(time.monotonic(), transfer_running)
+        ):
             self._job_start.clear()
         if not self._job_start.held:
             self._close_job_start_countdown()

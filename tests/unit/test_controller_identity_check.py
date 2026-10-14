@@ -36,6 +36,7 @@ from carveracontroller.protocols.handshake import (
     HELLO_ACCEPTED,
     HELLO_BUSY,
     HELLO_FEATURE_JOB_START_WAIT,
+    HELLO_FEATURE_KEEP_WAITING,
     HELLO_REJECTED_IDENTITY_CONNECTED,
 )
 from tests.unit.fake_machine import FakeMachine
@@ -281,7 +282,7 @@ def test_old_firmware_still_works_with_the_launch_part_in_the_hello(machines, co
 
     assert m.wait_until(lambda: len(m.hellos_received) >= 1, timeout=3.0)
     payload = m.hellos_received[0]
-    assert payload[-9] == HELLO_FEATURE_JOB_START_WAIT
+    assert payload[-9] == HELLO_FEATURE_JOB_START_WAIT | HELLO_FEATURE_KEEP_WAITING
     assert payload[-8:] == LAUNCH.to_bytes(8, "big")
 
     assert m.wait_until(lambda: m.frames_of_type(PTYPE_CTRL_MULTI) == [b"version"], timeout=ACK_TIMEOUT_S + 2.0)
