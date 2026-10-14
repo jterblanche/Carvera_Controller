@@ -102,6 +102,7 @@ import time
 from enum import Enum, auto
 
 from .machine.control_refusal import is_control_refusal
+from .machine.peer_transfer import is_transfer_busy_reply
 from .protocols.framing import (
     FRAME_END,
     FRAME_HEADER,
@@ -472,7 +473,8 @@ class XMODEM:
         self.deferred_download_md5 = None
         self.download_md5_failed = False
         # Why the last framed transfer failed, when there is a reason to
-        # show: a FILE_CAN payload, the machine's refusal reply, or a stall.
+        # show: a FILE_CAN payload, the machine's refusal or busy reply, or
+        # a stall.
         self.last_file_error = None
         # Frame bodies (packetData) that arrived during the last framed
         # transfer but were not part of it; see take_other_frames().
@@ -529,14 +531,30 @@ class XMODEM:
         (``error:Refused -- ...``, see machine/control_refusal.py) sent as
         PTYPE_NORMAL_INFO, and then never starts it. That ends the transfer
         at once: returns _REFUSED with the reply in ``last_file_error``,
-        where the caller reports it. Every other frame is kept for the
-        controller (``other_frames``). Returns _STALLED when no transfer
-        packet has arrived since ``last_progress`` for longer than
-        TRANSFER_STALL_TIMEOUT_S, else None to carry on waiting.
+        where the caller reports it.
+
+        The machine's busy reply (``error:Busy -- ...``, see
+        machine/peer_transfer.py) means it is running another controller's
+        transfer and has discarded this one's command, so this transfer
+        never starts either. It ends the same way, with no FILE_CAN: the
+        machine would discard that too and only answer it with the busy
+        reply again. The reply is also kept for the controller, which then
+        knows the machine is busy, as it does when the reply arrives
+        outside a transfer.
+
+        Every other frame is kept for the controller (``other_frames``).
+        Returns _STALLED when no transfer packet has arrived since
+        ``last_progress`` for longer than TRANSFER_STALL_TIMEOUT_S, else
+        None to carry on waiting.
         """
         if self.packetData[2] == PTYPE_NORMAL_INFO:
             reason = self._file_packet_text()
             if is_control_refusal(reason):
+                self.last_file_error = reason
+                self.log.info("Transmission refused by Machine: %s", reason)
+                return _REFUSED
+            if is_transfer_busy_reply(reason):
+                self.other_frames.append(bytes(self.packetData))
                 self.last_file_error = reason
                 self.log.info("Transmission refused by Machine: %s", reason)
                 return _REFUSED
