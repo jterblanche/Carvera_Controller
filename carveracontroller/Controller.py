@@ -2903,6 +2903,25 @@ class Controller:
 
     def _handle_protocol_message(self, message):
         """Dispatch a ParsedMessage from the active communication protocol."""
+        if message.kind == MessageKind.UNSOLICITED_DOWNLOAD:
+            # Handled before _on_peer_transfer_frame, not after: that hook
+            # treats any frame it does not specifically recognise as proof
+            # a tracked peer transfer (another controller's, learned about
+            # from its busy reply) is over, and reacts by resending a
+            # pending load command at once. This digest belongs to a
+            # download the machine is serving to us right now -- the
+            # machine is inside that transfer's own loop, which drops
+            # every non-file frame from its owner (us) until the loop
+            # ends, so a resend sent from here would be lost and wait out
+            # its own timeout for nothing. _refuse_unsolicited_download
+            # cancels the digest either way; only that transfer's proper
+            # end may end the peer-transfer tracking, same as before this
+            # frame produced a message at all. _refresh_heartbeat is set
+            # directly, the same as _on_peer_transfer_frame does for every
+            # frame, since this path no longer reaches it.
+            self._refresh_heartbeat = True
+            self._refuse_unsolicited_download(message.payload)
+            return
         if self._on_peer_transfer_frame(message):
             return
         if message.kind == MessageKind.HELLO_ACK:
@@ -2951,9 +2970,6 @@ class Controller:
             return
         if message.kind == MessageKind.PRESENCE_CHECK:
             self._answer_presence_check(message.payload)
-            return
-        if message.kind == MessageKind.UNSOLICITED_DOWNLOAD:
-            self._refuse_unsolicited_download(message.payload)
             return
 
         text = message.text or ""

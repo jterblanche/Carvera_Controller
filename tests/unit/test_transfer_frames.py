@@ -27,13 +27,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import carveracontroller.machine.peer_transfer as peer_transfer_module
 from carveracontroller.CNC import CNC
-from carveracontroller.Controller import CONN_WIFI, Controller
+from carveracontroller.Controller import CONN_WIFI, LOAD_DIR, Controller
 from carveracontroller.machine.identity import ControllerIdentity
 from carveracontroller.machine.passive_fetch import PassiveFetchTracker
 from carveracontroller.main import Makera
 from carveracontroller.protocols.framing import (
     PTYPE_AUTO_COMMAND,
+    PTYPE_CTRL_MULTI,
     PTYPE_EVENT,
     PTYPE_FILE_CAN,
     PTYPE_FILE_DATA,
@@ -48,6 +50,7 @@ from carveracontroller.protocols.framing import (
 )
 from carveracontroller.protocols.handshake import EVENT_KIND_CONTROL_CHANGED
 from tests.unit.fake_machine import FakeMachine
+from tests.unit.test_peer_transfer_link import _TransferHook
 
 IDENTITY = ControllerIdentity(id=0x0102030405060708, name="Test PC")
 OTHER_ID = 0x1111222233334444
@@ -479,6 +482,77 @@ def test_refuse_unsolicited_download_does_nothing_without_a_stream(controller):
     same guard _answer_presence_check uses. Must not raise."""
     assert controller.stream is None
     controller._refuse_unsolicited_download(b"digest")
+
+
+def test_unsolicited_download_during_busy_tracking_cancels_without_resending_early(
+    machines, controller, monkeypatch
+):
+    """#330's own shape: the machine's busy reply is already tracking
+    another controller's transfer (peer_transfer_active), with a listing
+    command still waiting for its reply, turned away by that same busy
+    reply and queued to resend once the tracked transfer ends
+    (_on_peer_transfer_frame's busy-reply branch). If a stale FILE_MD5
+    served late for the transfer being tracked reached
+    _on_peer_transfer_frame's "any other frame ends it" branch before
+    being cancelled, it would end that tracking and resend the listing at
+    once -- while the firmware is still inside its own transfer loop,
+    which drops every non-file frame from that transfer's owner, losing
+    the resend. UNSOLICITED_DOWNLOAD must be answered with FILE_CAN
+    without ending the tracking or resending anything; only the tracked
+    transfer's own proper end (here, the fake machine stopping its busy
+    replies, standing in for the firmware's real end-of-transfer console
+    line, "Info: Download canceled by Controller!") may do that.
+
+    Uses the same ``_TransferHook``/``_TransferringMachine`` double as
+    test_peer_transfer_link.py's socket test, not SilentDownloadPeer:
+    SilentDownloadPeer only answers a download *request*, so the
+    controller's own keep-alive probe (CLIENT_LIST_REQ, due at once once
+    the busy reply resets it, Controller.py's _advance_heartbeat) would
+    get a normal, non-busy CLIENT_LIST_REPLY back and end the tracking on
+    its own almost immediately -- before this test's own assertions ran,
+    on an earlier draft of this test that used it and checked the wrong
+    frame type as well (the resend is PTYPE_CTRL_MULTI, built by
+    executeCommand -> encode_command; PTYPE_AUTO_COMMAND is a different,
+    unrelated command path). The hook answers every probe with the busy
+    reply too, until its own end() is called, keeping the tracking alive
+    for as long as the real firmware would.
+    """
+    monkeypatch.setattr(peer_transfer_module, "PROBE_INTERVAL_S", 0.2)
+    m = FakeMachine(mode="new", frame_hook=None)
+    machines.append(m)
+    controller.open(CONN_WIFI, m.address())
+    assert m.wait_until(lambda: controller._hello is not None and controller._hello.identified, timeout=2.0)
+    assert m.wait_until(lambda: controller.comms.uses_framed_transfer, timeout=2.0)
+    _drain_log(controller)
+
+    hook = _TransferHook()
+    m.frame_hook = hook
+
+    def _listings():
+        return [p for p in m.frames_of_type(PTYPE_CTRL_MULTI) if p.startswith(b"ls ")]
+
+    controller.loadNUM = LOAD_DIR
+    controller.loadEOF = controller.loadERR = False
+    controller.lsCommand("/sd/gcodes")
+    assert m.wait_until(lambda: controller.peer_transfer_active, timeout=2.0)
+    assert len(_listings()) == 1
+
+    # A stale digest for the transfer the busy reply is tracking, served
+    # late while that transfer is still (as far as this controller can
+    # tell) running.
+    stray_digest = hashlib.md5(b"served late for the transfer being tracked").hexdigest().encode()
+    m.send_frame(build_frame(PTYPE_FILE_MD5, stray_digest))
+    assert m.wait_until(lambda: len(m.frames_of_type(PTYPE_FILE_CAN)) == 1, timeout=2.0)
+
+    time.sleep(0.3)
+    assert controller.peer_transfer_active
+    assert len(_listings()) == 1
+
+    # The tracked transfer's own proper end (not the digest above) may
+    # end the tracking and resend the listing it turned away.
+    hook.end()
+    assert m.wait_until(lambda: not controller.peer_transfer_active, timeout=2.0)
+    assert m.wait_until(lambda: len(_listings()) == 2, timeout=2.0)
 
 
 # -- the passive fetch in main.py ----------------------------------------------
