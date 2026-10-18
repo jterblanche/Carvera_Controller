@@ -484,9 +484,7 @@ def test_refuse_unsolicited_download_does_nothing_without_a_stream(controller):
     controller._refuse_unsolicited_download(b"digest")
 
 
-def test_unsolicited_download_during_busy_tracking_cancels_without_resending_early(
-    machines, controller, monkeypatch
-):
+def test_unsolicited_download_during_busy_tracking_cancels_without_resending_early(machines, controller, monkeypatch):
     """#330's own shape: the machine's busy reply is already tracking
     another controller's transfer (peer_transfer_active), with a listing
     command still waiting for its reply, turned away by that same busy

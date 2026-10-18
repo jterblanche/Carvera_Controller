@@ -3316,17 +3316,25 @@ class Controller:
         race that retry instead of leaving it to ask again on its own.
         ``self.paused``/``self.pausing`` being set is exactly that window,
         so drop the frame instead while either is set: the same silent
-        drop this parser always did, and harmless, because a transfer
-        waiting on its own MD5 asks again on its own
-        (XMODEM._ask_again_for_download_packet) if nothing reaches it.
+        drop this parser always did. Dropping specifically this frame,
+        this once, costs nothing: it never reached XMODEM at all (this
+        parser saw it, not the transfer's own read loop), so the transfer
+        simply has not yet seen its MD5 and asks again on its own
+        (XMODEM._ask_again_for_download_packet) the same as if the frame
+        had been lost in transit.
 
-        This only covers the window while streamIO owns the read loop. A
-        stale digest that happens to arrive while some other transfer
-        already owns the wire directly never reaches this method at all
-        -- XMODEM reads it there instead, and its own state machine
-        (WAIT_MD5 in recv(), the matching check in send()) only compares
-        it against the file it is expecting, so a mismatch is a retry
-        request, never corruption. That case is out of scope here.
+        This method only ever answers a digest while streamIO owns the
+        read loop; a digest that arrives once some other transfer already
+        owns the wire directly never reaches this method at all, either
+        before or after this change -- XMODEM reads it there instead. That
+        is not the same as saying it is safe: XMODEM's own WAIT_MD5 state
+        (recv()) and its send() counterpart adopt whatever digest arrives
+        next as the one for whatever is currently being transferred, with
+        no check that it is the file actually being asked for, so a stale
+        digest for a different file arriving there can be accepted and
+        saved under the current transfer's name. That gap predates this
+        change and is not fixed by it; this method cannot reach that case
+        to do anything about it either way.
 
         Called on whichever thread read the frame, the same as
         _answer_presence_check."""
