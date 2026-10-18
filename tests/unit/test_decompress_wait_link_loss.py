@@ -21,11 +21,11 @@ Two disconnect paths both need to end the wait, so both are covered here:
   itself -- not just the extracted method -- is covered.
 - _update_decompress_progress's own connection check (added alongside
   _clear_decompress_wait_on_disconnect): doUpload can still be between the
-  transfer finishing and setting self.decompstatus -- copying the file
-  locally, verifying firmware's MD5 -- at the moment the link drops. That
-  is after the state's edge updateStatus reacts to has already been
-  handled, so nothing would otherwise clear decompstatus a second time
-  until the watchdog's own, much longer, timeout.
+  transfer finishing and setting self.decompstatus -- copying the uploaded
+  file and its original locally -- at the moment the link drops. That is
+  after the state's edge updateStatus reacts to has already been handled,
+  so nothing would otherwise clear decompstatus a second time until the
+  watchdog's own, much longer, timeout.
 
 doUpload's own success path (_upload_file) also sets decomptime and
 pending_decompress_callback before decompstatus, not after: decompstatus is
@@ -147,10 +147,10 @@ def test_link_no_longer_busy_for_passive_fetch_after_the_wait_is_cleared(monkeyp
 
 # -----------------------------------------------------------------------
 # The race this fix also closes: doUpload sets self.decompstatus=True only
-# after the transfer finishes and the file is copied locally (and, for
-# firmware, MD5-verified) -- real work that takes real time. If the link
-# drops during that window, updateStatus's NOT_CONNECTED edge has already
-# been and gone by the time decompstatus becomes True, so
+# after the transfer finishes and the uploaded file and its original are
+# copied locally -- real work that takes real time. If the link drops
+# during that window, updateStatus's NOT_CONNECTED edge has already been
+# and gone by the time decompstatus becomes True, so
 # _clear_decompress_wait_on_disconnect never runs for it. Proven by a
 # large fileCompressionBlocks (so the pre-existing per-block watchdog,
 # which only reacts after max(15, blocks) seconds, cannot be what ends

@@ -8731,7 +8731,7 @@ class Makera(RelativeLayout):
         only on updateStatus's NOT_CONNECTED handling
         (_clear_decompress_wait_on_disconnect): doUpload can still be
         between the transfer finishing and setting self.decompstatus
-        (copying the file locally, verifying firmware's MD5, ...) at the
+        (copying the uploaded file and its original locally) at the
         moment the link drops. updateStatus only reacts to that drop once,
         on the state's edge from Connected to NOT_CONNECTED; if decompstatus
         becomes True only after that edge has already been handled, nothing
