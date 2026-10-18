@@ -26,8 +26,19 @@ Two disconnect paths both need to end the wait, so both are covered here:
   is after the state's edge updateStatus reacts to has already been
   handled, so nothing would otherwise clear decompstatus a second time
   until the watchdog's own, much longer, timeout.
+
+doUpload's own success path (_upload_file) also sets decomptime and
+pending_decompress_callback before decompstatus, not after: decompstatus is
+what a concurrent monitorSerial tick gates on, so everything that tick could
+read once it sees decompstatus True must already be in its final state by
+then, not read mid-assignment. test_decompstatus_is_set_last_in_the_lz_success_path
+proves that ordering directly; test_file_end_flag_then_lost_link_leaves_no_stale_callback
+drives the whole thing end to end, through the real upload path, from a
+successful transfer to a lost link before the machine's decompart
+confirmation ever arrives.
 """
 
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -37,6 +48,8 @@ from carveracontroller.machine.identity import ControllerIdentity
 from carveracontroller.main import Makera
 from carveracontroller.translation import tr
 from tests.unit.test_screen_after_inline_close import _connected_app, _connected_screen
+from tests.unit.test_upload_compress_failure import _host as _real_upload_host
+from tests.unit.test_upload_compress_failure import _ImmediateThread
 
 IDENTITY = ControllerIdentity(id=0x0102030405060708, name="Test PC")
 
@@ -227,3 +240,104 @@ def test_updatestatus_is_what_the_fix_relies_on(monkeypatch, connected_idle_stat
     root.show_peer_closed_popup()
 
     assert root.decompstatus is True  # unchanged: proves the call site, not just the method, matters
+
+
+# -----------------------------------------------------------------------
+# _upload_file's own ordering guarantee: decompstatus is set last, after
+# decomptime and pending_decompress_callback, so a concurrent monitorSerial
+# tick can never see decompstatus True before the data it reads under that
+# flag is already final. A data descriptor installed in decompstatus's
+# place records what the other two attributes held at the exact moment
+# decompstatus is set True -- the same moment a real tick could first
+# observe it -- without needing a real second thread.
+# -----------------------------------------------------------------------
+
+
+class _RecordsStateWhenDecompstatusIsSetTrue:
+    """Installed (via monkeypatch) in place of Makera's decompstatus class
+    attribute: a data descriptor, so it intercepts every instance's
+    ``self.decompstatus = ...``. Records decomptime and
+    pending_decompress_callback at the exact moment decompstatus is set
+    True -- the same moment a real concurrent monitorSerial tick could
+    first observe it -- storing them under the instance's own
+    __dict__ rather than relying on __set_name__ (never called by a plain
+    setattr after the class already exists)."""
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self
+        return obj.__dict__.get("_decompstatus", False)
+
+    def __set__(self, obj, value):
+        obj.__dict__["_decompstatus"] = value
+        if value:
+            obj.decomptime_when_flag_was_set = obj.decomptime
+            obj.pending_decompress_callback_when_flag_was_set = obj.pending_decompress_callback
+
+
+def test_decompstatus_is_set_last_in_the_lz_success_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(Makera, "decompstatus", _RecordsStateWhenDecompstatusIsSetTrue())
+    monkeypatch.setattr("carveracontroller.main.Clock.schedule_once", lambda cb, *a, **kw: None)
+    monkeypatch.setattr("carveracontroller.main.App.get_running_app", lambda: None)
+    monkeypatch.setattr("carveracontroller.main.threading.Thread", _ImmediateThread)
+    folder = tmp_path / "jobs"
+    folder.mkdir()
+    job = folder / "job.nc"
+    job.write_bytes(b"G21\nG0 X0\nG0 X1\n" * 50)
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    root = _real_upload_host(tmp_path, cache)
+    callback = MagicMock()
+    before = time.time()
+
+    Makera.uploadLocalFile(root, str(job), callback=callback)
+
+    assert root.uploading_file.endswith(".lz")  # sanity: this is the compressed-upload path
+    # decomptime was not still the class default (0) or some earlier
+    # upload's stale value at the moment decompstatus became True -- it was
+    # already this upload's own, fresh timestamp.
+    assert root.decomptime_when_flag_was_set >= before
+    # pending_decompress_callback was not still unset (or some earlier
+    # upload's stale value) at that same moment either.
+    assert root.pending_decompress_callback_when_flag_was_set is not None
+
+
+# -----------------------------------------------------------------------
+# The ticket's own scenario, end to end through the real upload path: a
+# compressed upload's FILE end flag arrives (the transfer succeeds, so
+# decompstatus and the pending callback for it are set together in
+# _upload_file), and then the link is lost before the machine's own
+# decompart confirmation ever comes back. The callback must never fire for
+# this upload, and nothing stale is left behind for an unrelated later
+# decompress to fire by mistake.
+# -----------------------------------------------------------------------
+
+
+def test_file_end_flag_then_lost_link_leaves_no_stale_callback(tmp_path, monkeypatch):
+    scheduled = []
+    monkeypatch.setattr("carveracontroller.main.Clock.schedule_once", lambda cb, *a, **kw: scheduled.append(cb))
+    monkeypatch.setattr("carveracontroller.main.App.get_running_app", lambda: None)
+    monkeypatch.setattr("carveracontroller.main.threading.Thread", _ImmediateThread)
+    folder = tmp_path / "jobs"
+    folder.mkdir()
+    job = folder / "job.nc"
+    job.write_bytes(b"G21\nG0 X0\nG0 X1\n" * 50)
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    root = _real_upload_host(tmp_path, cache)
+    callback = MagicMock()
+
+    Makera.uploadLocalFile(root, str(job), callback=callback)  # the FILE end flag: the transfer succeeded
+
+    assert root.uploading_file.endswith(".lz")  # sanity: this is the compressed-upload path
+    assert root.decompstatus is True
+    assert root.pending_decompress_callback is not None
+    callback.assert_not_called()  # not yet -- still waiting for the machine's decompart confirmation
+
+    # The link is lost before that confirmation ever arrives.
+    root.controller.stream = None
+    Makera._clear_decompress_wait_on_disconnect(root)
+
+    assert root.decompstatus is False
+    assert root.pending_decompress_callback is None
+    callback.assert_not_called()  # never fired, and nothing left to fire it later with this upload's name
