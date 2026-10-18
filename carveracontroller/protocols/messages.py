@@ -32,6 +32,18 @@ class MessageKind(Enum):
     # The machine's presence check (0x6D); payload is its number and
     # whatever follows it. Answered by the reading thread itself.
     PRESENCE_CHECK = auto()
+    # The machine started serving a download's digest (0xB1) on the
+    # ordinary link, where normally no framed transfer is reading the
+    # wire -- one that owns the wire reads it directly while streamIO is
+    # paused, never through this parser (see protocols/makera.py's
+    # _messages_from_packet). A narrow startup-race exception, where this
+    # can still be a transfer's own digest, is handled in Controller's
+    # _refuse_unsolicited_download, not here. So this is ordinarily a
+    # download nobody is waiting for: already given up on, never
+    # requested, or offered again after a cancel. payload is the raw
+    # advertised digest, kept only for logging. Answered by the reading
+    # thread itself, the same as PRESENCE_CHECK.
+    UNSOLICITED_DOWNLOAD = auto()
 
 
 @dataclass(frozen=True)

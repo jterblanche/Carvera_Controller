@@ -65,7 +65,7 @@ from .protocols.handshake import (
     decode_job_start_event,
     decode_transfer_in_progress_event,
 )
-from .protocols.makera import encode_job_start_ready, encode_presence_reply
+from .protocols.makera import encode_file_cancel, encode_job_start_ready, encode_presence_reply
 from .protocols.relay import decode_transfer_relay, encode_transfer_ended_relay, encode_transfer_started_relay
 from .USBBulkStream import USBBulkStream, is_usb_bulk_address
 from .USBStream import USBStream
@@ -2952,6 +2952,9 @@ class Controller:
         if message.kind == MessageKind.PRESENCE_CHECK:
             self._answer_presence_check(message.payload)
             return
+        if message.kind == MessageKind.UNSOLICITED_DOWNLOAD:
+            self._refuse_unsolicited_download(message.payload)
+            return
 
         text = message.text or ""
         if message.kind == MessageKind.LOAD_CHUNK:
@@ -3272,6 +3275,60 @@ class Controller:
         if len(payload) < 4 or self.stream is None:
             return
         self._send_raw(encode_presence_reply(payload[:4]))
+
+    def _refuse_unsolicited_download(self, payload):
+        """The machine served a download's digest (0xB1) on the ordinary
+        link, where normally no framed transfer is running: one that owns
+        the wire reads it directly while streamIO is paused (see
+        pauseStream and resumeStream), never through this parser. So this
+        frame is ordinarily a download nobody is waiting for -- already
+        given up on, never requested, or offered again after a cancel --
+        and the right answer is the same cancel (FILE_CAN) a framed
+        transfer sends to end itself, at once, so the machine does not
+        keep the link waiting for a reader that will never come.
+
+        ``pauseStream`` sets ``self.paused`` before streamIO is actually
+        guaranteed to have stopped reading (it waits up to a second for
+        that, then proceeds anyway if the wait times out), so there is a
+        narrow window, right as pauseStream starts a transfer, where
+        streamIO can still dispatch one frame it had already started
+        reading before the flag was set. In practice the frame this can
+        catch is exactly the kind this method exists to cancel: the same
+        stale digest from an earlier abandoned or busy-refused request,
+        now served late just as a retry or passive fetch for that same
+        file is starting through pauseStream. Cancelling it there would
+        race that retry instead of leaving it to ask again on its own.
+        ``self.paused``/``self.pausing`` being set is exactly that window,
+        so drop the frame instead while either is set: the same silent
+        drop this parser always did, and harmless, because a transfer
+        waiting on its own MD5 asks again on its own
+        (XMODEM._ask_again_for_download_packet) if nothing reaches it.
+
+        This only covers the window while streamIO owns the read loop. A
+        stale digest that happens to arrive while some other transfer
+        already owns the wire directly never reaches this method at all
+        -- XMODEM reads it there instead, and its own state machine
+        (WAIT_MD5 in recv(), the matching check in send()) only compares
+        it against the file it is expecting, so a mismatch is a retry
+        request, never corruption. That case is out of scope here.
+
+        Called on whichever thread read the frame, the same as
+        _answer_presence_check."""
+        if self.stream is None:
+            return
+        if self.paused or self.pausing:
+            logger.debug(
+                "Dropping a FILE_MD5 that arrived while a transfer is starting (digest=%r); "
+                "not cancelling in case it is this transfer's own.",
+                payload,
+            )
+            return
+        logger.warning(
+            "Refusing an unsolicited download on %s: machine sent FILE_MD5 with no download waiting (digest=%r)",
+            self.connection_type,
+            payload,
+        )
+        self._send_raw(encode_file_cancel())
 
     def _on_client_list(self, payload):
         """A client-list reply (requested on identify, and again on every

@@ -421,6 +421,66 @@ def test_upload_turned_away_as_busy_ends_at_once(machines, controller, tmp_path)
     assert m.frames_of_type(PTYPE_FILE_CAN) == []
 
 
+# -- (d) a download the controller never asked for is refused at once ---------
+
+
+def test_unsolicited_file_md5_is_cancelled_then_a_real_download_still_works(machines, controller, tmp_path):
+    """The machine can serve a download's digest when nothing is waiting
+    for it -- already given up, never asked, or offered again after a
+    cancel (the class of bug behind a firmware fix elsewhere). The
+    controller must refuse it with FILE_CAN at once, and a real download
+    started right after must still complete normally: the cancel must not
+    disturb the link or leave anything in a bad state."""
+    peer = DownloadPeer({})
+    m = _connect(machines, controller, peer)
+    _drain_log(controller)
+
+    stray_digest = hashlib.md5(b"not the file anyone asked for").hexdigest().encode()
+    m.send_frame(build_frame(PTYPE_FILE_MD5, stray_digest))
+
+    assert m.wait_until(lambda: len(m.frames_of_type(PTYPE_FILE_CAN)) == 1, timeout=2.0)
+
+    assert _download(controller, tmp_path) == len(FILE_BYTES)
+    # The genuine download's own end-of-transfer handling never needed a
+    # cancel: still exactly the one FILE_CAN, from the unsolicited frame.
+    assert len(m.frames_of_type(PTYPE_FILE_CAN)) == 1
+
+
+@pytest.mark.parametrize("flag", ["paused", "pausing"])
+def test_unsolicited_download_is_dropped_not_cancelled_during_the_pause_race(machines, controller, flag):
+    """pauseStream sets self.paused (and, until its wait ends,
+    self.pausing) before streamIO is guaranteed to have actually stopped
+    reading, so a FILE_MD5 reaching _refuse_unsolicited_download while
+    either flag is set could be racing the very transfer pauseStream is
+    starting rather than being a stale, abandoned one. It must be dropped,
+    not answered with a cancel -- see the method's own docstring. Calling
+    the method directly, rather than through streamIO, makes the race
+    deterministic: it isolates the flag check from the timing it exists
+    to guard against."""
+    peer = DownloadPeer({})
+    m = _connect(machines, controller, peer)
+    _drain_log(controller)
+    digest = hashlib.md5(b"racing the pause window").hexdigest().encode()
+
+    setattr(controller, flag, True)
+    try:
+        controller._refuse_unsolicited_download(digest)
+    finally:
+        setattr(controller, flag, False)
+    assert m.frames_of_type(PTYPE_FILE_CAN) == []
+
+    # Once neither flag is set, the same digest is refused normally.
+    controller._refuse_unsolicited_download(digest)
+    assert m.wait_until(lambda: len(m.frames_of_type(PTYPE_FILE_CAN)) == 1, timeout=2.0)
+
+
+def test_refuse_unsolicited_download_does_nothing_without_a_stream(controller):
+    """Before a connection exists there is nothing to answer on -- the
+    same guard _answer_presence_check uses. Must not raise."""
+    assert controller.stream is None
+    controller._refuse_unsolicited_download(b"digest")
+
+
 # -- the passive fetch in main.py ----------------------------------------------
 
 
