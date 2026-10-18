@@ -456,10 +456,13 @@ def test_unsolicited_download_is_dropped_not_cancelled_during_the_pause_race(mac
     reading, so a FILE_MD5 reaching _refuse_unsolicited_download while
     either flag is set could be racing the very transfer pauseStream is
     starting rather than being a stale, abandoned one. It must be dropped,
-    not answered with a cancel -- see the method's own docstring. Calling
-    the method directly, rather than through streamIO, makes the race
-    deterministic: it isolates the flag check from the timing it exists
-    to guard against."""
+    not answered with a cancel: dropping keeps the old behaviour for that
+    frame, which is enough if the transfer being started is for the same
+    file (its own re-ask, XMODEM._ask_again_for_download_packet,
+    recovers) -- see the method's own docstring for the case where it is
+    not. Calling the method directly, rather than through streamIO, makes
+    the race deterministic: it isolates the flag check from the timing it
+    exists to guard against."""
     peer = DownloadPeer({})
     m = _connect(machines, controller, peer)
     _drain_log(controller)
@@ -485,7 +488,7 @@ def test_refuse_unsolicited_download_does_nothing_without_a_stream(controller):
 
 
 def test_unsolicited_download_during_busy_tracking_cancels_without_resending_early(machines, controller, monkeypatch):
-    """#330's own shape: the machine's busy reply is already tracking
+    """The shape this guards against: the machine's busy reply is already tracking
     another controller's transfer (peer_transfer_active), with a listing
     command still waiting for its reply, turned away by that same busy
     reply and queued to resend once the tracked transfer ends
@@ -507,11 +510,9 @@ def test_unsolicited_download_during_busy_tracking_cancels_without_resending_ear
     controller's own keep-alive probe (CLIENT_LIST_REQ, due at once once
     the busy reply resets it, Controller.py's _advance_heartbeat) would
     get a normal, non-busy CLIENT_LIST_REPLY back and end the tracking on
-    its own almost immediately -- before this test's own assertions ran,
-    on an earlier draft of this test that used it and checked the wrong
-    frame type as well (the resend is PTYPE_CTRL_MULTI, built by
+    its own almost immediately. (The resend is PTYPE_CTRL_MULTI, built by
     executeCommand -> encode_command; PTYPE_AUTO_COMMAND is a different,
-    unrelated command path). The hook answers every probe with the busy
+    unrelated command path.) The hook answers every probe with the busy
     reply too, until its own end() is called, keeping the tracking alive
     for as long as the real firmware would.
     """
