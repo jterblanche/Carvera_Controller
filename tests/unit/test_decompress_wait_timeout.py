@@ -35,7 +35,12 @@ def _host(*, blocks, decompercent=0, decompercentlast=0, decomptime=0.0):
         decomptime=decomptime,
         decompstatus=True,
         pending_decompress_callback=None,
-        controller=SimpleNamespace(log=SimpleNamespace(put=MagicMock())),
+        # A non-None stream: these tests are about the watchdog timing out
+        # while the link is still up, not about a lost connection (see
+        # test_decompress_wait_link_loss.py for that; _update_decompress_progress
+        # now checks the stream first and would otherwise short-circuit
+        # every one of these into the lost-connection path instead).
+        controller=SimpleNamespace(log=SimpleNamespace(put=MagicMock()), stream=MagicMock()),
         progressUpdate=MagicMock(),
         progressFinish=MagicMock(),
         show_message_popup=MagicMock(),
@@ -43,8 +48,10 @@ def _host(*, blocks, decompercent=0, decompercentlast=0, decomptime=0.0):
     )
     # The real methods (not stubs): _update_decompress_progress calls both
     # of these on self (the zero-block/"changed" branches call
-    # updateCompressProgress; the timeout branch calls _decompress_timed_out).
+    # updateCompressProgress; the timeout branch calls _decompress_timed_out,
+    # which itself calls the shared _end_decompress_wait).
     host.updateCompressProgress = lambda value: Makera.updateCompressProgress(host, value)
+    host._end_decompress_wait = lambda message: Makera._end_decompress_wait(host, message)
     host._decompress_timed_out = lambda: Makera._decompress_timed_out(host)
     return host
 

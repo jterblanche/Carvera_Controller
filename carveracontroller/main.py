@@ -8452,9 +8452,18 @@ class Makera(RelativeLayout):
         self.controller.sendNUM = 0
         if upload_result and callback:  # Only run callback if upload succeeded
             if self.uploading_file.endswith(".lz"):
-                # Schedule callback to run after decompression completes
-                # The callback will be triggered in updateCompressProgress when decompression finishes
-                self.pending_decompress_callback = partial(callback, remotename[:-3], origin_path)
+                # Schedule callback to run after decompression completes.
+                # The callback will be triggered in updateCompressProgress
+                # when decompression finishes. Guarded on self.decompstatus:
+                # a disconnect between setting it True above and reaching
+                # this line (_clear_decompress_wait_on_disconnect runs on
+                # another thread, from updateStatus or a monitorSerial
+                # tick) already ended the wait with no confirmation the
+                # file is usable, so setting a callback for it now would
+                # leave it to fire, unasked, whenever some later decompress
+                # happens to finish.
+                if self.decompstatus:
+                    self.pending_decompress_callback = partial(callback, remotename[:-3], origin_path)
             else:
                 Clock.schedule_once(lambda dt: callback(remotename, local_path), 0)
         # For iOS we display the file list remotely only so we need to refresh it but on main thread
@@ -8705,7 +8714,20 @@ class Makera(RelativeLayout):
         watchdog (DECOMPRESS_TIMEOUT_FLOOR_SEC and
         DECOMPRESS_TIMEOUT_PER_BLOCK_SEC) gives up with a clear message
         instead.
+
+        Checks the connection itself first, every tick, rather than relying
+        only on updateStatus's NOT_CONNECTED handling
+        (_clear_decompress_wait_on_disconnect): doUpload can still be
+        between the transfer finishing and setting self.decompstatus
+        (copying the file locally, verifying firmware's MD5, ...) at the
+        moment the link drops. updateStatus only reacts to that drop once,
+        on the state's edge from Connected to NOT_CONNECTED; if decompstatus
+        becomes True only after that edge has already been handled, nothing
+        would otherwise clear it again until this watchdog's own timeout.
         """
+        if self.controller.stream is None:
+            self._clear_decompress_wait_on_disconnect()
+            return
         if self.fileCompressionBlocks <= 0:
             # Nothing to decompress (the source compressed to zero blocks,
             # e.g. an empty file): there is no firmware reply to wait for,
@@ -8727,6 +8749,22 @@ class Makera(RelativeLayout):
             self._decompress_timed_out()
 
     # --------------------------------------------------------------`---------
+    def _end_decompress_wait(self, message):
+        """End the post-upload decompress wait early, with *message* as the
+        reason: the progress popup dismissed, no pending decompress
+        callback left to fire later on a transfer that never finished, the
+        operator told why. Shared by the watchdog timeout
+        (_decompress_timed_out) and a lost connection
+        (_clear_decompress_wait_on_disconnect); both leave the wait the
+        same way a normal finish would, just without the firmware's own
+        confirmation.
+        """
+        self.decompstatus = False
+        self.pending_decompress_callback = None
+        self.controller.log.put((Controller.MSG_ERROR, message))
+        Clock.schedule_once(self.progressFinish, 0)
+        Clock.schedule_once(partial(self.show_message_popup, message, False), 0)
+
     def _decompress_timed_out(self):
         """No decompress progress arrived within the watchdog's time (see
         _update_decompress_progress): end the upload state honestly -- a
@@ -8734,12 +8772,26 @@ class Makera(RelativeLayout):
         instead of the old fallback of silently treating the wait's end as
         a finished transfer either way.
         """
-        self.decompstatus = False
-        self.pending_decompress_callback = None
-        message = tr._("Decompressing on the machine timed out; the file may not be usable.")
-        self.controller.log.put((Controller.MSG_ERROR, message))
-        Clock.schedule_once(self.progressFinish, 0)
-        Clock.schedule_once(partial(self.show_message_popup, message, False), 0)
+        self._end_decompress_wait(tr._("Decompressing on the machine timed out; the file may not be usable."))
+
+    def _clear_decompress_wait_on_disconnect(self):
+        """A decompress wait belongs to the connection that produced it, the
+        same as the md5-verify wait cleared alongside this call in
+        updateStatus's NOT_CONNECTED handling. Before this, losing the link
+        after a compressed upload's FILE end flag (self.decompstatus set in
+        doUpload) but before the machine's own decompart confirmation left
+        the wait running: _link_busy_for_passive_fetch counts decompstatus
+        as link-busy, so every passive fetch -- including a held start's
+        preparation -- stayed blocked until the watchdog's timeout, up to
+        about 85 minutes for a 20 MiB file at 4 KiB blocks. Ending it here
+        instead means a reconnect goes straight back to fetching, preparing
+        held starts and reporting ready, the same as if nothing had been
+        uploading.
+        """
+        if self.decompstatus:
+            self._end_decompress_wait(
+                tr._("Connection lost while decompressing on the machine; the file may not be usable.")
+            )
 
     # -----------------------------------------------------------------------
     def _open_decompress_progress(self, text, *args):
@@ -8838,6 +8890,9 @@ class Makera(RelativeLayout):
                     # was waiting on is already gone.
                     self._md5_verify_expected_path = None
                     self._md5_verify_event.set()
+                    # Same reasoning for a decompress wait still running: see
+                    # _clear_decompress_wait_on_disconnect.
+                    self._clear_decompress_wait_on_disconnect()
                     app.has_anchor2 = True
                     app.fw_version_digitized = 0
                     app.is_community_firmware = False
