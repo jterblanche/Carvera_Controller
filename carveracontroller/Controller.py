@@ -3308,12 +3308,9 @@ class Controller:
         that, then proceeds anyway if the wait times out), so there is a
         narrow window, right as pauseStream starts a transfer, where
         streamIO can still dispatch one frame it had already started
-        reading before the flag was set. In practice the frame this can
-        catch is exactly the kind this method exists to cancel: the same
-        stale digest from an earlier abandoned or busy-refused request,
-        now served late just as a retry or passive fetch for that same
-        file is starting through pauseStream. Cancelling it there would
-        race that retry instead of leaving it to ask again on its own.
+        reading before the flag was set. A frame dispatched in that
+        window is a stale serve unless the wait timed out, in which case
+        it may be the new transfer's own digest.
         ``self.paused``/``self.pausing`` being set is exactly that window,
         so drop the frame instead while either is set: the same silent
         drop this parser always did. Dropping keeps the old behaviour for
