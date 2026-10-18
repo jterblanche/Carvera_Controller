@@ -105,6 +105,14 @@ def encode_control_release() -> bytes:
     return build_frame(PTYPE_CTRL_RELEASE, b"")
 
 
+def encode_file_cancel() -> bytes:
+    """Build a bare file-transfer cancel (0xB5) frame, empty payload -- the
+    same frame a framed transfer sends to end itself (XMODEM.abort_framed),
+    used here to refuse a download the controller never asked for or no
+    longer wants (see MessageKind.UNSOLICITED_DOWNLOAD)."""
+    return build_frame(PTYPE_FILE_CAN, b"")
+
+
 def encode_relay(payload: bytes) -> bytes:
     """Build a relay (0x67) frame carrying `payload` verbatim -- the machine
     never inspects it, only repeats it to every other identified client
@@ -274,6 +282,20 @@ class MakeraProtocol(CommunicationProtocol):
         # link is genuinely speaking the framed protocol.
         self.frame_confirmed = True
 
+        if parsed.ptype == PTYPE_FILE_MD5:
+            # Reaching this parser at all normally means no framed
+            # transfer owns the wire right now (one that does owns it and
+            # reads it directly while streamIO is paused -- see
+            # Controller.pauseStream/resumeStream and
+            # _dispatch_frames_from_transfer). A narrow startup-race
+            # exception is handled in Controller's own
+            # _refuse_unsolicited_download, not here -- this parser
+            # reports every FILE_MD5 it sees. So this FILE_MD5 is
+            # ordinarily the machine serving a download nobody is waiting
+            # for; say so (UNSOLICITED_DOWNLOAD) instead of the unknown-
+            # file-transfer-type rule below silently swallowing it the way
+            # it used to.
+            return [ParsedMessage(MessageKind.UNSOLICITED_DOWNLOAD, payload=parsed.payload)]
         if parsed.ptype in _FILE_TRANSFER_TYPES:
             return []
 

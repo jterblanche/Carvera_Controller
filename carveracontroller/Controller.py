@@ -65,7 +65,7 @@ from .protocols.handshake import (
     decode_job_start_event,
     decode_transfer_in_progress_event,
 )
-from .protocols.makera import encode_job_start_ready, encode_presence_reply
+from .protocols.makera import encode_file_cancel, encode_job_start_ready, encode_presence_reply
 from .protocols.relay import decode_transfer_relay, encode_transfer_ended_relay, encode_transfer_started_relay
 from .USBBulkStream import USBBulkStream, is_usb_bulk_address
 from .USBStream import USBStream
@@ -2903,6 +2903,25 @@ class Controller:
 
     def _handle_protocol_message(self, message):
         """Dispatch a ParsedMessage from the active communication protocol."""
+        if message.kind == MessageKind.UNSOLICITED_DOWNLOAD:
+            # Handled before _on_peer_transfer_frame, not after: that hook
+            # treats any frame it does not specifically recognise as proof
+            # a tracked peer transfer (another controller's, learned about
+            # from its busy reply) is over, and reacts by resending a
+            # pending load command at once. This digest belongs to a
+            # download the machine is serving to us right now -- the
+            # machine is inside that transfer's own loop, which drops
+            # every non-file frame from its owner (us) until the loop
+            # ends, so a resend sent from here would be lost and wait out
+            # its own timeout for nothing. _refuse_unsolicited_download
+            # cancels the digest either way; only that transfer's proper
+            # end may end the peer-transfer tracking, same as before this
+            # frame produced a message at all. _refresh_heartbeat is set
+            # directly, the same as _on_peer_transfer_frame does for every
+            # frame, since this path no longer reaches it.
+            self._refresh_heartbeat = True
+            self._refuse_unsolicited_download(message.payload)
+            return
         if self._on_peer_transfer_frame(message):
             return
         if message.kind == MessageKind.HELLO_ACK:
@@ -3272,6 +3291,66 @@ class Controller:
         if len(payload) < 4 or self.stream is None:
             return
         self._send_raw(encode_presence_reply(payload[:4]))
+
+    def _refuse_unsolicited_download(self, payload):
+        """The machine served a download's digest (0xB1) on the ordinary
+        link, where normally no framed transfer is running: one that owns
+        the wire reads it directly while streamIO is paused (see
+        pauseStream and resumeStream), never through this parser. So this
+        frame is ordinarily a download nobody is waiting for -- already
+        given up on, never requested, or offered again after a cancel --
+        and the right answer is the same cancel (FILE_CAN) a framed
+        transfer sends to end itself, at once, so the machine does not
+        keep the link waiting for a reader that will never come.
+
+        ``pauseStream`` sets ``self.paused`` before streamIO is actually
+        guaranteed to have stopped reading (it waits up to a second for
+        that, then proceeds anyway if the wait times out), so there is a
+        narrow window, right as pauseStream starts a transfer, where
+        streamIO can still dispatch one frame it had already started
+        reading before the flag was set. A frame dispatched in that
+        window is a stale serve unless the wait timed out, in which case
+        it may be the new transfer's own digest.
+        ``self.paused``/``self.pausing`` being set is exactly that window,
+        so drop the frame instead while either is set: the same silent
+        drop this parser always did. Dropping keeps the old behaviour for
+        that frame. If the transfer being started is the same file, its
+        own re-ask (XMODEM._ask_again_for_download_packet) recovers. If
+        it is a different file or an upload, the stale serve meets it
+        exactly as before this change (see the WAIT_MD5 gap below).
+
+        This method only ever answers a digest while streamIO owns the
+        read loop; a digest that arrives once some other transfer already
+        owns the wire directly never reaches this method at all, either
+        before or after this change -- XMODEM reads it there instead. That
+        is not the same as saying it is safe: XMODEM.recv()'s WAIT_MD5
+        state adopts whatever digest arrives next as the one for the file
+        being received, checked only against the local copy, so a stale
+        digest for a different file arriving there can be accepted and
+        saved under the current transfer's name. send() does not check
+        either, and answers any FILE_MD5 by resending its own digest
+        instead, which can turn a stale serve into an endless FILE_MD5
+        exchange until the user cancels. That gap predates this change
+        and is not fixed by it; this method cannot reach that case to do
+        anything about it either way.
+
+        Called on whichever thread read the frame, the same as
+        _answer_presence_check."""
+        if self.stream is None:
+            return
+        if self.paused or self.pausing:
+            logger.debug(
+                "Dropping a FILE_MD5 that arrived while a transfer is starting (digest=%r); "
+                "not cancelling in case it is this transfer's own.",
+                payload,
+            )
+            return
+        logger.warning(
+            "Refusing an unsolicited download on %s: machine sent FILE_MD5 with no download waiting (digest=%r)",
+            self.connection_type,
+            payload,
+        )
+        self._send_raw(encode_file_cancel())
 
     def _on_client_list(self, payload):
         """A client-list reply (requested on identify, and again on every

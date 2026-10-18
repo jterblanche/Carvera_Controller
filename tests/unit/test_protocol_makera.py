@@ -3,6 +3,8 @@ import pytest
 from carveracontroller.protocols.framing import (
     PTYPE_CLIENT_LIST_REPLY,
     PTYPE_EVENT,
+    PTYPE_FILE_CAN,
+    PTYPE_FILE_DATA,
     PTYPE_FILE_MD5,
     PTYPE_HEARTBEAT,
     PTYPE_HELLO_ACK,
@@ -20,6 +22,7 @@ from carveracontroller.protocols.makera import (
     MakeraProtocol,
     encode_automatic_command,
     encode_client_list_request,
+    encode_file_cancel,
     encode_heartbeat,
     encode_hello,
 )
@@ -145,10 +148,41 @@ def test_feed_byte_at_a_time():
     assert msgs[0].text == "<Run>"
 
 
-def test_file_transfer_frames_ignored_on_control_channel():
+def test_file_transfer_frames_other_than_md5_still_ignored_on_control_channel():
+    """A stray frame from a framed transfer's own range, other than the
+    digest that starts one, reaching the ordinary parser is left alone --
+    only FILE_MD5 (the frame that would start a new download) gets a
+    cancel; see test_unwaited_file_md5_is_reported_for_cancelling below."""
     proto = MakeraProtocol()
-    frame = build_frame(PTYPE_FILE_MD5, b"3bc28b19cfca32e413fd9029000117a3")
+    frame = build_frame(PTYPE_FILE_DATA, (1).to_bytes(4, "big") + b"stray")
     assert proto.feed(frame) == []
+
+
+def test_unwaited_file_md5_is_reported_for_cancelling():
+    """Reaching the ordinary parser at all means no framed transfer owns
+    the wire (one that does reads FILE_MD5 itself, directly, while
+    streamIO is paused), so this is the machine serving a download nobody
+    is waiting for. The parser must say so instead of silently dropping
+    it, as it used to."""
+    proto = MakeraProtocol()
+    digest = b"3bc28b19cfca32e413fd9029000117a3"
+    frame = build_frame(PTYPE_FILE_MD5, digest)
+
+    msgs = proto.feed(frame)
+
+    assert len(msgs) == 1
+    assert msgs[0].kind == MessageKind.UNSOLICITED_DOWNLOAD
+    assert msgs[0].payload == digest
+
+
+def test_encode_file_cancel_is_a_bare_file_can_frame():
+    frame = encode_file_cancel()
+    assert frame[:2] == b"\x86\x68"
+    assert frame[-2:] == b"\x55\xaa"
+    parsed = validate_packet_data(frame[2:-2])
+    assert parsed is not None
+    assert parsed.ptype == PTYPE_FILE_CAN
+    assert parsed.payload == b""
 
 
 def test_frame_confirmed_false_until_a_valid_frame_arrives():
