@@ -3269,6 +3269,11 @@ class Makera(RelativeLayout):
     decompercentlast = 0  # carvera解压压缩文件的块数
     decompstatus = False
     decomptime = 0
+    # Always set alongside decompstatus (see _upload_file), never read
+    # unless decompstatus is also True; this default means updateCompressProgress
+    # can read it once, unconditionally, without an AttributeError on an
+    # instance that has never started a compressed upload.
+    pending_decompress_callback = None
 
     ctl_version = ""
 
@@ -8443,20 +8448,36 @@ class Makera(RelativeLayout):
             # If it is a compressed ''.lz' file, wait for the decompression to complete.
             if self.uploading_file.endswith(".lz"):
                 self.log = logging.getLogger("File.Decompress")
-                self.decompstatus = True
+                # Everything monitorSerial's very next tick could act on,
+                # once it sees decompstatus True, is set here before that
+                # flag, not after -- decompstatus is set last on purpose:
+                # - decomptime: compress_file resets decompercent and
+                #   decompercentlast but not this, so the old order
+                #   (decompstatus first) left a window where a tick could
+                #   see decompstatus True together with a stale decomptime
+                #   (0, the class default, or left over from an earlier
+                #   upload) and fire a false "timed out" error immediately.
+                # - pending_decompress_callback: sets it unconditionally
+                #   (None when there is no callback), so a tick landing in
+                #   that same window can never see decompstatus True with
+                #   no callback assigned yet, decide there is nothing to
+                #   clear, and then have this thread overwrite that later
+                #   with a callback for a wait that had already ended --
+                #   stale, naming this upload's file, left to fire whenever
+                #   some unrelated later decompress happens to finish.
+                self.pending_decompress_callback = partial(callback, remotename[:-3], origin_path) if callback else None
                 self.decomptime = time.time()
+                self.decompstatus = True
                 Clock.schedule_once(
                     partial(self._open_decompress_progress, tr._("Decompressing") + "\n%s" % displayname), 0.2
                 )
 
         self.controller.sendNUM = 0
-        if upload_result and callback:  # Only run callback if upload succeeded
-            if self.uploading_file.endswith(".lz"):
-                # Schedule callback to run after decompression completes
-                # The callback will be triggered in updateCompressProgress when decompression finishes
-                self.pending_decompress_callback = partial(callback, remotename[:-3], origin_path)
-            else:
-                Clock.schedule_once(lambda dt: callback(remotename, local_path), 0)
+        if upload_result and callback and not self.uploading_file.endswith(".lz"):
+            # Only run callback if upload succeeded; a .lz upload's callback
+            # was already set above, to run once decompression completes
+            # (see updateCompressProgress) rather than now.
+            Clock.schedule_once(lambda dt: callback(remotename, local_path), 0)
         # For iOS we display the file list remotely only so we need to refresh it but on main thread
         if upload_result and not firmware and not self.uploading_file.endswith(".lz"):
             Clock.schedule_once(self.file_popup.refresh_machine, 0)
@@ -8705,7 +8726,20 @@ class Makera(RelativeLayout):
         watchdog (DECOMPRESS_TIMEOUT_FLOOR_SEC and
         DECOMPRESS_TIMEOUT_PER_BLOCK_SEC) gives up with a clear message
         instead.
+
+        Checks the connection itself first, every tick, rather than relying
+        only on updateStatus's NOT_CONNECTED handling
+        (_clear_decompress_wait_on_disconnect): doUpload can still be
+        between the transfer finishing and setting self.decompstatus
+        (copying the uploaded file and its original locally) at the
+        moment the link drops. updateStatus only reacts to that drop once,
+        on the state's edge from Connected to NOT_CONNECTED; if decompstatus
+        becomes True only after that edge has already been handled, nothing
+        would otherwise clear it again until this watchdog's own timeout.
         """
+        if self.controller.stream is None:
+            self._clear_decompress_wait_on_disconnect()
+            return
         if self.fileCompressionBlocks <= 0:
             # Nothing to decompress (the source compressed to zero blocks,
             # e.g. an empty file): there is no firmware reply to wait for,
@@ -8727,6 +8761,22 @@ class Makera(RelativeLayout):
             self._decompress_timed_out()
 
     # --------------------------------------------------------------`---------
+    def _end_decompress_wait(self, message):
+        """End the post-upload decompress wait early, with *message* as the
+        reason: the progress popup dismissed, no pending decompress
+        callback left to fire later on a transfer that never finished, the
+        operator told why. Shared by the watchdog timeout
+        (_decompress_timed_out) and a lost connection
+        (_clear_decompress_wait_on_disconnect); both leave the wait the
+        same way a normal finish would, just without the firmware's own
+        confirmation.
+        """
+        self.decompstatus = False
+        self.pending_decompress_callback = None
+        self.controller.log.put((Controller.MSG_ERROR, message))
+        Clock.schedule_once(self.progressFinish, 0)
+        Clock.schedule_once(partial(self.show_message_popup, message, False), 0)
+
     def _decompress_timed_out(self):
         """No decompress progress arrived within the watchdog's time (see
         _update_decompress_progress): end the upload state honestly -- a
@@ -8734,12 +8784,26 @@ class Makera(RelativeLayout):
         instead of the old fallback of silently treating the wait's end as
         a finished transfer either way.
         """
-        self.decompstatus = False
-        self.pending_decompress_callback = None
-        message = tr._("Decompressing on the machine timed out; the file may not be usable.")
-        self.controller.log.put((Controller.MSG_ERROR, message))
-        Clock.schedule_once(self.progressFinish, 0)
-        Clock.schedule_once(partial(self.show_message_popup, message, False), 0)
+        self._end_decompress_wait(tr._("Decompressing on the machine timed out; the file may not be usable."))
+
+    def _clear_decompress_wait_on_disconnect(self):
+        """A decompress wait belongs to the connection that produced it, the
+        same as the md5-verify wait cleared alongside this call in
+        updateStatus's NOT_CONNECTED handling. Before this, losing the link
+        after a compressed upload's FILE end flag (self.decompstatus set in
+        doUpload) but before the machine's own decompart confirmation left
+        the wait running: _link_busy_for_passive_fetch counts decompstatus
+        as link-busy, so every passive fetch -- including a held start's
+        preparation -- stayed blocked until the watchdog's timeout, up to
+        about 85 minutes for a 20 MiB file at 4 KiB blocks. Ending it here
+        instead means a reconnect goes straight back to fetching, preparing
+        held starts and reporting ready, the same as if nothing had been
+        uploading.
+        """
+        if self.decompstatus:
+            self._end_decompress_wait(
+                tr._("Connection lost while decompressing on the machine; the file may not be usable.")
+            )
 
     # -----------------------------------------------------------------------
     def _open_decompress_progress(self, text, *args):
@@ -8774,11 +8838,16 @@ class Makera(RelativeLayout):
             Clock.schedule_once(self.progressFinish, 0)
             # Refresh the remote dir since upload finished
             Clock.schedule_once(self.file_popup.refresh_machine, 0)
-            # Call pending callback after decompression completes (for .lz files)
-            if hasattr(self, "pending_decompress_callback") and self.pending_decompress_callback:
-                # Capture callback before clearing it
-                callback = self.pending_decompress_callback
-                self.pending_decompress_callback = None
+            # Call pending callback after decompression completes (for .lz
+            # files). Read once into a local, then clear, then check that
+            # local -- not check-then-read: _end_decompress_wait can clear
+            # this same attribute from another thread (a disconnect, or the
+            # watchdog timeout) between a check here and a second read of
+            # it, which would otherwise leave `callback` as None while
+            # still scheduling a call to it.
+            callback = self.pending_decompress_callback
+            self.pending_decompress_callback = None
+            if callback:
                 # Schedule callback with a short delay to ensure decompression is fully complete
                 Clock.schedule_once(lambda dt: callback(), 0.1)
 
@@ -8838,6 +8907,9 @@ class Makera(RelativeLayout):
                     # was waiting on is already gone.
                     self._md5_verify_expected_path = None
                     self._md5_verify_event.set()
+                    # Same reasoning for a decompress wait still running: see
+                    # _clear_decompress_wait_on_disconnect.
+                    self._clear_decompress_wait_on_disconnect()
                     app.has_anchor2 = True
                     app.fw_version_digitized = 0
                     app.is_community_firmware = False
