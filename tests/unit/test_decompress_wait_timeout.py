@@ -35,7 +35,12 @@ def _host(*, blocks, decompercent=0, decompercentlast=0, decomptime=0.0):
         decomptime=decomptime,
         decompstatus=True,
         pending_decompress_callback=None,
-        controller=SimpleNamespace(log=SimpleNamespace(put=MagicMock())),
+        # A non-None stream: these tests are about the watchdog timing out
+        # while the link is still up, not about a lost connection (see
+        # test_decompress_wait_link_loss.py for that; _update_decompress_progress
+        # now checks the stream first and would otherwise short-circuit
+        # every one of these into the lost-connection path instead).
+        controller=SimpleNamespace(log=SimpleNamespace(put=MagicMock()), stream=MagicMock()),
         progressUpdate=MagicMock(),
         progressFinish=MagicMock(),
         show_message_popup=MagicMock(),
@@ -43,8 +48,10 @@ def _host(*, blocks, decompercent=0, decompercentlast=0, decomptime=0.0):
     )
     # The real methods (not stubs): _update_decompress_progress calls both
     # of these on self (the zero-block/"changed" branches call
-    # updateCompressProgress; the timeout branch calls _decompress_timed_out).
+    # updateCompressProgress; the timeout branch calls _decompress_timed_out,
+    # which itself calls the shared _end_decompress_wait).
     host.updateCompressProgress = lambda value: Makera.updateCompressProgress(host, value)
+    host._end_decompress_wait = lambda message: Makera._end_decompress_wait(host, message)
     host._decompress_timed_out = lambda: Makera._decompress_timed_out(host)
     return host
 
@@ -184,3 +191,45 @@ def test_update_compress_progress_zero_blocks_does_not_raise(monkeypatch):
 
     assert host.decompstatus is False
     host.progressUpdate.assert_called_once_with(100.0, "", True, 0)
+
+
+# -----------------------------------------------------------------------
+# A second race the decompress-wait-survives-link-loss fix must not
+# introduce: updateCompressProgress used to check pending_decompress_callback
+# truthy, then read the same attribute again to use it. _end_decompress_wait
+# -- now reachable from another thread, via either disconnect path in
+# test_decompress_wait_link_loss.py -- can clear that attribute in between,
+# so the second read sees None while the first read's truthy check already
+# committed to calling it: `lambda dt: callback()` then calls None().
+# -----------------------------------------------------------------------
+
+
+class _ClearsPendingCallbackWhenChecked:
+    """A stand-in decompress callback that clears
+    host.pending_decompress_callback as a side effect of being checked for
+    truthiness -- reproducing, on one thread and deterministically, what a
+    second thread's _end_decompress_wait does to the same attribute between
+    a check-then-read of it."""
+
+    def __init__(self, host):
+        self._host = host
+        self.called = False
+
+    def __bool__(self):
+        self._host.pending_decompress_callback = None
+        return True
+
+    def __call__(self):
+        self.called = True
+
+
+def test_update_compress_progress_survives_the_callback_being_cleared_mid_check(monkeypatch):
+    _run_scheduled_immediately(monkeypatch)
+    host = _host(blocks=2)
+    stand_in = _ClearsPendingCallbackWhenChecked(host)
+    host.pending_decompress_callback = stand_in
+
+    Makera.updateCompressProgress(host, host.fileCompressionBlocks)  # must not raise
+
+    assert stand_in.called is True
+    assert host.pending_decompress_callback is None
