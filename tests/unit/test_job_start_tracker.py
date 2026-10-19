@@ -140,6 +140,36 @@ def test_a_hold_is_never_stale_while_a_transfer_runs():
     assert t.stale(late, transfer_running=False)
 
 
+def test_the_wait_runs_out_in_a_transfer_only_while_one_runs():
+    """The machine cannot announce the timed-out phase during a transfer,
+    so the starter's controller works out that the limit has passed."""
+    t = JobStartTracker(own_id=STARTER)
+    t.on_event(_event(seconds_left=30), now=0.0)
+    assert not t.ran_out_in_transfer(29.0, transfer_running=True)
+    assert not t.ran_out_in_transfer(31.0, transfer_running=False)
+    assert t.ran_out_in_transfer(30.0, transfer_running=True)
+    assert t.ran_out_in_transfer(500.0, transfer_running=True)
+    assert t.held and not t.timed_out
+
+
+def test_keep_waiting_counts_the_whole_limit_again():
+    t = JobStartTracker(own_id=STARTER)
+    t.on_event(_event(seconds_left=30), now=0.0)
+    t.on_event(_event(seconds_left=12), now=18.0)
+    t.keep_waiting_locally(40.0)
+    assert t.seconds_left(40.0) == 30
+    assert not t.ran_out_in_transfer(69.0, transfer_running=True)
+    assert t.ran_out_in_transfer(70.0, transfer_running=True)
+
+
+def test_a_new_start_forgets_the_old_limit():
+    t = JobStartTracker(own_id=STARTER)
+    t.on_event(_event(start_id=7, seconds_left=30), now=0.0)
+    t.on_event(_event(start_id=8, seconds_left=10), now=50.0)
+    t.keep_waiting_locally(60.0)
+    assert t.seconds_left(60.0) == 10
+
+
 def test_a_failed_attempt_is_retried_after_a_backoff():
     t = JobStartTracker(own_id=ME)
     t.on_event(_event(), now=0.0)

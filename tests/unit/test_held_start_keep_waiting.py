@@ -362,3 +362,91 @@ def test_list_label_is_the_drop_down_row_without_its_marks():
     assert list_label(usb, entries) == "Workshop PC (USB)"
     assert list_label(a, entries) == "Laptop (WiFi - 192.168.1.20)"
     assert list_label(a, (usb, a)) == "Laptop (WiFi)"
+
+
+# -- the wait runs out while another controller's file transfer runs -------------
+
+
+def _transfer_host(tmp_path, monkeypatch, own_id=PC, **kw):
+    clock = [100.0]
+    monkeypatch.setattr("carveracontroller.main.time.monotonic", lambda: clock[0])
+    _PopupWithButtons.made = []
+    monkeypatch.setattr("carveracontroller.main.JobStartPopup", _PopupWithButtons)
+    root = _host(tmp_path, own_id=own_id, has_control=own_id == PC, **kw)
+    root._job_start_popup = None
+    root.controller.peer_transfer_active = True
+    Makera.on_job_start_event(root, _event(not_ready=(DEMO,), seconds_left=30))
+    return root, clock, _PopupWithButtons.made[0]
+
+
+def test_the_starter_is_offered_the_choice_when_the_wait_runs_out_in_a_transfer(tmp_path, app, monkeypatch):
+    root, clock, popup = _transfer_host(tmp_path, monkeypatch)
+    clock[0] += 10
+    Makera._tick_job_start_countdown(root)
+    assert "will start in 20 s" in popup.texts[-1]
+
+    clock[0] += 20
+    Makera._tick_job_start_countdown(root)
+    assert "ran out" in popup.texts[-1]
+    assert "Demo" in popup.texts[-1]
+    assert popup.keep_waitings[-1] is True
+    assert popup.buttons[-1] is True
+    assert root._job_start.held
+
+    clock[0] += 300
+    Makera._tick_job_start_countdown(root)
+    assert root._job_start.held
+    assert "ran out" in popup.texts[-1]
+
+
+def test_a_watcher_is_not_offered_the_choice_in_a_transfer(tmp_path, app, monkeypatch):
+    root, clock, popup = _transfer_host(tmp_path, monkeypatch, own_id=THIRD)
+    clock[0] += 40
+    Makera._tick_job_start_countdown(root)
+    assert "ran out" not in popup.texts[-1]
+    assert root._job_start.held
+
+
+def test_keep_waiting_in_a_transfer_restarts_the_countdown_and_is_sent(tmp_path, app, monkeypatch):
+    root, clock, popup = _transfer_host(tmp_path, monkeypatch)
+    clock[0] += 35
+    Makera._tick_job_start_countdown(root)
+    popup.on_keep_waiting()
+    root.controller.keepWaitingCommand.assert_called_once_with()
+    assert "will start in 30 s" in popup.texts[-1]
+
+    clock[0] += 31
+    Makera._tick_job_start_countdown(root)
+    assert "ran out" in popup.texts[-1]
+
+
+def test_start_now_in_a_transfer_is_sent_when_the_transfer_ends(tmp_path, app, monkeypatch):
+    root, clock, popup = _transfer_host(tmp_path, monkeypatch)
+    clock[0] += 35
+    Makera._tick_job_start_countdown(root)
+    popup.on_start_now()
+    root.controller.startNowCommand.assert_not_called()
+    assert "waiting for the file transfer" in popup.texts[-1]
+
+    clock[0] += 5
+    Makera._tick_job_start_countdown(root)
+    root.controller.startNowCommand.assert_not_called()
+
+    root.controller.peer_transfer_active = False
+    Makera._tick_job_start_countdown(root)
+    root.controller.startNowCommand.assert_called_once_with()
+    Makera._tick_job_start_countdown(root)
+    root.controller.startNowCommand.assert_called_once_with()
+
+
+def test_a_queued_start_now_is_dropped_when_the_job_starts_by_itself(tmp_path, app, monkeypatch):
+    root, clock, popup = _transfer_host(tmp_path, monkeypatch)
+    clock[0] += 35
+    Makera._tick_job_start_countdown(root)
+    popup.on_start_now()
+    Makera.on_job_start_event(
+        root, _event(phase=JOB_START_STARTING, reason=JOB_START_REASON_ALL_READY, seconds_left=0, not_ready=())
+    )
+    root.controller.peer_transfer_active = False
+    Makera._tick_job_start_countdown(root)
+    root.controller.startNowCommand.assert_not_called()

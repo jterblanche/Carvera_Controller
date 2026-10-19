@@ -3364,6 +3364,7 @@ class Makera(RelativeLayout):
         self._job_start = JobStartTracker(own_id=self.identity.id)
         self._job_start_popup = None
         self._job_start_clock = None
+        self._start_now_queued = False
         # The path of a held start's file whose download or drawing was
         # still under way when the job started (see on_job_start_event).
         self._job_start_late = None
@@ -7306,9 +7307,9 @@ class Makera(RelativeLayout):
             return
         if self._job_start_popup is None:
             self._job_start_popup = JobStartPopup(
-                on_start_now=self.controller.startNowCommand,
+                on_start_now=self._job_start_now,
                 on_cancel=self.controller.abortCommand,
-                on_keep_waiting=self.controller.keepWaitingCommand,
+                on_keep_waiting=self._job_keep_waiting,
             )
         is_starter = self._job_start.is_starter
         can_cancel = self._may_cancel_held_start()
@@ -7320,11 +7321,17 @@ class Makera(RelativeLayout):
                 self._job_start_clock = Clock.schedule_interval(self._tick_job_start_countdown, 1.0)
             return
         waiting = [i for i in event.not_ready_ids if i != self.identity.id]
-        if self._job_start.timed_out:
+        supports_keep_waiting = bool(self.controller.machine_supports_keep_waiting)
+        ran_out_in_transfer = (
+            is_starter
+            and supports_keep_waiting
+            and self._job_start.ran_out_in_transfer(time.monotonic(), self._job_start_transfer_running())
+        )
+        if self._job_start.timed_out or ran_out_in_transfer:
             # Keep waiting only where the machine accepts keep-waiting; a
             # machine without it never sends this phase. Controllers are
             # named by their labels in the connected-controllers list.
-            keep_waiting = is_starter and bool(self.controller.machine_supports_keep_waiting)
+            keep_waiting = is_starter and supports_keep_waiting
             labels = self._client_labels(waiting)
             if self.identity.id in event.not_ready_ids:
                 labels.insert(0, tr._("this controller"))
@@ -7337,6 +7344,7 @@ class Makera(RelativeLayout):
                     can_cancel,
                     keep_waiting=keep_waiting,
                     starter_name=self._client_labels([event.starter_id])[0] if starter_known else None,
+                    start_now_queued=self._start_now_queued,
                 ),
                 show_start_now=is_starter,
                 show_cancel=can_cancel,
@@ -7356,6 +7364,28 @@ class Makera(RelativeLayout):
         )
         if self._job_start_clock is None:
             self._job_start_clock = Clock.schedule_interval(self._tick_job_start_countdown, 1.0)
+
+    def _job_start_transfer_running(self):
+        """True while a file transfer keeps the machine's main loop busy:
+        it sends no job-start event and takes only a few commands."""
+        return bool(self._auto_fetch_in_progress or getattr(self.controller, "peer_transfer_active", False))
+
+    def _job_start_now(self):
+        """Start now. The machine refuses it while a file transfer runs, so
+        then it is kept and sent once the transfer has ended."""
+        if self._job_start_transfer_running():
+            self._start_now_queued = True
+            self._show_job_start_countdown()
+            return
+        self.controller.startNowCommand()
+
+    def _job_keep_waiting(self):
+        """Keep waiting: the machine takes it during a transfer too and
+        counts the whole limit again once the transfer ends."""
+        self._job_start.keep_waiting_locally(time.monotonic())
+        self._start_now_queued = False
+        self.controller.keepWaitingCommand()
+        self._show_job_start_countdown()
 
     def _client_labels(self, client_ids):
         """The connected-controllers list's label for each of `client_ids`
@@ -7388,7 +7418,12 @@ class Makera(RelativeLayout):
         the hold's end was never heard of."""
         # The machine sends no event while a file transfer runs, and a start
         # held after its wait ran out has no limit to count to.
-        transfer_running = self._auto_fetch_in_progress or bool(getattr(self.controller, "peer_transfer_active", False))
+        transfer_running = self._job_start_transfer_running()
+        if self._start_now_queued and (not self._job_start.held or self._machine_reports_playing()):
+            self._start_now_queued = False
+        elif self._start_now_queued and not transfer_running:
+            self._start_now_queued = False
+            self.controller.startNowCommand()
         if self._job_start.held and (
             self._machine_reports_playing() or self._job_start.stale(time.monotonic(), transfer_running)
         ):

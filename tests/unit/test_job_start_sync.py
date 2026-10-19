@@ -162,6 +162,7 @@ def _host(tmp_path, own_id=DEMO, has_control=False, multi_user=True, holder=PC, 
     root._job_start = JobStartTracker(own_id=own_id)
     root._job_start_popup = _FakePopup()
     root._job_start_clock = None
+    root._start_now_queued = False
     root.controller = SimpleNamespace(
         has_control=has_control,
         multi_user_mode=multi_user,

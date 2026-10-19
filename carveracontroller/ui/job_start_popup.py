@@ -87,6 +87,7 @@ def timed_out_text(
     can_cancel: bool = False,
     keep_waiting: bool = False,
     starter_name: str | None = None,
+    start_now_queued: bool = False,
 ) -> str:
     """The text once the wait has run out and the start is held for the
     starting controller's choice: which file, that it has not started,
@@ -107,6 +108,8 @@ def timed_out_text(
         lines.append(
             tr._("Until you choose, the job stays held. It starts by itself once every controller has synced.")
         )
+        if start_now_queued:
+            lines.append(tr._("Start now is waiting for the file transfer to end, then the job starts."))
         return "\n\n".join(lines)
     if is_starter:
         lines.append(_buttons_line(True, True))
