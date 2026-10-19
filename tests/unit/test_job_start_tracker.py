@@ -130,6 +130,16 @@ def test_a_hold_whose_end_was_lost_goes_stale():
     assert not JobStartTracker(own_id=ME).stale(1000.0)
 
 
+def test_a_hold_is_never_stale_while_a_transfer_runs():
+    """The machine sends no events during a peer's file transfer, so the
+    hold stays (with its Start now and Cancel) until the transfer ends."""
+    t = JobStartTracker(own_id=ME)
+    t.on_event(_event(seconds_left=30), now=0.0)
+    late = 30.0 + STALE_AFTER_LIMIT_S + 100
+    assert not t.stale(late, transfer_running=True)
+    assert t.stale(late, transfer_running=False)
+
+
 def test_a_failed_attempt_is_retried_after_a_backoff():
     t = JobStartTracker(own_id=ME)
     t.on_event(_event(), now=0.0)

@@ -232,13 +232,13 @@ class JobStartTracker:
         """True when a held start has had no event for well past its limit,
         so its "starting" or "cancelled" event was lost. A start held after
         its wait ran out has no limit: it is stale when its once-a-second
-        events have stopped for STALE_AFTER_LIMIT_S, and never while
-        `transfer_running` (the machine sends no events during a file
-        transfer)."""
-        if self._event is None:
+        events have stopped for STALE_AFTER_LIMIT_S. Never stale while
+        `transfer_running`: the machine sends no events during a file
+        transfer, and the hold may outlast its limit until it ends."""
+        if self._event is None or transfer_running:
             return False
         if self._event.phase == JOB_START_TIMED_OUT:
-            return not transfer_running and now > self._last_event_at + STALE_AFTER_LIMIT_S
+            return now > self._last_event_at + STALE_AFTER_LIMIT_S
         return now > self._deadline + STALE_AFTER_LIMIT_S
 
     def clear(self) -> None:
