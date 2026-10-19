@@ -112,6 +112,7 @@ class JobStartTracker:
     _event: JobStartEvent | None = field(default=None, init=False, repr=False)
     _deadline: float = field(default=0.0, init=False, repr=False)
     _last_event_at: float = field(default=0.0, init=False, repr=False)
+    _limit_s: int = field(default=0, init=False, repr=False)
     _preparing_for: int = field(default=0, init=False, repr=False)
     _ready_for: int = field(default=0, init=False, repr=False)
     _failures: int = field(default=0, init=False, repr=False)
@@ -163,7 +164,10 @@ class JobStartTracker:
             self._ready_for = 0
             self._failures = 0
             self._retry_after = 0.0
+            self._limit_s = 0
         self._event = event
+        if event.phase == JOB_START_WAITING:
+            self._limit_s = max(self._limit_s, event.seconds_left)
         self._deadline = now + event.seconds_left
         self._last_event_at = now
         if event.phase == JOB_START_HASHING:
@@ -228,6 +232,25 @@ class JobStartTracker:
             return 0
         return max(0, math.ceil(self._deadline - now))
 
+    def ran_out_in_transfer(self, now: float, transfer_running: bool) -> bool:
+        """True when the machine's limit has run out on this controller's
+        clock while a file transfer runs. The machine's main loop is stopped
+        by the transfer, so it cannot announce the timed-out phase; the
+        start is held all the same (it only starts or holds after the
+        transfer ends), so the starter is shown the held prompt now."""
+        return (
+            transfer_running
+            and self._event is not None
+            and self._event.phase == JOB_START_WAITING
+            and now >= self._deadline
+        )
+
+    def keep_waiting_locally(self, now: float) -> None:
+        """The starter chose Keep waiting: count the whole limit again from
+        `now`, as the machine does once it takes the command."""
+        if self._event is not None and self._limit_s:
+            self._deadline = now + self._limit_s
+
     def stale(self, now: float, transfer_running: bool = False) -> bool:
         """True when a held start has had no event for well past its limit,
         so its "starting" or "cancelled" event was lost. A start held after
@@ -247,6 +270,7 @@ class JobStartTracker:
         self._event = None
         self._deadline = 0.0
         self._last_event_at = 0.0
+        self._limit_s = 0
         self._preparing_for = 0
         self._ready_for = 0
         self._failures = 0
