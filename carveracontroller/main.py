@@ -7098,7 +7098,7 @@ class Makera(RelativeLayout):
         def load():
             ok = True
             try:
-                self.load_gcode_file(local_path)
+                self.load_gcode_file(local_path, quiet_notice=True)
             except Exception:
                 logger.exception("Could not draw %s", local_path)
                 ok = False
@@ -11069,7 +11069,9 @@ class Makera(RelativeLayout):
         """The file loaded without its toolpath (load_gcode_file found it
         too large for the memory free): features that need the toolpath
         are off, as for a file that cannot be visualised, and the user is
-        told why. ``skipped`` is (points needed, budget)."""
+        told why: by a popup when the operator chose the file, only in the
+        console when the machine's job or another controller did (a popup
+        would block a watcher's screen). ``skipped`` is (points needed, budget)."""
         points, budget = skipped
         self.gcode_cannot_visualise = True
         logger.warning(
@@ -11083,7 +11085,8 @@ class Makera(RelativeLayout):
             "The file is loaded and can still be run."
         )
         self.controller.log.put((Controller.MSG_NORMAL, message))
-        self.show_message_popup(message, False)
+        if not getattr(self, "_quiet_toolpath_notice", False):
+            self.show_message_popup(message, False)
 
     # ------------------------------------------------------------------------
     def load_end(self, *args):
@@ -11264,8 +11267,10 @@ class Makera(RelativeLayout):
         return self._replace_file(filepath, fill)
 
     # -----------------------------------------------------------------------
-    def load_gcode_file(self, filepath):
+    def load_gcode_file(self, filepath, quiet_notice=False):
         # Every file drawn here is a local copy the machine may later play.
+        # quiet_notice: the machine, not the operator, chose this file.
+        self._quiet_toolpath_notice = quiet_notice
         self._local_copies.remember(filepath)
         self._job_without_toolpath = None
         # (points needed so far, budget) once the toolpath is found too
