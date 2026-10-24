@@ -4310,7 +4310,7 @@ class Makera(RelativeLayout):
             self.file_just_loaded = False
             return
 
-        if time.time() - self.heartbeat_time > HEARTBEAT_TIMEOUT and self.controller.stream:
+        if time.time() - self.heartbeat_time > self._heartbeat_limit() and self.controller.stream:
             logger.error("Connection to machine lost")
             # Check reconnection configuration (only if not a manual disconnect and not already reconnecting)
             if not self.controller._manual_disconnect and not self.reconnection_popup._is_open:
@@ -4338,6 +4338,12 @@ class Makera(RelativeLayout):
             self.controller.close()
             self.status_drop_down.set_connected_controllers(())
             self.updateStatus()
+
+    # -----------------------------------------------------------------------
+    def _heartbeat_limit(self):
+        """Seconds without a status reply before the link is called lost:
+        longer on WiFi, whose stalls of 4-5 s are normal, than on USB."""
+        return WIFI_HEARTBEAT_TIMEOUT if self.controller.connection_type == CONN_WIFI else HEARTBEAT_TIMEOUT
 
     # -----------------------------------------------------------------------
     def _handle_version_reply(self, line):
@@ -11932,6 +11938,7 @@ def load_constants():
     global SHORT_LOAD_TIMEOUT
     global WIFI_LOAD_TIMEOUT
     global HEARTBEAT_TIMEOUT
+    global WIFI_HEARTBEAT_TIMEOUT
     global MAX_TOUCH_INTERVAL
     global GCODE_VIEW_SPEED
     global LOAD_INTERVAL
@@ -11942,6 +11949,8 @@ def load_constants():
     SHORT_LOAD_TIMEOUT = 3  # s
     WIFI_LOAD_TIMEOUT = 30  # s
     HEARTBEAT_TIMEOUT = 5
+    # The machine's WiFi stalls for 4-5 s every 10-20 minutes; 5 s dropped the link on each.
+    WIFI_HEARTBEAT_TIMEOUT = 10
     MAX_TOUCH_INTERVAL = 0.15
     GCODE_VIEW_SPEED = 1
 

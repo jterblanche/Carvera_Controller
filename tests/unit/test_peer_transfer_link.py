@@ -84,8 +84,10 @@ def _notice_frame(payload):
     return build_frame(PTYPE_RELAY, PEER_ID + payload)
 
 
-# main.py's main() sets this global; tests that never run main() set it too.
-HEARTBEAT_TIMEOUT = 5
+# main.py's load_constants() sets these globals; tests that never call it set
+# them too. These tests run on WiFi, so HEARTBEAT_TIMEOUT here is the WiFi limit.
+USB_HEARTBEAT_TIMEOUT = 5
+HEARTBEAT_TIMEOUT = 10
 # blink_state runs every half second (Clock.schedule_interval in main.py).
 BLINK_PERIOD_S = 0.5
 TICK_S = 0.05
@@ -189,7 +191,8 @@ def clock(monkeypatch):
     # are replaced, so nothing else in the process sees the fake clock.
     monkeypatch.setattr(main_module, "time", _ClockedTime(c))
     monkeypatch.setattr(controller_module, "time", _ClockedTime(c))
-    monkeypatch.setattr(main_module, "HEARTBEAT_TIMEOUT", HEARTBEAT_TIMEOUT, raising=False)
+    monkeypatch.setattr(main_module, "HEARTBEAT_TIMEOUT", USB_HEARTBEAT_TIMEOUT, raising=False)
+    monkeypatch.setattr(main_module, "WIFI_HEARTBEAT_TIMEOUT", HEARTBEAT_TIMEOUT, raising=False)
     monkeypatch.setattr(main_module.App, "get_running_app", lambda: None)
     return c
 
@@ -942,3 +945,14 @@ def test_waiting_popup_names_the_download_or_upload(run_clock_now, direction, wo
     root.controller.peer_transfer_direction = direction
     assert root._hold_for_passive_fetch(MagicMock()) is True
     assert words in root.progressStart.call_args[0][0]
+
+
+def test_wifi_waits_longer_than_usb_before_calling_the_link_lost():
+    """The machine's WiFi stalls for 4-5 s now and then; USB keeps 5 s."""
+    from carveracontroller.Controller import CONN_USB, CONN_WIFI
+
+    root = main_module.Makera.__new__(main_module.Makera)
+    root.controller = SimpleNamespace(connection_type=CONN_WIFI)
+    assert root._heartbeat_limit() == main_module.WIFI_HEARTBEAT_TIMEOUT == 10
+    root.controller.connection_type = CONN_USB
+    assert root._heartbeat_limit() == main_module.HEARTBEAT_TIMEOUT == 5
