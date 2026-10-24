@@ -177,7 +177,7 @@ def test_worker_thread_never_touches_kivy_properties_inline(monkeypatch, tmp_pat
         if len(scheduled) == 2:
             break
         threading.Event().wait(0.05)
-    root.load_gcode_file.assert_called_once_with(os.path.join(str(tmp_path), "job.nc"))
+    root.load_gcode_file.assert_called_once_with(os.path.join(str(tmp_path), "job.nc"), quiet_notice=True)
     assert root._auto_fetch_in_progress is True  # until the drawing is done
     scheduled[1](0)
     assert root._auto_fetch_in_progress is False

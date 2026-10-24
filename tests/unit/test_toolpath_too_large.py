@@ -113,3 +113,21 @@ def test_load_end_tells_the_user_and_turns_off_toolpath_features(monkeypatch):
     assert root.gcode_cannot_visualise is True
     assert len(shown) == 1 and "too large to draw" in shown[0] and "can still be run" in shown[0]
     assert logged and logged[0][1] == shown[0]
+
+
+def test_notice_for_a_file_the_machine_chose_is_console_only(monkeypatch):
+    shown = []
+    logged = []
+    root = main_module.Makera.__new__(main_module.Makera)
+    root.show_message_popup = lambda message, disabled: shown.append(message)
+    root.controller = type("C", (), {"log": type("L", (), {"put": staticmethod(logged.append)})()})()
+    root._quiet_toolpath_notice = True
+    monkeypatch.setattr(
+        "carveracontroller.main.App.get_running_app", lambda: type("A", (), {"selected_local_filename": "big.nc"})()
+    )
+
+    root._show_toolpath_skipped((2_000_001, 2_000_000))
+
+    assert shown == []
+    assert root.gcode_cannot_visualise is True
+    assert len(logged) == 1 and "too large to draw" in logged[0][1]
