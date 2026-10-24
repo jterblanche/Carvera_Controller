@@ -380,6 +380,7 @@ from .GcodeViewer import (
 from .machine.busy_state import machine_is_busy
 from .machine.clients import list_label, row_display_text, rows_for_display
 from .machine.computer_part import computer_part_for_this_process, new_launch_part
+from .machine.control_refusal import is_control_refusal, refusal_reason
 from .machine.identity import load_identity, set_name, with_id
 from .machine.job_start import JobStartAction, JobStartTracker, may_cancel_held_start
 from .machine.local_copies import LocalCopyStore
@@ -8392,7 +8393,12 @@ class Makera(RelativeLayout):
             busy = is_transfer_busy_reply(last_file_error or "")
             if last_file_error and not busy:
                 self.controller.log.put((Controller.MSG_ERROR, last_file_error))
-            error_msg = last_file_error if busy else tr._("Upload file error!")
+            if busy:
+                error_msg = last_file_error
+            elif is_control_refusal(last_file_error or ""):
+                error_msg = tr._("Upload refused: {}").format(refusal_reason(last_file_error))
+            else:
+                error_msg = tr._("Upload file error!")
             Clock.schedule_once(partial(self.show_message_popup, error_msg, False), 0)
         else:
             # copy file to application directory if needed

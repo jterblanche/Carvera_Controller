@@ -189,18 +189,25 @@ def _upload_host(tmp_path, last_file_error):
     ("reason", "popup", "console"),
     [
         (BUSY.decode().strip(), BUSY.decode().strip(), []),
-        (REFUSED_HOLDER.decode().strip(), "Upload file error!", [REFUSED_HOLDER.decode().strip()]),
+        (REFUSED_HOLDER.decode().strip(), "Upload refused: PC has control", [REFUSED_HOLDER.decode().strip()]),
+        (
+            REFUSED_MOTION.decode().strip(),
+            "Upload refused: an interactive move is in progress",
+            [REFUSED_MOTION.decode().strip()],
+        ),
+        ("Some other failure", "Upload file error!", ["Some other failure"]),
     ],
-    ids=["busy", "refused"],
+    ids=["busy", "refused", "refused-motion", "other"],
 )
-def test_upload_turned_away_shows_the_busy_reply_in_place_of_the_generic_error(
+def test_upload_turned_away_shows_the_machines_reason_in_place_of_the_generic_error(
     tmp_path, monkeypatch, reason, popup, console
 ):
     """Turned away because another controller's transfer is running, the
     popup gives the machine's busy reply, which says to try again when it
     finishes. The controller has already put that reply on the console when
-    it learned the machine was busy, so it is not repeated there. A refusal
-    is shown as before."""
+    it learned the machine was busy, so it is not repeated there. A control
+    refusal gives who has control or what blocks the transfer, and is also
+    put on the console. Any other failure keeps the generic text."""
     monkeypatch.setattr("carveracontroller.main.App.get_running_app", lambda: None)
     scheduled = []
     monkeypatch.setattr("carveracontroller.main.Clock.schedule_once", lambda cb, *a, **kw: scheduled.append(cb))

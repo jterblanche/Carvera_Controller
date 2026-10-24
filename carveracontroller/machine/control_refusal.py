@@ -47,3 +47,11 @@ def is_job_start_refusal(text: str) -> bool:
     """True for the machine's refusal of a command while it holds a job's
     start (JOB_START_REFUSAL)."""
     return bool(text) and text.strip().lower() == JOB_START_REFUSAL.lower()
+
+
+def refusal_reason(text: str) -> str:
+    """The reason in a refusal reply, without the "error:Refused --" lead:
+    "Auto 1 has control" from "error:Refused -- Auto 1 has control". A reply
+    with no dashes comes back whole."""
+    text = (text or "").strip()
+    return text.partition("--")[2].strip() or text
