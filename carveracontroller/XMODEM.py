@@ -599,6 +599,16 @@ class XMODEM:
             return False
         return str(local_md5).strip().lower() == advertised
 
+    def _is_other_files_digest(self, expected_md5, advertised_md5):
+        """True when the caller knows the digest of the file it asked for
+        and the machine advertised a different real digest."""
+        if not expected_md5:
+            return False
+        advertised = self._normalize_advertised_md5(advertised_md5)
+        if advertised is None:
+            return False
+        return str(expected_md5).strip().lower() != advertised
+
     def _finalize_download_integrity(self, expected_md5, received_md5, income_size, first_bytes=b""):
         """
         Apply download MD5 policy.
@@ -701,15 +711,23 @@ class XMODEM:
                         return 1
                     return None
 
-    def recv(self, stream, md5="", crc_mode=1, retry=5, timeout=5, delay=0.1, quiet=0, callback=None):
-        """Receive a file using the Makera framed transfer protocol."""
+    def recv(
+        self, stream, md5="", crc_mode=1, retry=5, timeout=5, delay=0.1, quiet=0, callback=None, expected_md5=None
+    ):
+        """Receive a file using the Makera framed transfer protocol.
+
+        ``expected_md5`` is the digest the caller already knows for the file
+        it asked for. The machine's digest frame names no file, so one left
+        over from an abandoned download of another file would otherwise be
+        taken as this file's: a digest that differs ends the download.
+        """
         success_count = 0
         error_count = 0
         totalerr_count = 0
         total_packet = 0
         sequence = 0
         income_size = 0
-        expected_md5 = None
+        advertised_md5 = None
         received_md5 = hashlib.md5()
         first_bytes = bytearray()
         self.deferred_download_md5 = None
@@ -770,7 +788,7 @@ class XMODEM:
                                 self._send_file_trans_command(PTYPE_FILE_END, b"")
                                 self.FileRcvState = FileTransState.WAIT_MD5
                                 if not self._finalize_download_integrity(
-                                    expected_md5, received_md5, income_size, first_bytes
+                                    advertised_md5, received_md5, income_size, first_bytes
                                 ):
                                     return None
                                 self.log.info("Transmission complete, %d bytes", income_size)
@@ -807,8 +825,20 @@ class XMODEM:
                     if self.packetData:
                         if cmd_type == PTYPE_FILE_MD5:
                             md5new = self.packetData[3 : len(self.packetData) - 2]
-                            expected_md5 = bytes(md5new)
-                            if self._local_md5_matches_advertised(md5, expected_md5):
+                            offered_md5 = bytes(md5new)
+                            if self._is_other_files_digest(expected_md5, offered_md5):
+                                self._send_file_trans_command(PTYPE_FILE_CAN, b"")
+                                self.last_file_error = (
+                                    "Download refused: the machine answered with another file's digest"
+                                )
+                                self.log.error(
+                                    "Download refused: advertised digest %s is not the expected %s",
+                                    self._normalize_advertised_md5(offered_md5),
+                                    expected_md5,
+                                )
+                                return None
+                            advertised_md5 = offered_md5
+                            if self._local_md5_matches_advertised(md5, advertised_md5):
                                 self._send_file_trans_command(PTYPE_FILE_CAN, b"")
                                 return 0
                             self._send_file_trans_command(PTYPE_FILE_VIEW, b"")

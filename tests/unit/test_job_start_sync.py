@@ -182,7 +182,7 @@ def _host(tmp_path, own_id=DEMO, has_control=False, multi_user=True, holder=PC, 
         log=MagicMock(),
     )
 
-    def download(remote_path, local_path, show_progress=True, open_after=True, automatic=False):
+    def download(remote_path, local_path, show_progress=True, open_after=True, automatic=False, expected_md5=None):
         with open(local_path, "wb") as f:
             f.write(CONTENT)
         return 1
@@ -379,7 +379,7 @@ def _download_results(*results):
     download fails)."""
     calls = list(results)
 
-    def download(remote_path, local_path, show_progress=True, open_after=True, automatic=False):
+    def download(remote_path, local_path, show_progress=True, open_after=True, automatic=False, expected_md5=None):
         content = calls.pop(0) if calls else results[-1]
         if content is None:
             return None

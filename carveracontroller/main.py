@@ -5956,11 +5956,20 @@ class Makera(RelativeLayout):
 
     # -----------------------------------------------------------------------
     def doDownload(
-        self, remote_path, local_path, show_progress=True, open_after=True, automatic=False, decompress=True
+        self,
+        remote_path,
+        local_path,
+        show_progress=True,
+        open_after=True,
+        automatic=False,
+        decompress=True,
+        expected_md5=None,
     ):
         """Download `remote_path` to `local_path`. With open_after False and
         decompress False, a compressed download is left compressed at
-        `local_path` for the caller to decompress."""
+        `local_path` for the caller to decompress. `expected_md5` is the digest
+        already known for the file: a download that is offered another one
+        ends (see XMODEM.recv)."""
         app = App.get_running_app()
         was_config_download = self.downloading_config
         # Config backup reuses downloading_config so /sd is not added to recents, but those
@@ -6019,7 +6028,12 @@ class Makera(RelativeLayout):
                 # instead; a retry (automatic or manual) shortly after
                 # succeeds normally.
                 raise RuntimeError(f"Download command held back for {remote_path}: not yet connected to the machine")
-            download_result = self.controller.stream.download(tmp_filename, md5, progress_cb)
+            if expected_md5:
+                download_result = self.controller.stream.download(
+                    tmp_filename, md5, progress_cb, expected_md5=expected_md5
+                )
+            else:
+                download_result = self.controller.stream.download(tmp_filename, md5, progress_cb)
             last_file_error = getattr(getattr(self.controller.stream, "modem", None), "last_file_error", None)
         except Exception:
             logger.error(sys.exc_info()[1])
@@ -7671,7 +7685,12 @@ class Makera(RelativeLayout):
         local_path = os.path.join(self.temp_dir, os.path.basename(remote_path))
         try:
             download_result = self.doDownload(
-                remote_path, local_path, show_progress=False, open_after=False, automatic=True
+                remote_path,
+                local_path,
+                show_progress=False,
+                open_after=False,
+                automatic=True,
+                expected_md5=self._passive_fetch.expected_digest(remote_path),
             )
         except Exception:
             logger.exception("Passive auto-fetch of %s raised during download", remote_path)

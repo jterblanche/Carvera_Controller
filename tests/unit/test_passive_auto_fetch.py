@@ -194,7 +194,9 @@ def test_failed_fetch_does_not_retry_before_the_backoff_elapses(monkeypatch, tmp
     attempts = []
     clock = [0.0]
 
-    def flaky_download(remote_path, local_path, show_progress=False, open_after=False, automatic=False):
+    def flaky_download(
+        remote_path, local_path, show_progress=False, open_after=False, automatic=False, expected_md5=None
+    ):
         attempts.append(remote_path)
         return None if len(attempts) == 1 else 1
 
