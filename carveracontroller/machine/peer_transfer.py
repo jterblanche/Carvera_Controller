@@ -59,7 +59,7 @@ BUSY_REPLY_PREFIX = "error:Busy -- a file transfer is in progress"
 
 # How often to ask while another controller's transfer runs. Each ask gets
 # an answer (the machine's own limit is one per 250 ms), so the link is
-# proven every second, well inside the 5 s the app allows before it calls
+# proven every second, well inside the limit the app allows (5 s on USB, 10 s on WiFi) before it calls
 # the link lost (main.py's HEARTBEAT_TIMEOUT).
 PROBE_INTERVAL_S = 1.0
 

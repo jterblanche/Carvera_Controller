@@ -380,6 +380,7 @@ from .GcodeViewer import (
 from .machine.busy_state import machine_is_busy
 from .machine.clients import list_label, row_display_text, rows_for_display
 from .machine.computer_part import computer_part_for_this_process, new_launch_part
+from .machine.control_refusal import is_control_refusal, refusal_reason
 from .machine.identity import load_identity, set_name, with_id
 from .machine.job_start import JobStartAction, JobStartTracker, may_cancel_held_start
 from .machine.local_copies import LocalCopyStore
@@ -3364,6 +3365,7 @@ class Makera(RelativeLayout):
         self._job_start = JobStartTracker(own_id=self.identity.id)
         self._job_start_popup = None
         self._job_start_clock = None
+        self._start_now_queued = False
         # The path of a held start's file whose download or drawing was
         # still under way when the job started (see on_job_start_event).
         self._job_start_late = None
@@ -4308,7 +4310,7 @@ class Makera(RelativeLayout):
             self.file_just_loaded = False
             return
 
-        if time.time() - self.heartbeat_time > HEARTBEAT_TIMEOUT and self.controller.stream:
+        if time.time() - self.heartbeat_time > self._heartbeat_limit() and self.controller.stream:
             logger.error("Connection to machine lost")
             # Check reconnection configuration (only if not a manual disconnect and not already reconnecting)
             if not self.controller._manual_disconnect and not self.reconnection_popup._is_open:
@@ -4336,6 +4338,12 @@ class Makera(RelativeLayout):
             self.controller.close()
             self.status_drop_down.set_connected_controllers(())
             self.updateStatus()
+
+    # -----------------------------------------------------------------------
+    def _heartbeat_limit(self):
+        """Seconds without a status reply before the link is called lost:
+        longer on WiFi, whose stalls of 4-5 s are normal, than on USB."""
+        return WIFI_HEARTBEAT_TIMEOUT if self.controller.connection_type == CONN_WIFI else HEARTBEAT_TIMEOUT
 
     # -----------------------------------------------------------------------
     def _handle_version_reply(self, line):
@@ -5954,11 +5962,20 @@ class Makera(RelativeLayout):
 
     # -----------------------------------------------------------------------
     def doDownload(
-        self, remote_path, local_path, show_progress=True, open_after=True, automatic=False, decompress=True
+        self,
+        remote_path,
+        local_path,
+        show_progress=True,
+        open_after=True,
+        automatic=False,
+        decompress=True,
+        expected_md5=None,
     ):
         """Download `remote_path` to `local_path`. With open_after False and
         decompress False, a compressed download is left compressed at
-        `local_path` for the caller to decompress."""
+        `local_path` for the caller to decompress. `expected_md5` is the digest
+        already known for the file: a download that is offered another one
+        ends (see XMODEM.recv)."""
         app = App.get_running_app()
         was_config_download = self.downloading_config
         # Config backup reuses downloading_config so /sd is not added to recents, but those
@@ -6017,7 +6034,12 @@ class Makera(RelativeLayout):
                 # instead; a retry (automatic or manual) shortly after
                 # succeeds normally.
                 raise RuntimeError(f"Download command held back for {remote_path}: not yet connected to the machine")
-            download_result = self.controller.stream.download(tmp_filename, md5, progress_cb)
+            if expected_md5:
+                download_result = self.controller.stream.download(
+                    tmp_filename, md5, progress_cb, expected_md5=expected_md5
+                )
+            else:
+                download_result = self.controller.stream.download(tmp_filename, md5, progress_cb)
             last_file_error = getattr(getattr(self.controller.stream, "modem", None), "last_file_error", None)
         except Exception:
             logger.error(sys.exc_info()[1])
@@ -7096,7 +7118,7 @@ class Makera(RelativeLayout):
         def load():
             ok = True
             try:
-                self.load_gcode_file(local_path)
+                self.load_gcode_file(local_path, quiet_notice=True)
             except Exception:
                 logger.exception("Could not draw %s", local_path)
                 ok = False
@@ -7306,9 +7328,9 @@ class Makera(RelativeLayout):
             return
         if self._job_start_popup is None:
             self._job_start_popup = JobStartPopup(
-                on_start_now=self.controller.startNowCommand,
+                on_start_now=self._job_start_now,
                 on_cancel=self.controller.abortCommand,
-                on_keep_waiting=self.controller.keepWaitingCommand,
+                on_keep_waiting=self._job_keep_waiting,
             )
         is_starter = self._job_start.is_starter
         can_cancel = self._may_cancel_held_start()
@@ -7320,11 +7342,17 @@ class Makera(RelativeLayout):
                 self._job_start_clock = Clock.schedule_interval(self._tick_job_start_countdown, 1.0)
             return
         waiting = [i for i in event.not_ready_ids if i != self.identity.id]
-        if self._job_start.timed_out:
+        supports_keep_waiting = bool(self.controller.machine_supports_keep_waiting)
+        ran_out_in_transfer = (
+            is_starter
+            and supports_keep_waiting
+            and self._job_start.ran_out_in_transfer(time.monotonic(), self._job_start_transfer_running())
+        )
+        if self._job_start.timed_out or ran_out_in_transfer:
             # Keep waiting only where the machine accepts keep-waiting; a
             # machine without it never sends this phase. Controllers are
             # named by their labels in the connected-controllers list.
-            keep_waiting = is_starter and bool(self.controller.machine_supports_keep_waiting)
+            keep_waiting = is_starter and supports_keep_waiting
             labels = self._client_labels(waiting)
             if self.identity.id in event.not_ready_ids:
                 labels.insert(0, tr._("this controller"))
@@ -7337,6 +7365,7 @@ class Makera(RelativeLayout):
                     can_cancel,
                     keep_waiting=keep_waiting,
                     starter_name=self._client_labels([event.starter_id])[0] if starter_known else None,
+                    start_now_queued=self._start_now_queued,
                 ),
                 show_start_now=is_starter,
                 show_cancel=can_cancel,
@@ -7356,6 +7385,28 @@ class Makera(RelativeLayout):
         )
         if self._job_start_clock is None:
             self._job_start_clock = Clock.schedule_interval(self._tick_job_start_countdown, 1.0)
+
+    def _job_start_transfer_running(self):
+        """True while a file transfer keeps the machine's main loop busy:
+        it sends no job-start event and takes only a few commands."""
+        return bool(self._auto_fetch_in_progress or getattr(self.controller, "peer_transfer_active", False))
+
+    def _job_start_now(self):
+        """Start now. The machine refuses it while a file transfer runs, so
+        then it is kept and sent once the transfer has ended."""
+        if self._job_start_transfer_running():
+            self._start_now_queued = True
+            self._show_job_start_countdown()
+            return
+        self.controller.startNowCommand()
+
+    def _job_keep_waiting(self):
+        """Keep waiting: the machine takes it during a transfer too and
+        counts the whole limit again once the transfer ends."""
+        self._job_start.keep_waiting_locally(time.monotonic())
+        self._start_now_queued = False
+        self.controller.keepWaitingCommand()
+        self._show_job_start_countdown()
 
     def _client_labels(self, client_ids):
         """The connected-controllers list's label for each of `client_ids`
@@ -7388,7 +7439,12 @@ class Makera(RelativeLayout):
         the hold's end was never heard of."""
         # The machine sends no event while a file transfer runs, and a start
         # held after its wait ran out has no limit to count to.
-        transfer_running = self._auto_fetch_in_progress or bool(getattr(self.controller, "peer_transfer_active", False))
+        transfer_running = self._job_start_transfer_running()
+        if self._start_now_queued and (not self._job_start.held or self._machine_reports_playing()):
+            self._start_now_queued = False
+        elif self._start_now_queued and not transfer_running:
+            self._start_now_queued = False
+            self.controller.startNowCommand()
         if self._job_start.held and (
             self._machine_reports_playing() or self._job_start.stale(time.monotonic(), transfer_running)
         ):
@@ -7635,7 +7691,12 @@ class Makera(RelativeLayout):
         local_path = os.path.join(self.temp_dir, os.path.basename(remote_path))
         try:
             download_result = self.doDownload(
-                remote_path, local_path, show_progress=False, open_after=False, automatic=True
+                remote_path,
+                local_path,
+                show_progress=False,
+                open_after=False,
+                automatic=True,
+                expected_md5=self._passive_fetch.expected_digest(remote_path),
             )
         except Exception:
             logger.exception("Passive auto-fetch of %s raised during download", remote_path)
@@ -8357,7 +8418,12 @@ class Makera(RelativeLayout):
             busy = is_transfer_busy_reply(last_file_error or "")
             if last_file_error and not busy:
                 self.controller.log.put((Controller.MSG_ERROR, last_file_error))
-            error_msg = last_file_error if busy else tr._("Upload file error!")
+            if busy:
+                error_msg = last_file_error
+            elif is_control_refusal(last_file_error or ""):
+                error_msg = tr._("Upload refused: {}").format(refusal_reason(last_file_error))
+            else:
+                error_msg = tr._("Upload file error!")
             Clock.schedule_once(partial(self.show_message_popup, error_msg, False), 0)
         else:
             # copy file to application directory if needed
@@ -11028,7 +11094,9 @@ class Makera(RelativeLayout):
         """The file loaded without its toolpath (load_gcode_file found it
         too large for the memory free): features that need the toolpath
         are off, as for a file that cannot be visualised, and the user is
-        told why. ``skipped`` is (points needed, budget)."""
+        told why: by a popup when the operator chose the file, only in the
+        console when the machine's job or another controller did (a popup
+        would block a watcher's screen). ``skipped`` is (points needed, budget)."""
         points, budget = skipped
         self.gcode_cannot_visualise = True
         logger.warning(
@@ -11042,7 +11110,8 @@ class Makera(RelativeLayout):
             "The file is loaded and can still be run."
         )
         self.controller.log.put((Controller.MSG_NORMAL, message))
-        self.show_message_popup(message, False)
+        if not getattr(self, "_quiet_toolpath_notice", False):
+            self.show_message_popup(message, False)
 
     # ------------------------------------------------------------------------
     def load_end(self, *args):
@@ -11223,8 +11292,10 @@ class Makera(RelativeLayout):
         return self._replace_file(filepath, fill)
 
     # -----------------------------------------------------------------------
-    def load_gcode_file(self, filepath):
+    def load_gcode_file(self, filepath, quiet_notice=False):
         # Every file drawn here is a local copy the machine may later play.
+        # quiet_notice: the machine, not the operator, chose this file.
+        self._quiet_toolpath_notice = quiet_notice
         self._local_copies.remember(filepath)
         self._job_without_toolpath = None
         # (points needed so far, budget) once the toolpath is found too
@@ -11886,6 +11957,7 @@ def load_constants():
     global SHORT_LOAD_TIMEOUT
     global WIFI_LOAD_TIMEOUT
     global HEARTBEAT_TIMEOUT
+    global WIFI_HEARTBEAT_TIMEOUT
     global MAX_TOUCH_INTERVAL
     global GCODE_VIEW_SPEED
     global LOAD_INTERVAL
@@ -11896,6 +11968,8 @@ def load_constants():
     SHORT_LOAD_TIMEOUT = 3  # s
     WIFI_LOAD_TIMEOUT = 30  # s
     HEARTBEAT_TIMEOUT = 5
+    # The machine's WiFi stalls for 4-5 s every 10-20 minutes; 5 s dropped the link on each.
+    WIFI_HEARTBEAT_TIMEOUT = 10
     MAX_TOUCH_INTERVAL = 0.15
     GCODE_VIEW_SPEED = 1
 

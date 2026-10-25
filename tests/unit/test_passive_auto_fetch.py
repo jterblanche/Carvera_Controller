@@ -177,7 +177,7 @@ def test_worker_thread_never_touches_kivy_properties_inline(monkeypatch, tmp_pat
         if len(scheduled) == 2:
             break
         threading.Event().wait(0.05)
-    root.load_gcode_file.assert_called_once_with(os.path.join(str(tmp_path), "job.nc"))
+    root.load_gcode_file.assert_called_once_with(os.path.join(str(tmp_path), "job.nc"), quiet_notice=True)
     assert root._auto_fetch_in_progress is True  # until the drawing is done
     scheduled[1](0)
     assert root._auto_fetch_in_progress is False
@@ -194,7 +194,9 @@ def test_failed_fetch_does_not_retry_before_the_backoff_elapses(monkeypatch, tmp
     attempts = []
     clock = [0.0]
 
-    def flaky_download(remote_path, local_path, show_progress=False, open_after=False, automatic=False):
+    def flaky_download(
+        remote_path, local_path, show_progress=False, open_after=False, automatic=False, expected_md5=None
+    ):
         attempts.append(remote_path)
         return None if len(attempts) == 1 else 1
 

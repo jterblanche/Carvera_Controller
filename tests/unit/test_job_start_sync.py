@@ -162,6 +162,7 @@ def _host(tmp_path, own_id=DEMO, has_control=False, multi_user=True, holder=PC, 
     root._job_start = JobStartTracker(own_id=own_id)
     root._job_start_popup = _FakePopup()
     root._job_start_clock = None
+    root._start_now_queued = False
     root.controller = SimpleNamespace(
         has_control=has_control,
         multi_user_mode=multi_user,
@@ -181,7 +182,7 @@ def _host(tmp_path, own_id=DEMO, has_control=False, multi_user=True, holder=PC, 
         log=MagicMock(),
     )
 
-    def download(remote_path, local_path, show_progress=True, open_after=True, automatic=False):
+    def download(remote_path, local_path, show_progress=True, open_after=True, automatic=False, expected_md5=None):
         with open(local_path, "wb") as f:
             f.write(CONTENT)
         return 1
@@ -221,7 +222,7 @@ def test_identical_copy_of_a_card_file_is_drawn_without_a_fetch(tmp_path, app):
     Makera.on_job_start_event(root, _event())
 
     root.doDownload.assert_not_called()
-    root.load_gcode_file.assert_called_once_with(copy)
+    root.load_gcode_file.assert_called_once_with(copy, quiet_notice=True)
     assert app.selected_remote_filename == PATH
     assert app.selected_local_filename == copy
     root.controller.send_job_start_ready.assert_called_once_with(7)
@@ -262,7 +263,7 @@ def test_play_started_with_a_matching_copy_draws_it_at_once(tmp_path, app):
     Makera.on_passive_file_published(root, PATH, MD5, size=len(CONTENT), played=True)
 
     root.doDownload.assert_not_called()
-    root.load_gcode_file.assert_called_once_with(copy)
+    root.load_gcode_file.assert_called_once_with(copy, quiet_notice=True)
     assert app.selected_local_filename == copy
     assert root._passive_fetch.pending_path is None
 
@@ -355,7 +356,7 @@ def test_card_file_this_controller_lacks_is_fetched_before_the_start(tmp_path, a
     assert app.selected_local_filename == local
     _HeldThread.started[1].run()
 
-    root.load_gcode_file.assert_called_once_with(local)
+    root.load_gcode_file.assert_called_once_with(local, quiet_notice=True)
     root.controller.send_job_start_ready.assert_called_once_with(7)
     assert root._auto_fetch_in_progress is False
     assert root._passive_fetch.pending_path is None
@@ -378,7 +379,7 @@ def _download_results(*results):
     download fails)."""
     calls = list(results)
 
-    def download(remote_path, local_path, show_progress=True, open_after=True, automatic=False):
+    def download(remote_path, local_path, show_progress=True, open_after=True, automatic=False, expected_md5=None):
         content = calls.pop(0) if calls else results[-1]
         if content is None:
             return None

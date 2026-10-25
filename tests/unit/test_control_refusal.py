@@ -1,6 +1,6 @@
 """Unit tests for carveracontroller.machine.control_refusal."""
 
-from carveracontroller.machine.control_refusal import is_control_refusal
+from carveracontroller.machine.control_refusal import is_control_refusal, refusal_reason
 
 
 def test_recognises_the_named_holder_variant():
@@ -37,3 +37,17 @@ def test_recognises_the_busy_refusal():
     # line. Nothing here needs to be busy-specific -- the generic
     # "error:Refused" shape this module already matches covers it.
     assert is_control_refusal("error:Refused -- can't change settings while the machine is busy") is True
+
+
+def test_refusal_reason_is_the_text_after_the_dashes():
+    assert refusal_reason("error:Refused -- Auto 1 has control") == "Auto 1 has control"
+    assert (
+        refusal_reason("error:Transfer refused -- PC has control and an interactive move is in progress")
+        == "PC has control and an interactive move is in progress"
+    )
+    assert refusal_reason("  error:Refused -- a job is about to start \r\n") == "a job is about to start"
+
+
+def test_refusal_reason_without_dashes_is_the_whole_line():
+    assert refusal_reason("error:Refused") == "error:Refused"
+    assert refusal_reason("") == ""

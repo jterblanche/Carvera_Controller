@@ -228,6 +228,14 @@ class PassiveFetchTracker:
             return self._announced_checksum
         return b""
 
+    def expected_digest(self, path: str) -> str | None:
+        """The MD5 (lowercase hex) an event announced for `path`, or None
+        when none has. A download of `path` must be of that file; see
+        ``XMODEM.recv``."""
+        if path == self._announced_path and len(self._announced_checksum) == 16:
+            return self._announced_checksum.hex()
+        return None
+
     def note_own_upload(self, path: str, md5_hex: str) -> None:
         """Call when this controller sends a file to the card, with the
         path the machine will announce once it is written (see

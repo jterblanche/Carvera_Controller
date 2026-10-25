@@ -233,12 +233,12 @@ class WIFIStream:
                 return self.modem.send(stream, md5=local_md5, retry=50, callback=callback)
             return self.modem.send_legacy(stream, md5=local_md5, retry=10, callback=callback)
 
-    def download(self, filename, local_md5, callback):
+    def download(self, filename, local_md5, callback, expected_md5=None):
         # As upload: closed even when the transfer raises, or the caller
         # cannot rename or delete the file afterwards on Windows.
         with open(filename, "wb") as stream:
             if self.uses_framed_transfer:
-                return self.modem.recv(stream, md5=local_md5, retry=50, callback=callback)
+                return self.modem.recv(stream, md5=local_md5, retry=50, callback=callback, expected_md5=expected_md5)
             return self.modem.recv_legacy(stream, md5=local_md5, retry=10, callback=callback)
 
     def cancel_process(self):
